@@ -18,7 +18,8 @@ typedef enum {
     TRACE_RETURN = 1,
     TRACE_STORE  = 2,
     TRACE_IO     = 3,
-    TRACE_BRANCH = 4
+    TRACE_BRANCH     = 4,
+    TRACE_PROVENANCE = 5
 } TraceEventKind;
 
 typedef struct {
@@ -30,6 +31,7 @@ typedef struct {
         struct { const char *var; int64_t ival; double fval; const char *sval; int tag; char *deep_json; } store;
         struct { const char *op; char *data; int len; } io;
         struct { int line; int taken; } branch;
+        struct { const char *var; const char *origin; const char *detail; int line; } prov;
     };
 } TraceEvent;
 
@@ -40,6 +42,8 @@ struct XSTracer {
     int n_events;
     int capacity;
     int deep_serialize;
+    int suppress;           /* local suppress (for force-write) */
+    int *suppress_flag;     /* external flag (e.g. g_in_eval_hook) */
     struct timespec start_time;
 };
 
@@ -67,6 +71,16 @@ static void ensure_capacity(XSTracer *t) {
 
 void tracer_set_deep(XSTracer *t, int deep) {
     if (t) t->deep_serialize = deep;
+}
+
+void tracer_set_suppress_flag(XSTracer *t, int *flag) {
+    if (t) t->suppress_flag = flag;
+}
+
+static int tracer_suppressed(XSTracer *t) {
+    if (t->suppress) return 1;
+    if (t->suppress_flag && *t->suppress_flag) return 1;
+    return 0;
 }
 
 
@@ -246,7 +260,7 @@ void tracer_free(XSTracer *t) {
 }
 
 void tracer_record_call(XSTracer *t, const char *fn, int line) {
-    if (!t || t->n_events >= MAX_EVENTS) return;
+    if (!t || t->n_events >= MAX_EVENTS || tracer_suppressed(t)) return;
     ensure_capacity(t);
     if (t->n_events >= t->capacity) return;
 
@@ -280,7 +294,7 @@ static void extract_value(Value *v, int *tag, int64_t *ival, double *fval, const
 }
 
 void tracer_record_return(XSTracer *t, const char *fn, void *retval) {
-    if (!t || t->n_events >= MAX_EVENTS) return;
+    if (!t || t->n_events >= MAX_EVENTS || tracer_suppressed(t)) return;
     ensure_capacity(t);
     if (t->n_events >= t->capacity) return;
 
@@ -296,7 +310,7 @@ void tracer_record_return(XSTracer *t, const char *fn, void *retval) {
 }
 
 void tracer_record_store(XSTracer *t, const char *var, void *val) {
-    if (!t || t->n_events >= MAX_EVENTS) return;
+    if (!t || t->n_events >= MAX_EVENTS || tracer_suppressed(t)) return;
     ensure_capacity(t);
     if (t->n_events >= t->capacity) return;
 
@@ -312,7 +326,7 @@ void tracer_record_store(XSTracer *t, const char *var, void *val) {
 }
 
 void tracer_record_io(XSTracer *t, const char *op, void *data, int len) {
-    if (!t || t->n_events >= MAX_EVENTS) return;
+    if (!t || t->n_events >= MAX_EVENTS || tracer_suppressed(t)) return;
     ensure_capacity(t);
     if (t->n_events >= t->capacity) return;
 
@@ -334,7 +348,7 @@ void tracer_record_io(XSTracer *t, const char *op, void *data, int len) {
 }
 
 void tracer_record_branch(XSTracer *t, int line, int taken) {
-    if (!t || t->n_events >= MAX_EVENTS) return;
+    if (!t || t->n_events >= MAX_EVENTS || tracer_suppressed(t)) return;
     ensure_capacity(t);
     if (t->n_events >= t->capacity) return;
 
@@ -343,6 +357,38 @@ void tracer_record_branch(XSTracer *t, int line, int taken) {
     e->timestamp = elapsed_ns(t);
     e->branch.line = line;
     e->branch.taken = taken;
+}
+
+void tracer_record_provenance(XSTracer *t, const char *var,
+                               const char *origin, const char *detail,
+                               int line) {
+    if (!t || t->n_events >= MAX_EVENTS || tracer_suppressed(t)) return;
+    ensure_capacity(t);
+    if (t->n_events >= t->capacity) return;
+
+    TraceEvent *e = &t->events[t->n_events++];
+    e->kind = TRACE_PROVENANCE;
+    e->timestamp = elapsed_ns(t);
+    e->prov.var = var;
+    e->prov.origin = origin;
+    e->prov.detail = detail;
+    e->prov.line = line;
+}
+
+void tracer_record_provenance_force(XSTracer *t, const char *var,
+                                     const char *origin, const char *detail,
+                                     int line) {
+    if (!t || t->n_events >= MAX_EVENTS) return;
+    ensure_capacity(t);
+    if (t->n_events >= t->capacity) return;
+
+    TraceEvent *e = &t->events[t->n_events++];
+    e->kind = TRACE_PROVENANCE;
+    e->timestamp = elapsed_ns(t);
+    e->prov.var = var;
+    e->prov.origin = origin;
+    e->prov.detail = detail;
+    e->prov.line = line;
 }
 
 int tracer_flush(XSTracer *t) {
@@ -395,6 +441,12 @@ int tracer_flush(XSTracer *t) {
         case TRACE_BRANCH:
             fwrite(&e->branch.line, 4, 1, t->out);
             fwrite(&e->branch.taken, 4, 1, t->out);
+            break;
+        case TRACE_PROVENANCE:
+            write_string(t->out, e->prov.var);
+            write_string(t->out, e->prov.origin);
+            write_string(t->out, e->prov.detail);
+            fwrite(&e->prov.line, 4, 1, t->out);
             break;
         }
     }
