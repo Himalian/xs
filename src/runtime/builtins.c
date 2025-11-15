@@ -4,6 +4,14 @@
 #include "runtime/interp.h"
 #include "core/xs_bigint.h"
 #include "tls/xs_tls.h"
+#include "core/gc.h"
+#include "core/msgpack.h"
+#include "runtime/async.h"
+#include "bearssl_hash.h"
+#include "bearssl_hmac.h"
+#include "bearssl_kdf.h"
+#include "bearssl_block.h"
+#include "bearssl_aead.h"
 #include <strings.h>
 #ifdef __MINGW32__
 #define re_nsub nsub
@@ -37,6 +45,12 @@ void xs_set_argv(int argc, char **argv) {
 #    include <dirent.h>
 #    include <glob.h>
 #  endif
+#  if defined(__linux__)
+#    include <sys/inotify.h>
+#  endif
+#  include <sys/wait.h>
+#  include <signal.h>
+#  include <netinet/tcp.h>
 #else
 #  include <sys/stat.h>
 #  include <errno.h>
@@ -1355,11 +1369,60 @@ static Value *native_time_parse(Interp *ig, Value **a, int n) {
 static Value *native_time_now_ms(Interp *ig, Value **a, int n) {
     return native_time_millis(ig,a,n);
 }
+static Value *native_time_now_ns(Interp *ig, Value **a, int n) {
+    (void)ig;(void)a;(void)n;
+    struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
+    return xs_int((int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec);
+}
+static Value *native_time_date(Interp *ig, Value **a, int n) {
+    (void)ig;
+    time_t t;
+    if (n >= 1) {
+        if (a[0]->tag == XS_INT) t = (time_t)a[0]->i;
+        else if (a[0]->tag == XS_FLOAT) t = (time_t)a[0]->f;
+        else t = time(NULL);
+    } else t = time(NULL);
+    struct tm *tm2 = localtime(&t);
+    Value *m = xs_map_new();
+    Value *v;
+    v = xs_int(tm2->tm_year+1900); map_set(m->map,"year",v);    value_decref(v);
+    v = xs_int(tm2->tm_mon+1);     map_set(m->map,"month",v);   value_decref(v);
+    v = xs_int(tm2->tm_mday);      map_set(m->map,"day",v);     value_decref(v);
+    v = xs_int(tm2->tm_hour);      map_set(m->map,"hour",v);    value_decref(v);
+    v = xs_int(tm2->tm_min);       map_set(m->map,"minute",v);  value_decref(v);
+    v = xs_int(tm2->tm_sec);       map_set(m->map,"second",v);  value_decref(v);
+    v = xs_int(tm2->tm_wday);      map_set(m->map,"weekday",v); value_decref(v);
+    return m;
+}
+static Value *native_time_to_iso(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1) return xs_str("");
+    time_t t;
+    if (a[0]->tag == XS_INT) t = (time_t)a[0]->i;
+    else if (a[0]->tag == XS_FLOAT) t = (time_t)a[0]->f;
+    else return xs_str("");
+    struct tm *tm2 = gmtime(&t);
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", tm2);
+    return xs_str(buf);
+}
+static Value *native_time_from_iso(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || a[0]->tag != XS_STR) return value_incref(XS_NULL_VAL);
+    struct tm tm2; memset(&tm2, 0, sizeof(tm2));
+    if (strptime(a[0]->s, "%Y-%m-%dT%H:%M:%S", &tm2)
+        || strptime(a[0]->s, "%Y-%m-%d", &tm2)) {
+        time_t t = mktime(&tm2);
+        return xs_int((int64_t)t);
+    }
+    return value_incref(XS_NULL_VAL);
+}
 
 Value *make_time_module(void) {
     XSMap *m = map_new();
     map_set(m, "now",       xs_native(native_time_now));
     map_set(m, "now_ms",    xs_native(native_time_now_ms));
+    map_set(m, "now_ns",    xs_native(native_time_now_ns));
     map_set(m, "sleep",     xs_native(native_time_sleep));
     map_set(m, "sleep_ms",  xs_native(native_time_sleep_ms));
     map_set(m, "stopwatch", xs_native(native_time_stopwatch));
@@ -1368,6 +1431,9 @@ Value *make_time_module(void) {
     map_set(m, "monotonic", xs_native(native_time_monotonic));
     map_set(m, "clock",     xs_native(native_time_monotonic));
     map_set(m, "parse",     xs_native(native_time_parse));
+    map_set(m, "date",      xs_native(native_time_date));
+    map_set(m, "to_iso",    xs_native(native_time_to_iso));
+    map_set(m, "from_iso",  xs_native(native_time_from_iso));
     map_set(m, "year",      xs_native(native_time_year));
     map_set(m, "month",     xs_native(native_time_month));
     map_set(m, "day",       xs_native(native_time_day));
@@ -2060,10 +2126,250 @@ static Value *native_process_run(Interp *i, Value **a, int n) {
     Value *cv=xs_int(code2); map_set(result->map,"code",cv); value_decref(cv);
     return result;
 }
+/* process.exec(cmd_string) - run shell command, return exit code */
+static Value *native_process_exec(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || a[0]->tag != XS_STR) return xs_int(-1);
+    int rc = system(a[0]->s);
+    return xs_int(rc);
+}
+
+/* process.spawn(cmd, args, opts) - spawn with pipe access */
+static Value *native_process_spawn_stdin_write(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 2 || (a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE)) return value_incref(XS_FALSE_VAL);
+    Value *fdv = map_get(a[0]->map, "_stdin_fd");
+    if (!fdv || fdv->tag != XS_INT || fdv->i <= 0) return value_incref(XS_FALSE_VAL);
+    if (a[1]->tag != XS_STR) return value_incref(XS_FALSE_VAL);
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    ssize_t w = write((int)fdv->i, a[1]->s, strlen(a[1]->s));
+    return (w >= 0) ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL);
+#else
+    return value_incref(XS_FALSE_VAL);
+#endif
+}
+
+static Value *native_process_spawn_stdout_read(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || (a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE)) return value_incref(XS_NULL_VAL);
+    Value *fdv = map_get(a[0]->map, "_stdout_fd");
+    if (!fdv || fdv->tag != XS_INT || fdv->i <= 0) return value_incref(XS_NULL_VAL);
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    int maxn = 4096;
+    if (n >= 2 && a[1]->tag == XS_INT) maxn = (int)a[1]->i;
+    char *buf = xs_malloc(maxn + 1);
+    ssize_t nr = read((int)fdv->i, buf, maxn);
+    if (nr <= 0) { free(buf); return value_incref(XS_NULL_VAL); }
+    buf[nr] = '\0';
+    Value *v = xs_str_n(buf, nr); free(buf); return v;
+#else
+    return value_incref(XS_NULL_VAL);
+#endif
+}
+
+static Value *native_process_spawn_stderr_read(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || (a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE)) return value_incref(XS_NULL_VAL);
+    Value *fdv = map_get(a[0]->map, "_stderr_fd");
+    if (!fdv || fdv->tag != XS_INT || fdv->i <= 0) return value_incref(XS_NULL_VAL);
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    int maxn = 4096;
+    if (n >= 2 && a[1]->tag == XS_INT) maxn = (int)a[1]->i;
+    char *buf = xs_malloc(maxn + 1);
+    ssize_t nr = read((int)fdv->i, buf, maxn);
+    if (nr <= 0) { free(buf); return value_incref(XS_NULL_VAL); }
+    buf[nr] = '\0';
+    Value *v = xs_str_n(buf, nr); free(buf); return v;
+#else
+    return value_incref(XS_NULL_VAL);
+#endif
+}
+
+static Value *native_process_spawn_wait(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || (a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE)) return xs_int(-1);
+    Value *pidv = map_get(a[0]->map, "pid");
+    if (!pidv || pidv->tag != XS_INT) return xs_int(-1);
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    int status = 0;
+    waitpid((pid_t)pidv->i, &status, 0);
+    /* close remaining fds */
+    Value *si = map_get(a[0]->map, "_stdin_fd");
+    if (si && si->tag == XS_INT && si->i > 0) { close((int)si->i); map_set(a[0]->map, "_stdin_fd", xs_int(0)); }
+    Value *so = map_get(a[0]->map, "_stdout_fd");
+    if (so && so->tag == XS_INT && so->i > 0) { close((int)so->i); map_set(a[0]->map, "_stdout_fd", xs_int(0)); }
+    Value *se = map_get(a[0]->map, "_stderr_fd");
+    if (se && se->tag == XS_INT && se->i > 0) { close((int)se->i); map_set(a[0]->map, "_stderr_fd", xs_int(0)); }
+    if (WIFEXITED(status)) return xs_int(WEXITSTATUS(status));
+    return xs_int(-1);
+#else
+    return xs_int(-1);
+#endif
+}
+
+static Value *native_process_spawn_kill(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || (a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE)) return value_incref(XS_FALSE_VAL);
+    Value *pidv = map_get(a[0]->map, "pid");
+    if (!pidv || pidv->tag != XS_INT) return value_incref(XS_FALSE_VAL);
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    int sig = SIGTERM;
+    if (n >= 2 && a[1]->tag == XS_INT) sig = (int)a[1]->i;
+    return (kill((pid_t)pidv->i, sig) == 0) ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL);
+#else
+    return value_incref(XS_FALSE_VAL);
+#endif
+}
+
+static Value *native_process_spawn(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n < 1 || a[0]->tag != XS_STR) return value_incref(XS_NULL_VAL);
+    const char *cmd = a[0]->s;
+
+    /* collect args */
+    int nargs = 0;
+    char **argv_list = NULL;
+    if (n >= 2 && a[1]->tag == XS_ARRAY) {
+        nargs = a[1]->arr->len;
+        argv_list = xs_malloc(sizeof(char*) * (nargs + 2));
+        argv_list[0] = (char*)cmd;
+        for (int j = 0; j < nargs; j++) {
+            Value *av = a[1]->arr->items[j];
+            argv_list[j+1] = (av->tag == XS_STR) ? av->s : "";
+        }
+        argv_list[nargs+1] = NULL;
+    } else {
+        argv_list = xs_malloc(sizeof(char*) * 4);
+        argv_list[0] = "/bin/sh";
+        argv_list[1] = "-c";
+        argv_list[2] = (char*)cmd;
+        argv_list[3] = NULL;
+    }
+
+    int stdin_pipe[2], stdout_pipe[2], stderr_pipe[2];
+    if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
+        free(argv_list);
+        return value_incref(XS_NULL_VAL);
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        free(argv_list);
+        return value_incref(XS_NULL_VAL);
+    }
+    if (pid == 0) {
+        /* child */
+        close(stdin_pipe[1]);  dup2(stdin_pipe[0], 0);  close(stdin_pipe[0]);
+        close(stdout_pipe[0]); dup2(stdout_pipe[1], 1); close(stdout_pipe[1]);
+        close(stderr_pipe[0]); dup2(stderr_pipe[1], 2); close(stderr_pipe[1]);
+        if (n >= 2 && a[1]->tag == XS_ARRAY)
+            execvp(cmd, argv_list);
+        else
+            execvp("/bin/sh", argv_list);
+        _exit(127);
+    }
+    /* parent */
+    close(stdin_pipe[0]);
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
+    free(argv_list);
+
+    XSMap *proc = map_new();
+    map_set(proc, "pid", xs_int((int64_t)pid));
+    map_set(proc, "_stdin_fd", xs_int((int64_t)stdin_pipe[1]));
+    map_set(proc, "_stdout_fd", xs_int((int64_t)stdout_pipe[0]));
+    map_set(proc, "_stderr_fd", xs_int((int64_t)stderr_pipe[0]));
+    map_set(proc, "stdin_write", xs_native(native_process_spawn_stdin_write));
+    map_set(proc, "stdout_read", xs_native(native_process_spawn_stdout_read));
+    map_set(proc, "stderr_read", xs_native(native_process_spawn_stderr_read));
+    map_set(proc, "wait", xs_native(native_process_spawn_wait));
+    map_set(proc, "kill", xs_native(native_process_spawn_kill));
+    return xs_module(proc);
+#else
+    (void)a; (void)n;
+    return value_incref(XS_NULL_VAL);
+#endif
+}
+
+/* process.on_signal(sig_name, callback) */
+static Interp *g_signal_interp = NULL;
+static Value  *g_signal_handlers[32] = {0};
+
+static void xs_signal_handler(int sig) {
+    if (sig >= 0 && sig < 32 && g_signal_handlers[sig] && g_signal_interp) {
+        Value *sv = xs_int(sig);
+        Value *args[1] = { sv };
+        Value *r = call_value(g_signal_interp, g_signal_handlers[sig], args, 1, "on_signal");
+        if (r) value_decref(r);
+        value_decref(sv);
+    }
+}
+
+static Value *native_process_on_signal(Interp *ig, Value **a, int n) {
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n < 2 || (a[1]->tag != XS_FUNC && a[1]->tag != XS_NATIVE))
+        return value_incref(XS_FALSE_VAL);
+    int sig = -1;
+    if (a[0]->tag == XS_INT) sig = (int)a[0]->i;
+    else if (a[0]->tag == XS_STR) {
+        if (strcasecmp(a[0]->s, "SIGINT") == 0 || strcasecmp(a[0]->s, "INT") == 0) sig = SIGINT;
+        else if (strcasecmp(a[0]->s, "SIGTERM") == 0 || strcasecmp(a[0]->s, "TERM") == 0) sig = SIGTERM;
+        else if (strcasecmp(a[0]->s, "SIGHUP") == 0 || strcasecmp(a[0]->s, "HUP") == 0) sig = SIGHUP;
+        else if (strcasecmp(a[0]->s, "SIGUSR1") == 0 || strcasecmp(a[0]->s, "USR1") == 0) sig = SIGUSR1;
+        else if (strcasecmp(a[0]->s, "SIGUSR2") == 0 || strcasecmp(a[0]->s, "USR2") == 0) sig = SIGUSR2;
+    }
+    if (sig < 0 || sig >= 32) return value_incref(XS_FALSE_VAL);
+    g_signal_interp = ig;
+    if (g_signal_handlers[sig]) value_decref(g_signal_handlers[sig]);
+    g_signal_handlers[sig] = value_incref(a[1]);
+    signal(sig, xs_signal_handler);
+    return value_incref(XS_TRUE_VAL);
+#else
+    (void)ig; (void)a; (void)n;
+    return value_incref(XS_FALSE_VAL);
+#endif
+}
+
+/* process.env(name) / process.env(name, value) */
+static Value *native_process_env(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || a[0]->tag != XS_STR) return value_incref(XS_NULL_VAL);
+    if (n >= 2 && a[1]->tag == XS_STR) {
+        setenv(a[0]->s, a[1]->s, 1);
+        return value_incref(XS_TRUE_VAL);
+    }
+    const char *v = getenv(a[0]->s);
+    return v ? xs_str(v) : value_incref(XS_NULL_VAL);
+}
+
+/* process.cwd() */
+static Value *native_process_cwd(Interp *ig, Value **a, int n) {
+    (void)ig; (void)a; (void)n;
+    char buf[4096];
+    if (getcwd(buf, sizeof(buf))) return xs_str(buf);
+    return xs_str(".");
+}
+
+/* process.exit(code) */
+static Value *native_process_exit(Interp *ig, Value **a, int n) {
+    (void)ig;
+    int code = 0;
+    if (n >= 1 && a[0]->tag == XS_INT) code = (int)a[0]->i;
+    exit(code);
+    return value_incref(XS_NULL_VAL);
+}
+
 Value *make_process_module(void) {
     XSMap *m=map_new();
-    map_set(m,"pid", xs_native(native_process_pid));
-    map_set(m,"run", xs_native(native_process_run));
+    map_set(m,"pid",       xs_native(native_process_pid));
+    map_set(m,"run",       xs_native(native_process_run));
+    map_set(m,"exec",      xs_native(native_process_exec));
+    map_set(m,"spawn",     xs_native(native_process_spawn));
+    map_set(m,"on_signal", xs_native(native_process_on_signal));
+    map_set(m,"env",       xs_native(native_process_env));
+    map_set(m,"cwd",       xs_native(native_process_cwd));
+    map_set(m,"exit",      xs_native(native_process_exit));
     return xs_module(m);
 }
 
@@ -3304,13 +3610,48 @@ static Value *native_test_assert_close(Interp *ig, Value **a, int n) {
     else { test_failed_count++; fprintf(stderr,"[FAIL] %s: |%g - %g| = %g > %g\n",msg,av,bv,diff,eps); }
     return value_incref(XS_NULL_VAL);
 }
+static Value *native_test_assert_throws(Interp *ig, Value **a, int n) {
+    if (n<1) return value_incref(XS_NULL_VAL);
+    const char *msg=(n>=2&&a[1]->tag==XS_STR)?a[1]->s:"assert_throws failed";
+    Value *fn=a[0];
+    if (fn->tag!=XS_FUNC&&fn->tag!=XS_NATIVE) {
+        test_failed_count++;
+        fprintf(stderr,"[FAIL] %s: not a callable\n",msg);
+        return value_incref(XS_NULL_VAL);
+    }
+    Value *res=call_value(ig,fn,NULL,0,"assert_throws");
+    int threw=(ig->cf.signal==CF_THROW||ig->cf.signal==CF_ERROR||ig->cf.signal==CF_PANIC);
+    if (threw) { CF_CLEAR(ig); test_passed_count++; }
+    else { test_failed_count++; fprintf(stderr,"[FAIL] %s: expected throw\n",msg); }
+    if (res) value_decref(res);
+    return value_incref(XS_NULL_VAL);
+}
 static Value *native_test_run(Interp *ig, Value **a, int n) {
+    if (n>=1&&(a[0]->tag==XS_MAP||a[0]->tag==XS_MODULE)) {
+        int nk=0; char **ks=map_keys(a[0]->map,&nk);
+        int run_pass=0,run_fail=0;
+        for (int j=0;j<nk;j++){
+            Value *fn=map_get(a[0]->map,ks[j]);
+            if (fn&&(fn->tag==XS_FUNC||fn->tag==XS_NATIVE)) {
+                fprintf(stderr,"[RUN] %s\n",ks[j]);
+                int before_fail=test_failed_count;
+                Value *res=call_value(ig,fn,NULL,0,ks[j]);
+                if (ig->cf.signal) CF_CLEAR(ig);
+                if (res) value_decref(res);
+                if (test_failed_count>before_fail) { run_fail++; }
+                else { run_pass++; fprintf(stderr,"[PASS] %s\n",ks[j]); }
+            }
+            free(ks[j]);
+        }
+        free(ks);
+        fprintf(stderr,"[SUMMARY] %d passed, %d failed\n",run_pass,run_fail);
+        return xs_int(run_fail);
+    }
     const char *name=(n>0&&a[0]->tag==XS_STR)?a[0]->s:"test";
     fprintf(stderr,"[RUN] %s\n",name);
-    /* If fn is a native, call it directly */
-    if (n>=2&&a[1]->tag==XS_NATIVE&&a[1]->native) {
-        Value *no_args=NULL;
-        Value *res=a[1]->native(ig,&no_args,0);
+    if (n>=2&&(a[1]->tag==XS_NATIVE||a[1]->tag==XS_FUNC)) {
+        Value *res=call_value(ig,a[1],NULL,0,name);
+        if (ig->cf.signal) CF_CLEAR(ig);
         if (res) value_decref(res);
     }
     return value_incref(XS_NULL_VAL);
@@ -3328,13 +3669,14 @@ Value *make_test_module(void) {
     map_set(m,"assert_gt",    xs_native(native_test_assert_gt));
     map_set(m,"assert_lt",    xs_native(native_test_assert_lt));
     map_set(m,"assert_close", xs_native(native_test_assert_close));
+    map_set(m,"assert_throws",xs_native(native_test_assert_throws));
     map_set(m,"run",          xs_native(native_test_run));
     map_set(m,"summary",      xs_native(native_test_summary));
     return xs_module(m);
 }
 
 /* csv module */
-static Value *csv_parse_row(const char *s, int *pos2) {
+static Value *csv_parse_row(const char *s, int *pos2, char delim) {
     Value *row=xs_array_new();
     while (s[*pos2]&&s[*pos2]!='\n'&&s[*pos2]!='\r') {
         int start=*pos2;
@@ -3351,10 +3693,10 @@ static Value *csv_parse_row(const char *s, int *pos2) {
             buf[ri]='\0'; array_push(row->arr,xs_str(buf)); free(buf);
         } else {
             /* unquoted field */
-            while (s[*pos2]&&s[*pos2]!=','&&s[*pos2]!='\n'&&s[*pos2]!='\r') (*pos2)++;
+            while (s[*pos2]&&s[*pos2]!=delim&&s[*pos2]!='\n'&&s[*pos2]!='\r') (*pos2)++;
             array_push(row->arr,xs_str_n(s+start,*pos2-start));
         }
-        if (s[*pos2]==',') (*pos2)++;
+        if (s[*pos2]==delim) (*pos2)++;
         else break;
     }
     return row;
@@ -3362,10 +3704,12 @@ static Value *csv_parse_row(const char *s, int *pos2) {
 static Value *native_csv_parse(Interp *ig, Value **a, int n) {
     (void)ig;
     if (n<1||a[0]->tag!=XS_STR) return xs_array_new();
+    char delim=',';
+    if (n>=2&&a[1]->tag==XS_STR&&a[1]->s[0]) delim=a[1]->s[0];
     const char *s=a[0]->s; int pos2=0; int slen=(int)strlen(s);
     Value *rows=xs_array_new();
     while (pos2<slen) {
-        Value *row=csv_parse_row(s,&pos2);
+        Value *row=csv_parse_row(s,&pos2,delim);
         array_push(rows->arr,row);
         while (s[pos2]=='\r'||s[pos2]=='\n') pos2++;
     }
@@ -3374,14 +3718,16 @@ static Value *native_csv_parse(Interp *ig, Value **a, int n) {
 static Value *native_csv_parse_with_headers(Interp *ig, Value **a, int n) {
     (void)ig;
     if (n<1||a[0]->tag!=XS_STR) return xs_array_new();
+    char delim=',';
+    if (n>=2&&a[1]->tag==XS_STR&&a[1]->s[0]) delim=a[1]->s[0];
     const char *s=a[0]->s; int pos2=0; int slen=(int)strlen(s);
     if (pos2>=slen) return xs_array_new();
     /* First row = headers */
-    Value *hdr_row=csv_parse_row(s,&pos2);
+    Value *hdr_row=csv_parse_row(s,&pos2,delim);
     while (s[pos2]=='\r'||s[pos2]=='\n') pos2++;
     Value *result=xs_array_new();
     while (pos2<slen) {
-        Value *row=csv_parse_row(s,&pos2);
+        Value *row=csv_parse_row(s,&pos2,delim);
         Value *rec=xs_map_new();
         for (int j=0;j<hdr_row->arr->len&&j<row->arr->len;j++){
             Value *hk=hdr_row->arr->items[j];
@@ -3400,6 +3746,8 @@ static Value *native_csv_parse_with_headers(Interp *ig, Value **a, int n) {
 static Value *native_csv_stringify(Interp *ig, Value **a, int n) {
     (void)ig;
     if (n<1||a[0]->tag!=XS_ARRAY) return xs_str("");
+    char delim=',';
+    if (n>=2&&a[1]->tag==XS_STR&&a[1]->s[0]) delim=a[1]->s[0];
     int cap=256,len2=0; char *out=xs_malloc(cap); out[0]='\0';
     XSArray *rows=a[0]->arr;
     for (int r=0;r<rows->len;r++){
@@ -3412,12 +3760,12 @@ static Value *native_csv_stringify(Interp *ig, Value **a, int n) {
         for (int c=0;c<row->len;c++){
             if (c){
                 if (len2+2>cap){cap*=2;out=xs_realloc(out,cap);}
-                out[len2++]=','; out[len2]='\0';
+                out[len2++]=delim; out[len2]='\0';
             }
             char *s=value_str(row->items[c]); int sl=(int)strlen(s);
-            /* Quote if contains comma, quote, or newline */
+            /* Quote if contains delimiter, quote, or newline */
             int need_quote=0;
-            for(int j=0;s[j];j++) if(s[j]==','||s[j]=='"'||s[j]=='\n'){need_quote=1;break;}
+            for(int j=0;s[j];j++) if(s[j]==delim||s[j]=='"'||s[j]=='\n'){need_quote=1;break;}
             if (need_quote) {
                 if (len2+sl*2+4>cap){cap=cap*2+sl*2+4;out=xs_realloc(out,cap);}
                 out[len2++]='"';
@@ -3835,6 +4183,8 @@ Value *make_ffi_module(void);
 Value *make_reflect_module(void);
 Value *make_gc_module(void);
 Value *make_reactive_module(void);
+Value *make_toml_module(void);
+Value *make_http_module(void);
 Value *make_fs_module(void);
 
 /* register all */
@@ -4000,6 +4350,14 @@ void stdlib_register(Interp *i) {
     env_define(i->globals, "re", re_mod, 1);
     value_decref(re_mod);
 
+    Value *msgpack_mod = make_msgpack_module();
+    env_define(i->globals, "msgpack", msgpack_mod, 1);
+    value_decref(msgpack_mod);
+
+    Value *promise_mod = make_promise_module();
+    env_define(i->globals, "Promise", promise_mod, 1);
+    value_decref(promise_mod);
+
     /* Constants */
     {
         Value *v = xs_float(M_PI);
@@ -4072,6 +4430,14 @@ void stdlib_register(Interp *i) {
     Value *reactive_mod = make_reactive_module();
     env_define(i->globals, "reactive", reactive_mod, 1);
     value_decref(reactive_mod);
+
+    Value *toml_mod = make_toml_module();
+    env_define(i->globals, "toml", toml_mod, 1);
+    value_decref(toml_mod);
+
+    Value *http_mod = make_http_module();
+    env_define(i->globals, "http", http_mod, 1);
+    value_decref(http_mod);
 
     Value *fs_mod = make_fs_module();
     env_define(i->globals, "fs", fs_mod, 1);
@@ -4846,6 +5212,180 @@ static Value *native_net_http(Interp *ig, Value **a, int n) {
 #endif
 }
 
+/* net.udp_bind(port) */
+static Value *native_net_udp_bind(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n < 1 || a[0]->tag != XS_INT) return value_incref(XS_NULL_VAL);
+    int port = (int)a[0]->i;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return value_incref(XS_NULL_VAL);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons((uint16_t)port);
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(fd); return value_incref(XS_NULL_VAL);
+    }
+    XSMap *m = map_new();
+    map_set(m, "fd", xs_int(fd));
+    return xs_module(m);
+#else
+    (void)a; (void)n;
+    return value_incref(XS_NULL_VAL);
+#endif
+}
+
+/* net.udp_send(sock, host, port, data) */
+static Value *native_net_udp_send(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n < 4) return value_incref(XS_FALSE_VAL);
+    if ((a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE) || a[1]->tag != XS_STR
+        || a[2]->tag != XS_INT || a[3]->tag != XS_STR)
+        return value_incref(XS_FALSE_VAL);
+    Value *fdv = map_get(a[0]->map, "fd");
+    if (!fdv || fdv->tag != XS_INT) return value_incref(XS_FALSE_VAL);
+    int fd = (int)fdv->i;
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons((uint16_t)a[2]->i);
+    inet_pton(AF_INET, a[1]->s, &dest.sin_addr);
+    ssize_t sent = sendto(fd, a[3]->s, strlen(a[3]->s), 0,
+                          (struct sockaddr*)&dest, sizeof(dest));
+    return (sent >= 0) ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL);
+#else
+    (void)a; (void)n;
+    return value_incref(XS_FALSE_VAL);
+#endif
+}
+
+/* net.udp_recv(sock, max) */
+static Value *native_net_udp_recv(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n < 1 || (a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE))
+        return value_incref(XS_NULL_VAL);
+    Value *fdv = map_get(a[0]->map, "fd");
+    if (!fdv || fdv->tag != XS_INT) return value_incref(XS_NULL_VAL);
+    int fd = (int)fdv->i;
+    int maxsz = 65536;
+    if (n >= 2 && a[1]->tag == XS_INT) maxsz = (int)a[1]->i;
+    char *buf = xs_malloc(maxsz + 1);
+    struct sockaddr_in from;
+    socklen_t fromlen = sizeof(from);
+    ssize_t nr = recvfrom(fd, buf, maxsz, 0, (struct sockaddr*)&from, &fromlen);
+    if (nr < 0) { free(buf); return value_incref(XS_NULL_VAL); }
+    buf[nr] = '\0';
+    Value *result = xs_map_new();
+    Value *dv = xs_str_n(buf, nr); map_set(result->map, "data", dv); value_decref(dv);
+    free(buf);
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip));
+    Value *hv = xs_str(ip); map_set(result->map, "host", hv); value_decref(hv);
+    Value *pv = xs_int(ntohs(from.sin_port)); map_set(result->map, "port", pv); value_decref(pv);
+    return result;
+#else
+    (void)a; (void)n;
+    return value_incref(XS_NULL_VAL);
+#endif
+}
+
+/* net.set_timeout(conn, ms) */
+static Value *native_net_set_timeout(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n < 2 || (a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE) || a[1]->tag != XS_INT)
+        return value_incref(XS_FALSE_VAL);
+    Value *fdv = map_get(a[0]->map, "fd");
+    if (!fdv || fdv->tag != XS_INT) return value_incref(XS_FALSE_VAL);
+    int fd = (int)fdv->i;
+    int ms = (int)a[1]->i;
+    struct timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    return value_incref(XS_TRUE_VAL);
+#else
+    (void)a; (void)n;
+    return value_incref(XS_FALSE_VAL);
+#endif
+}
+
+/* net.set_nodelay(conn, bool) */
+static Value *native_net_set_nodelay(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n < 2 || (a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE))
+        return value_incref(XS_FALSE_VAL);
+    Value *fdv = map_get(a[0]->map, "fd");
+    if (!fdv || fdv->tag != XS_INT) return value_incref(XS_FALSE_VAL);
+    int fd = (int)fdv->i;
+    int flag = value_truthy(a[1]) ? 1 : 0;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    return value_incref(XS_TRUE_VAL);
+#else
+    (void)a; (void)n;
+    return value_incref(XS_FALSE_VAL);
+#endif
+}
+
+/* net.close(conn) */
+static Value *native_net_close(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n < 1 || (a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE))
+        return value_incref(XS_FALSE_VAL);
+    Value *fdv = map_get(a[0]->map, "fd");
+    if (!fdv || fdv->tag != XS_INT) return value_incref(XS_FALSE_VAL);
+    close((int)fdv->i);
+    map_set(a[0]->map, "fd", xs_int(-1));
+    return value_incref(XS_TRUE_VAL);
+#else
+    (void)a; (void)n;
+    return value_incref(XS_FALSE_VAL);
+#endif
+}
+
+/* net.send(conn, data) / net.recv(conn, max) */
+static Value *native_net_send(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n < 2 || (a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE) || a[1]->tag != XS_STR)
+        return xs_int(-1);
+    Value *fdv = map_get(a[0]->map, "fd");
+    if (!fdv || fdv->tag != XS_INT) return xs_int(-1);
+    ssize_t w = write((int)fdv->i, a[1]->s, strlen(a[1]->s));
+    return xs_int((int64_t)w);
+#else
+    (void)a; (void)n;
+    return xs_int(-1);
+#endif
+}
+
+static Value *native_net_recv(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n < 1 || (a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE))
+        return value_incref(XS_NULL_VAL);
+    Value *fdv = map_get(a[0]->map, "fd");
+    if (!fdv || fdv->tag != XS_INT) return value_incref(XS_NULL_VAL);
+    int maxsz = 4096;
+    if (n >= 2 && a[1]->tag == XS_INT) maxsz = (int)a[1]->i;
+    char *buf = xs_malloc(maxsz + 1);
+    ssize_t nr = read((int)fdv->i, buf, maxsz);
+    if (nr <= 0) { free(buf); return value_incref(XS_NULL_VAL); }
+    buf[nr] = '\0';
+    Value *v = xs_str_n(buf, nr); free(buf); return v;
+#else
+    (void)a; (void)n;
+    return value_incref(XS_NULL_VAL);
+#endif
+}
+
 Value *make_net_module(void) {
     XSMap *m = map_new();
     map_set(m, "tcp_connect", xs_native(native_net_tcp_connect));
@@ -4855,6 +5395,14 @@ Value *make_net_module(void) {
     map_set(m, "http_get",    xs_native(native_net_http_get));
     map_set(m, "http_post",   xs_native(native_net_http_post));
     map_set(m, "http",        xs_native(native_net_http));
+    map_set(m, "udp_bind",    xs_native(native_net_udp_bind));
+    map_set(m, "udp_send",    xs_native(native_net_udp_send));
+    map_set(m, "udp_recv",    xs_native(native_net_udp_recv));
+    map_set(m, "set_timeout", xs_native(native_net_set_timeout));
+    map_set(m, "set_nodelay", xs_native(native_net_set_nodelay));
+    map_set(m, "close",       xs_native(native_net_close));
+    map_set(m, "send",        xs_native(native_net_send));
+    map_set(m, "recv",        xs_native(native_net_recv));
     return xs_module(m);
 }
 
@@ -5197,18 +5745,321 @@ static Value *native_crypto_base64_decode(Interp *ig, Value **a, int n) {
     r[ri] = '\0'; Value *v2 = xs_str(r); free(r); return v2;
 }
 
+/* crypto.sha1(data) -> hex string using BearSSL */
+static Value *native_crypto_sha1(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || a[0]->tag != XS_STR) return xs_str("");
+    br_sha1_context ctx;
+    br_sha1_init(&ctx);
+    br_sha1_update(&ctx, a[0]->s, strlen(a[0]->s));
+    uint8_t hash[20];
+    br_sha1_out(&ctx, hash);
+    char hex[41];
+    for (int i = 0; i < 20; i++) sprintf(hex + i*2, "%02x", hash[i]);
+    hex[40] = '\0';
+    return xs_str(hex);
+}
+
+/* crypto.hmac_sha256(key, data) -> hex string using BearSSL */
+static Value *native_crypto_hmac_sha256(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 2 || a[0]->tag != XS_STR || a[1]->tag != XS_STR) return xs_str("");
+    br_hmac_key_context kc;
+    br_hmac_key_init(&kc, &br_sha256_vtable, a[0]->s, strlen(a[0]->s));
+    br_hmac_context hctx;
+    br_hmac_init(&hctx, &kc, 0);
+    br_hmac_update(&hctx, a[1]->s, strlen(a[1]->s));
+    uint8_t mac[32];
+    br_hmac_out(&hctx, mac);
+    char hex[65];
+    for (int i = 0; i < 32; i++) sprintf(hex + i*2, "%02x", mac[i]);
+    hex[64] = '\0';
+    return xs_str(hex);
+}
+
+/* crypto.hkdf(ikm, salt, info, length) -> hex string using BearSSL */
+static Value *native_crypto_hkdf(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 4 || a[0]->tag != XS_STR || a[3]->tag != XS_INT) return xs_str("");
+    int out_len = (int)a[3]->i;
+    if (out_len <= 0 || out_len > 255 * 32) return xs_str("");
+    const void *salt = BR_HKDF_NO_SALT;
+    size_t salt_len = 0;
+    if (a[1]->tag == XS_STR && strlen(a[1]->s) > 0) {
+        salt = a[1]->s; salt_len = strlen(a[1]->s);
+    }
+    br_hkdf_context hc;
+    br_hkdf_init(&hc, &br_sha256_vtable, salt, salt_len);
+    br_hkdf_inject(&hc, a[0]->s, strlen(a[0]->s));
+    br_hkdf_flip(&hc);
+    const void *info = "";
+    size_t info_len = 0;
+    if (n >= 3 && a[2]->tag == XS_STR) { info = a[2]->s; info_len = strlen(a[2]->s); }
+    uint8_t *out = xs_malloc(out_len);
+    br_hkdf_produce(&hc, info, info_len, out, out_len);
+    char *hex = xs_malloc(out_len * 2 + 1);
+    for (int i = 0; i < out_len; i++) sprintf(hex + i*2, "%02x", out[i]);
+    hex[out_len * 2] = '\0';
+    free(out);
+    Value *r = xs_str(hex); free(hex); return r;
+}
+
+/* crypto.pbkdf2(password, salt, iterations, key_len) -> hex string
+   PBKDF2-HMAC-SHA256, hand-rolled using BearSSL HMAC primitives */
+static Value *native_crypto_pbkdf2(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 4 || a[0]->tag != XS_STR || a[1]->tag != XS_STR
+        || a[2]->tag != XS_INT || a[3]->tag != XS_INT) return xs_str("");
+    const char *pw = a[0]->s;
+    size_t pw_len = strlen(pw);
+    const char *salt = a[1]->s;
+    size_t salt_len = strlen(salt);
+    int iters = (int)a[2]->i;
+    int dklen = (int)a[3]->i;
+    if (iters <= 0 || dklen <= 0 || dklen > 1024) return xs_str("");
+
+    br_hmac_key_context kc;
+    br_hmac_key_init(&kc, &br_sha256_vtable, pw, pw_len);
+
+    uint8_t *dk = xs_calloc(dklen, 1);
+    int blocks = (dklen + 31) / 32;
+    for (int blk = 1; blk <= blocks; blk++) {
+        /* U1 = HMAC(pw, salt || INT_BE(blk)) */
+        uint8_t salt_blk[4];
+        salt_blk[0] = (uint8_t)(blk >> 24);
+        salt_blk[1] = (uint8_t)(blk >> 16);
+        salt_blk[2] = (uint8_t)(blk >> 8);
+        salt_blk[3] = (uint8_t)(blk);
+
+        br_hmac_context hctx;
+        br_hmac_init(&hctx, &kc, 0);
+        br_hmac_update(&hctx, salt, salt_len);
+        br_hmac_update(&hctx, salt_blk, 4);
+        uint8_t u[32], t[32];
+        br_hmac_out(&hctx, u);
+        memcpy(t, u, 32);
+
+        for (int i = 1; i < iters; i++) {
+            br_hmac_init(&hctx, &kc, 0);
+            br_hmac_update(&hctx, u, 32);
+            br_hmac_out(&hctx, u);
+            for (int j = 0; j < 32; j++) t[j] ^= u[j];
+        }
+
+        int off = (blk - 1) * 32;
+        int cp = dklen - off;
+        if (cp > 32) cp = 32;
+        memcpy(dk + off, t, cp);
+    }
+
+    char *hex = xs_malloc(dklen * 2 + 1);
+    for (int i = 0; i < dklen; i++) sprintf(hex + i*2, "%02x", dk[i]);
+    hex[dklen * 2] = '\0';
+    free(dk);
+    Value *r = xs_str(hex); free(hex); return r;
+}
+
+/* crypto.aes_encrypt(key_hex, plaintext, mode) -> ciphertext hex
+   Supports "cbc" and "gcm". Key must be hex-encoded (32/48/64 chars for 128/192/256). */
+static int hex_decode_bytes(const char *hex, uint8_t *out, int max) {
+    int len = (int)strlen(hex);
+    if (len % 2 != 0) return -1;
+    int n2 = len / 2;
+    if (n2 > max) n2 = max;
+    for (int i = 0; i < n2; i++) {
+        unsigned int b;
+        if (sscanf(hex + i*2, "%2x", &b) != 1) return -1;
+        out[i] = (uint8_t)b;
+    }
+    return n2;
+}
+
+static Value *native_crypto_aes_encrypt(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 2 || a[0]->tag != XS_STR || a[1]->tag != XS_STR) return xs_str("");
+    const char *mode_str = (n >= 3 && a[2]->tag == XS_STR) ? a[2]->s : "gcm";
+
+    uint8_t key[32];
+    int klen = hex_decode_bytes(a[0]->s, key, 32);
+    if (klen != 16 && klen != 24 && klen != 32) return xs_str("");
+
+    const uint8_t *pt = (const uint8_t*)a[1]->s;
+    size_t pt_len = strlen(a[1]->s);
+
+    if (strcmp(mode_str, "cbc") == 0) {
+        /* PKCS7 padding */
+        int pad = 16 - (int)(pt_len % 16);
+        size_t padded_len = pt_len + (size_t)pad;
+        uint8_t *buf = xs_malloc(padded_len);
+        memcpy(buf, pt, pt_len);
+        for (int i = 0; i < pad; i++) buf[pt_len + i] = (uint8_t)pad;
+
+        /* random IV */
+        uint8_t iv[16];
+        FILE *rng = fopen("/dev/urandom", "rb");
+        if (rng) { if (fread(iv, 1, 16, rng) < 16) {} fclose(rng); }
+        else { for (int i=0;i<16;i++) iv[i]=(uint8_t)(rand()&0xff); }
+
+        br_aes_ct_cbcenc_keys ctx;
+        br_aes_ct_cbcenc_init(&ctx, key, (size_t)klen);
+        br_aes_ct_cbcenc_run(&ctx, iv, buf, padded_len);
+
+        /* output: IV || ciphertext, hex encoded */
+        size_t out_len = 16 + padded_len;
+        char *hex = xs_malloc(out_len * 2 + 1);
+        uint8_t iv_save[16];
+        /* we need original IV, but it was modified. regenerate */
+        /* actually, openssl CBC mode modifies IV in place, so we need to save it.
+           let's re-encrypt properly */
+        free(buf); free(hex);
+
+        /* redo: save IV first */
+        uint8_t iv2[16];
+        if (rng) { rng = fopen("/dev/urandom","rb"); if(rng){if(fread(iv2,1,16,rng)<16){}fclose(rng);} }
+        else { for (int i=0;i<16;i++) iv2[i]=(uint8_t)(rand()&0xff); }
+        memcpy(iv_save, iv2, 16);
+
+        buf = xs_malloc(padded_len);
+        memcpy(buf, pt, pt_len);
+        for (int i = 0; i < pad; i++) buf[pt_len + i] = (uint8_t)pad;
+
+        br_aes_ct_cbcenc_init(&ctx, key, (size_t)klen);
+        br_aes_ct_cbcenc_run(&ctx, iv2, buf, padded_len);
+
+        out_len = 16 + padded_len;
+        hex = xs_malloc(out_len * 2 + 1);
+        for (int i = 0; i < 16; i++) sprintf(hex + i*2, "%02x", iv_save[i]);
+        for (size_t i = 0; i < padded_len; i++) sprintf(hex + 32 + i*2, "%02x", buf[i]);
+        hex[out_len * 2] = '\0';
+        free(buf);
+        Value *r = xs_str(hex); free(hex); return r;
+    } else {
+        /* GCM mode */
+        uint8_t iv[12];
+        FILE *rng = fopen("/dev/urandom", "rb");
+        if (rng) { if (fread(iv, 1, 12, rng) < 12) {} fclose(rng); }
+        else { for (int i=0;i<12;i++) iv[i]=(uint8_t)(rand()&0xff); }
+
+        uint8_t *buf = xs_malloc(pt_len > 0 ? pt_len : 1);
+        memcpy(buf, pt, pt_len);
+
+        br_aes_ct_ctr_keys ctr_keys;
+        br_aes_ct_ctr_init(&ctr_keys, key, (size_t)klen);
+        br_gcm_context gc;
+        br_gcm_init(&gc, &ctr_keys.vtable, br_ghash_ctmul);
+        br_gcm_reset(&gc, iv, 12);
+        br_gcm_flip(&gc);
+        br_gcm_run(&gc, 1, buf, pt_len);
+        uint8_t tag[16];
+        br_gcm_get_tag(&gc, tag);
+
+        /* output: IV(12) || ciphertext || tag(16), hex encoded */
+        size_t out_len = 12 + pt_len + 16;
+        char *hex = xs_malloc(out_len * 2 + 1);
+        for (int i = 0; i < 12; i++) sprintf(hex + i*2, "%02x", iv[i]);
+        for (size_t i = 0; i < pt_len; i++) sprintf(hex + 24 + i*2, "%02x", buf[i]);
+        for (int i = 0; i < 16; i++) sprintf(hex + 24 + pt_len*2 + i*2, "%02x", tag[i]);
+        hex[out_len * 2] = '\0';
+        free(buf);
+        Value *r = xs_str(hex); free(hex); return r;
+    }
+}
+
+static Value *native_crypto_aes_decrypt(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 2 || a[0]->tag != XS_STR || a[1]->tag != XS_STR) return xs_str("");
+    const char *mode_str = (n >= 3 && a[2]->tag == XS_STR) ? a[2]->s : "gcm";
+
+    uint8_t key[32];
+    int klen = hex_decode_bytes(a[0]->s, key, 32);
+    if (klen != 16 && klen != 24 && klen != 32) return xs_str("");
+
+    int ct_hex_len = (int)strlen(a[1]->s);
+    if (ct_hex_len % 2 != 0) return xs_str("");
+    int ct_bytes = ct_hex_len / 2;
+
+    if (strcmp(mode_str, "cbc") == 0) {
+        if (ct_bytes < 32) return xs_str(""); /* need at least IV + 1 block */
+        uint8_t *raw = xs_malloc(ct_bytes);
+        if (hex_decode_bytes(a[1]->s, raw, ct_bytes) != ct_bytes) { free(raw); return xs_str(""); }
+
+        uint8_t iv[16];
+        memcpy(iv, raw, 16);
+        uint8_t *ct = raw + 16;
+        int ct_len = ct_bytes - 16;
+
+        br_aes_ct_cbcdec_keys ctx;
+        br_aes_ct_cbcdec_init(&ctx, key, (size_t)klen);
+        br_aes_ct_cbcdec_run(&ctx, iv, ct, (size_t)ct_len);
+
+        /* remove PKCS7 padding */
+        int pad = ct[ct_len - 1];
+        if (pad < 1 || pad > 16) { free(raw); return xs_str(""); }
+        ct_len -= pad;
+        Value *r = xs_str_n((const char*)ct, ct_len);
+        free(raw);
+        return r;
+    } else {
+        /* GCM: IV(12) || ciphertext || tag(16) */
+        if (ct_bytes < 28) return xs_str(""); /* 12 + 0 + 16 minimum */
+        uint8_t *raw = xs_malloc(ct_bytes);
+        if (hex_decode_bytes(a[1]->s, raw, ct_bytes) != ct_bytes) { free(raw); return xs_str(""); }
+
+        uint8_t iv[12];
+        memcpy(iv, raw, 12);
+        int data_len = ct_bytes - 12 - 16;
+        if (data_len < 0) { free(raw); return xs_str(""); }
+        uint8_t *ct = raw + 12;
+        uint8_t *tag = raw + 12 + data_len;
+
+        br_aes_ct_ctr_keys ctr_keys;
+        br_aes_ct_ctr_init(&ctr_keys, key, (size_t)klen);
+        br_gcm_context gc;
+        br_gcm_init(&gc, &ctr_keys.vtable, br_ghash_ctmul);
+        br_gcm_reset(&gc, iv, 12);
+        br_gcm_flip(&gc);
+        br_gcm_run(&gc, 0, ct, (size_t)data_len);
+
+        if (br_gcm_check_tag(&gc, tag) != 1) {
+            free(raw); return xs_str("");
+        }
+        Value *r = xs_str_n((const char*)ct, data_len);
+        free(raw);
+        return r;
+    }
+}
+
+/* crypto.constant_time_eq(a, b) -> bool */
+static Value *native_crypto_constant_time_eq(Interp *ig, Value **a2, int n) {
+    (void)ig;
+    if (n < 2 || a2[0]->tag != XS_STR || a2[1]->tag != XS_STR) return value_incref(XS_FALSE_VAL);
+    size_t la = strlen(a2[0]->s), lb = strlen(a2[1]->s);
+    if (la != lb) return value_incref(XS_FALSE_VAL);
+    volatile uint8_t diff = 0;
+    for (size_t i = 0; i < la; i++)
+        diff |= (uint8_t)((unsigned char)a2[0]->s[i] ^ (unsigned char)a2[1]->s[i]);
+    return (diff == 0) ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL);
+}
+
 Value *make_crypto_module(void) {
     XSMap *m = map_new();
-    map_set(m, "sha256",        xs_native(native_crypto_sha256));
-    map_set(m, "md5",           xs_native(native_crypto_md5));
-    map_set(m, "hash",          xs_native(native_crypto_hash));
-    map_set(m, "hex_encode",    xs_native(native_crypto_hex_encode));
-    map_set(m, "hex_decode",    xs_native(native_crypto_hex_decode));
-    map_set(m, "base64_encode", xs_native(native_crypto_base64_encode));
-    map_set(m, "base64_decode", xs_native(native_crypto_base64_decode));
-    map_set(m, "random_bytes",  xs_native(native_crypto_random_bytes));
-    map_set(m, "random_int",    xs_native(native_crypto_random_int));
-    map_set(m, "uuid4",         xs_native(native_crypto_uuid4));
+    map_set(m, "sha256",           xs_native(native_crypto_sha256));
+    map_set(m, "sha1",             xs_native(native_crypto_sha1));
+    map_set(m, "md5",              xs_native(native_crypto_md5));
+    map_set(m, "hmac_sha256",      xs_native(native_crypto_hmac_sha256));
+    map_set(m, "hash",             xs_native(native_crypto_hash));
+    map_set(m, "hex_encode",       xs_native(native_crypto_hex_encode));
+    map_set(m, "hex_decode",       xs_native(native_crypto_hex_decode));
+    map_set(m, "base64_encode",    xs_native(native_crypto_base64_encode));
+    map_set(m, "base64_decode",    xs_native(native_crypto_base64_decode));
+    map_set(m, "random_bytes",     xs_native(native_crypto_random_bytes));
+    map_set(m, "random_int",       xs_native(native_crypto_random_int));
+    map_set(m, "uuid4",            xs_native(native_crypto_uuid4));
+    map_set(m, "hkdf",             xs_native(native_crypto_hkdf));
+    map_set(m, "pbkdf2",           xs_native(native_crypto_pbkdf2));
+    map_set(m, "aes_encrypt",      xs_native(native_crypto_aes_encrypt));
+    map_set(m, "aes_decrypt",      xs_native(native_crypto_aes_decrypt));
+    map_set(m, "constant_time_eq", xs_native(native_crypto_constant_time_eq));
     return xs_module(m);
 }
 
@@ -6419,35 +7270,68 @@ Value *make_reflect_module(void) {
 
 static Value *native_gc_collect(Interp *ig, Value **a, int n) {
     (void)ig; (void)a; (void)n;
-    /* XS uses refcounting, not tracing GC. This is a no-op. */
-    return value_incref(XS_NULL_VAL);
+    int freed = gc_collect();
+    return xs_int(freed);
 }
 
 static Value *native_gc_disable(Interp *ig, Value **a, int n) {
     (void)ig; (void)a; (void)n;
+    gc_disable();
     return value_incref(XS_NULL_VAL);
 }
 
 static Value *native_gc_enable(Interp *ig, Value **a, int n) {
     (void)ig; (void)a; (void)n;
+    gc_enable();
     return value_incref(XS_NULL_VAL);
 }
 
 static Value *native_gc_stats(Interp *ig, Value **a, int n) {
     (void)ig; (void)a; (void)n;
+    GCStats st = gc_get_stats();
     XSMap *s = map_new();
-    map_set(s, "heap_used",   xs_int(0));
-    map_set(s, "collections", xs_int(0));
-    map_set(s, "strategy",    xs_str("refcount"));
+    map_set(s, "total_collected",   xs_int(st.total_collected));
+    map_set(s, "total_allocations", xs_int(st.total_allocations));
+    map_set(s, "gen0_collections",  xs_int(st.gen0_collections));
+    map_set(s, "gen1_collections",  xs_int(st.gen1_collections));
+    map_set(s, "gen2_collections",  xs_int(st.gen2_collections));
+    map_set(s, "tracked",           xs_int(gc_tracked_count()));
+    map_set(s, "peak_tracked",      xs_int(st.peak_tracked));
+    map_set(s, "gc_time_ms",        xs_float(st.total_gc_time_ms));
+    map_set(s, "strategy",          xs_str("generational-refcount"));
     return xs_module(s);
 }
 
+static Value *native_gc_set_threshold(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 2 || !a[0] || !a[1]) return value_incref(XS_NULL_VAL);
+    if (a[0]->tag != XS_INT || a[1]->tag != XS_INT) return value_incref(XS_NULL_VAL);
+    gc_set_threshold((int)a[0]->i, (int)a[1]->i);
+    return value_incref(XS_NULL_VAL);
+}
+
+static Value *native_gc_freeze(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || !a[0]) return value_incref(XS_NULL_VAL);
+    gc_freeze(a[0]);
+    return value_incref(XS_NULL_VAL);
+}
+
+static Value *native_gc_tracked(Interp *ig, Value **a, int n) {
+    (void)ig; (void)a; (void)n;
+    return xs_int(gc_tracked_count());
+}
+
 Value *make_gc_module(void) {
+    gc_init();
     XSMap *m = map_new();
-    map_set(m, "collect", xs_native(native_gc_collect));
-    map_set(m, "disable", xs_native(native_gc_disable));
-    map_set(m, "enable",  xs_native(native_gc_enable));
-    map_set(m, "stats",   xs_native(native_gc_stats));
+    map_set(m, "collect",       xs_native(native_gc_collect));
+    map_set(m, "disable",       xs_native(native_gc_disable));
+    map_set(m, "enable",        xs_native(native_gc_enable));
+    map_set(m, "stats",         xs_native(native_gc_stats));
+    map_set(m, "set_threshold", xs_native(native_gc_set_threshold));
+    map_set(m, "freeze",        xs_native(native_gc_freeze));
+    map_set(m, "tracked",       xs_native(native_gc_tracked));
     return xs_module(m);
 }
 
@@ -6576,17 +7460,733 @@ static Value *native_fs_size(Interp *ig, Value **a, int n) {
     return xs_int((int64_t)st.st_size);
 }
 
+static Value *native_fs_stat(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || a[0]->tag != XS_STR) return value_incref(XS_NULL_VAL);
+    struct stat st;
+    if (stat(a[0]->s, &st) != 0) return value_incref(XS_NULL_VAL);
+    XSMap *m = map_new();
+    map_set(m, "size", xs_int((int64_t)st.st_size));
+    map_set(m, "is_file", S_ISREG(st.st_mode) ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL));
+    map_set(m, "is_dir", S_ISDIR(st.st_mode) ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL));
+    map_set(m, "mtime", xs_int((int64_t)st.st_mtime));
+    return xs_module(m);
+}
+
+static Value *native_fs_read_bytes(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || a[0]->tag != XS_STR) return xs_array_new();
+    FILE *f = fopen(a[0]->s, "rb");
+    if (!f) return xs_array_new();
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t *buf = xs_malloc((size_t)sz);
+    long nr = (long)fread(buf, 1, (size_t)sz, f); fclose(f);
+    Value *arr = xs_array_new();
+    for (long j = 0; j < nr; j++) array_push(arr->arr, xs_int(buf[j]));
+    free(buf);
+    return arr;
+}
+
+static Value *native_fs_write_bytes(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 2 || a[0]->tag != XS_STR || a[1]->tag != XS_ARRAY) return value_incref(XS_FALSE_VAL);
+    FILE *f = fopen(a[0]->s, "wb");
+    if (!f) return value_incref(XS_FALSE_VAL);
+    XSArray *arr = a[1]->arr;
+    for (int j = 0; j < arr->len; j++) {
+        uint8_t b = (arr->items[j]->tag == XS_INT) ? (uint8_t)arr->items[j]->i : 0;
+        fwrite(&b, 1, 1, f);
+    }
+    fclose(f);
+    return value_incref(XS_TRUE_VAL);
+}
+
+static Value *native_fs_mkdir_p(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || a[0]->tag != XS_STR) return value_incref(XS_FALSE_VAL);
+    int r = io_mkdirs(a[0]->s);
+    return (r == 0 || errno == EEXIST) ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL);
+}
+
+static Value *native_fs_rmdir(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || a[0]->tag != XS_STR) return value_incref(XS_FALSE_VAL);
+    return (rmdir(a[0]->s) == 0) ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL);
+}
+
+static Value *native_fs_rename(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 2 || a[0]->tag != XS_STR || a[1]->tag != XS_STR) return value_incref(XS_FALSE_VAL);
+    return (rename(a[0]->s, a[1]->s) == 0) ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL);
+}
+
+static Value *native_fs_copy(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 2 || a[0]->tag != XS_STR || a[1]->tag != XS_STR) return value_incref(XS_FALSE_VAL);
+    FILE *src = fopen(a[0]->s, "rb"); if (!src) return value_incref(XS_FALSE_VAL);
+    FILE *dst = fopen(a[1]->s, "wb"); if (!dst) { fclose(src); return value_incref(XS_FALSE_VAL); }
+    char buf[4096]; size_t nr;
+    while ((nr = fread(buf, 1, sizeof buf, src)) > 0) fwrite(buf, 1, nr, dst);
+    fclose(src); fclose(dst);
+    return value_incref(XS_TRUE_VAL);
+}
+
+static Value *native_fs_join(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1) return xs_str("");
+    int total = 0;
+    for (int j = 0; j < n; j++) {
+        if (a[j]->tag != XS_STR) continue;
+        total += (int)strlen(a[j]->s) + 1;
+    }
+    char *res = xs_malloc(total + 1); res[0] = '\0';
+    for (int j = 0; j < n; j++) {
+        if (a[j]->tag != XS_STR) continue;
+        if (j > 0 && res[0] != '\0') {
+            int rlen = (int)strlen(res);
+            if (rlen > 0 && res[rlen-1] != '/') strcat(res, "/");
+        }
+        strcat(res, a[j]->s);
+    }
+    Value *v = xs_str(res); free(res); return v;
+}
+
+static Value *native_fs_basename(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || a[0]->tag != XS_STR) return xs_str("");
+    const char *s = a[0]->s;
+    const char *last = strrchr(s, '/');
+    return xs_str(last ? last + 1 : s);
+}
+
+static Value *native_fs_dirname(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || a[0]->tag != XS_STR) return xs_str(".");
+    const char *s = a[0]->s;
+    const char *last = strrchr(s, '/');
+    if (!last) return xs_str(".");
+    if (last == s) return xs_str("/");
+    return xs_str_n(s, last - s);
+}
+
+static Value *native_fs_ext(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || a[0]->tag != XS_STR) return xs_str("");
+    const char *s = a[0]->s;
+    const char *base = strrchr(s, '/');
+    const char *dot = strrchr(base ? base : s, '.');
+    return dot ? xs_str(dot) : xs_str("");
+}
+
+static Value *native_fs_abs(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || a[0]->tag != XS_STR) return xs_str("");
+    char buf[4096];
+    if (realpath(a[0]->s, buf)) return xs_str(buf);
+    return value_incref((Value*)a[0]);
+}
+
+static Value *native_fs_temp_dir(Interp *ig, Value **a, int n) {
+    (void)ig; (void)a; (void)n;
+    const char *t = getenv("TMPDIR");
+    if (!t) t = "/tmp";
+    return xs_str(t);
+}
+
+static Value *native_fs_temp_file(Interp *ig, Value **a, int n) {
+    (void)ig; (void)a; (void)n;
+    char tmpl[] = "/tmp/xs_tmp_XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) return xs_str("");
+    close(fd);
+    return xs_str(tmpl);
+}
+
+/* fs.read_stream(path) - returns a reader map with read/read_line/read_all/close */
+static Value *native_fs_reader_read(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || (a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE)) return value_incref(XS_NULL_VAL);
+    Value *fdv = map_get(a[0]->map, "_fd");
+    if (!fdv || fdv->tag != XS_INT) return value_incref(XS_NULL_VAL);
+    FILE *f = (FILE*)(uintptr_t)fdv->i;
+    if (!f) return value_incref(XS_NULL_VAL);
+    int count = 4096;
+    if (n >= 2 && a[1]->tag == XS_INT) count = (int)a[1]->i;
+    if (count <= 0) count = 1;
+    if (count > 1048576) count = 1048576;
+    char *buf = xs_malloc((size_t)count + 1);
+    size_t nr = fread(buf, 1, (size_t)count, f);
+    if (nr == 0) { free(buf); return value_incref(XS_NULL_VAL); }
+    buf[nr] = '\0';
+    Value *v = xs_str_n(buf, nr); free(buf); return v;
+}
+
+static Value *native_fs_reader_read_line(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || (a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE)) return value_incref(XS_NULL_VAL);
+    Value *fdv = map_get(a[0]->map, "_fd");
+    if (!fdv || fdv->tag != XS_INT) return value_incref(XS_NULL_VAL);
+    FILE *f = (FILE*)(uintptr_t)fdv->i;
+    if (!f) return value_incref(XS_NULL_VAL);
+    int cap = 256; char *buf = xs_malloc(cap); int pos = 0;
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        if (c == '\n') break;
+        if (pos + 1 >= cap) { cap *= 2; buf = xs_realloc(buf, cap); }
+        buf[pos++] = (char)c;
+    }
+    if (pos == 0 && c == EOF) { free(buf); return value_incref(XS_NULL_VAL); }
+    if (pos > 0 && buf[pos-1] == '\r') pos--;
+    buf[pos] = '\0';
+    Value *v = xs_str(buf); free(buf); return v;
+}
+
+static Value *native_fs_reader_read_all(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || (a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE)) return value_incref(XS_NULL_VAL);
+    Value *fdv = map_get(a[0]->map, "_fd");
+    if (!fdv || fdv->tag != XS_INT) return value_incref(XS_NULL_VAL);
+    FILE *f = (FILE*)(uintptr_t)fdv->i;
+    if (!f) return value_incref(XS_NULL_VAL);
+    int cap = 4096; char *buf = xs_malloc(cap); int pos = 0;
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        if (pos + 1 >= cap) { cap *= 2; buf = xs_realloc(buf, cap); }
+        buf[pos++] = (char)c;
+    }
+    buf[pos] = '\0';
+    Value *v = xs_str(buf); free(buf); return v;
+}
+
+static Value *native_fs_reader_close(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || (a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE)) return value_incref(XS_NULL_VAL);
+    Value *fdv = map_get(a[0]->map, "_fd");
+    if (!fdv || fdv->tag != XS_INT) return value_incref(XS_NULL_VAL);
+    FILE *f = (FILE*)(uintptr_t)fdv->i;
+    if (f) { fclose(f); map_set(a[0]->map, "_fd", xs_int(0)); }
+    return value_incref(XS_NULL_VAL);
+}
+
+static Value *native_fs_read_stream(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || a[0]->tag != XS_STR) return value_incref(XS_NULL_VAL);
+    FILE *f = fopen(a[0]->s, "r");
+    if (!f) return value_incref(XS_NULL_VAL);
+    XSMap *m = map_new();
+    map_set(m, "_fd", xs_int((int64_t)(uintptr_t)f));
+    map_set(m, "read", xs_native(native_fs_reader_read));
+    map_set(m, "read_line", xs_native(native_fs_reader_read_line));
+    map_set(m, "read_all", xs_native(native_fs_reader_read_all));
+    map_set(m, "close", xs_native(native_fs_reader_close));
+    return xs_module(m);
+}
+
+/* fs.write_stream(path) - returns a writer map with write/flush/close */
+static Value *native_fs_writer_write(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 2 || (a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE)) return value_incref(XS_FALSE_VAL);
+    Value *fdv = map_get(a[0]->map, "_fd");
+    if (!fdv || fdv->tag != XS_INT) return value_incref(XS_FALSE_VAL);
+    FILE *f = (FILE*)(uintptr_t)fdv->i;
+    if (!f) return value_incref(XS_FALSE_VAL);
+    if (a[1]->tag == XS_STR) fputs(a[1]->s, f);
+    return value_incref(XS_TRUE_VAL);
+}
+
+static Value *native_fs_writer_flush(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || (a[0]->tag != XS_MAP && a[0]->tag != XS_MODULE)) return value_incref(XS_NULL_VAL);
+    Value *fdv = map_get(a[0]->map, "_fd");
+    if (!fdv || fdv->tag != XS_INT) return value_incref(XS_NULL_VAL);
+    FILE *f = (FILE*)(uintptr_t)fdv->i;
+    if (f) fflush(f);
+    return value_incref(XS_NULL_VAL);
+}
+
+static Value *native_fs_write_stream(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || a[0]->tag != XS_STR) return value_incref(XS_NULL_VAL);
+    FILE *f = fopen(a[0]->s, "w");
+    if (!f) return value_incref(XS_NULL_VAL);
+    XSMap *m = map_new();
+    map_set(m, "_fd", xs_int((int64_t)(uintptr_t)f));
+    map_set(m, "write", xs_native(native_fs_writer_write));
+    map_set(m, "flush", xs_native(native_fs_writer_flush));
+    map_set(m, "close", xs_native(native_fs_reader_close));
+    return xs_module(m);
+}
+
+/* fs.read_lines(path) - returns array of lines */
+static Value *native_fs_read_lines(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || a[0]->tag != XS_STR) return xs_array_new();
+    FILE *f = fopen(a[0]->s, "r");
+    if (!f) return xs_array_new();
+    Value *arr = xs_array_new();
+    char buf[8192];
+    while (fgets(buf, sizeof(buf), f)) {
+        int len = (int)strlen(buf);
+        while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r')) buf[--len] = '\0';
+        array_push(arr->arr, xs_str(buf));
+    }
+    fclose(f);
+    return arr;
+}
+
+/* fs.walk(path) - recursive directory walker, returns array of entry maps */
+static void fs_walk_recurse(const char *dir, Value *arr) {
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        char fullpath[4096];
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", dir, ent->d_name);
+        struct stat st;
+        if (stat(fullpath, &st) != 0) continue;
+        Value *entry = xs_map_new();
+        Value *pv = xs_str(fullpath); map_set(entry->map, "path", pv); value_decref(pv);
+        Value *nv = xs_str(ent->d_name); map_set(entry->map, "name", nv); value_decref(nv);
+        int isdir = S_ISDIR(st.st_mode);
+        int isfile = S_ISREG(st.st_mode);
+        map_set(entry->map, "is_file", isfile ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL));
+        map_set(entry->map, "is_dir", isdir ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL));
+        Value *sv = xs_int((int64_t)st.st_size); map_set(entry->map, "size", sv); value_decref(sv);
+        array_push(arr->arr, entry);
+        value_decref(entry);
+        if (isdir) fs_walk_recurse(fullpath, arr);
+    }
+    closedir(d);
+#else
+    (void)dir; (void)arr;
+#endif
+}
+
+static Value *native_fs_walk(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || a[0]->tag != XS_STR) return xs_array_new();
+    Value *arr = xs_array_new();
+    fs_walk_recurse(a[0]->s, arr);
+    return arr;
+}
+
+/* fs.glob(pattern) - match files by glob pattern */
+static Value *native_fs_glob(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n < 1 || a[0]->tag != XS_STR) return xs_array_new();
+    glob_t g;
+    memset(&g, 0, sizeof(g));
+    int rc = glob(a[0]->s, GLOB_NOSORT, NULL, &g);
+    Value *arr = xs_array_new();
+    if (rc == 0) {
+        for (size_t j = 0; j < g.gl_pathc; j++)
+            array_push(arr->arr, xs_str(g.gl_pathv[j]));
+    }
+    globfree(&g);
+    return arr;
+#else
+    (void)a; (void)n;
+    return xs_array_new();
+#endif
+}
+
+/* fs.chmod(path, mode) */
+static Value *native_fs_chmod(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n < 2 || a[0]->tag != XS_STR || a[1]->tag != XS_INT) return value_incref(XS_FALSE_VAL);
+    return (chmod(a[0]->s, (mode_t)a[1]->i) == 0) ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL);
+#else
+    (void)a; (void)n;
+    return value_incref(XS_FALSE_VAL);
+#endif
+}
+
+/* fs.symlink(target, link_path) */
+static Value *native_fs_symlink(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n < 2 || a[0]->tag != XS_STR || a[1]->tag != XS_STR) return value_incref(XS_FALSE_VAL);
+    return (symlink(a[0]->s, a[1]->s) == 0) ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL);
+#else
+    (void)a; (void)n;
+    return value_incref(XS_FALSE_VAL);
+#endif
+}
+
+/* fs.readlink(path) */
+static Value *native_fs_readlink(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n < 1 || a[0]->tag != XS_STR) return value_incref(XS_NULL_VAL);
+    char buf[4096];
+    ssize_t len = readlink(a[0]->s, buf, sizeof(buf) - 1);
+    if (len < 0) return value_incref(XS_NULL_VAL);
+    buf[len] = '\0';
+    return xs_str(buf);
+#else
+    (void)a; (void)n;
+    return value_incref(XS_NULL_VAL);
+#endif
+}
+
+/* fs.realpath(path) */
+static Value *native_fs_realpath(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1 || a[0]->tag != XS_STR) return value_incref(XS_NULL_VAL);
+    char buf[4096];
+    if (realpath(a[0]->s, buf)) return xs_str(buf);
+    return value_incref(XS_NULL_VAL);
+}
+
+/* fs.watch(path, callback) - inotify-based file watcher (Linux only, stub elsewhere) */
+static Value *native_fs_watch(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if defined(__linux__) && !defined(__wasi__)
+    if (n < 2 || a[0]->tag != XS_STR || (a[1]->tag != XS_FUNC && a[1]->tag != XS_NATIVE))
+        return value_incref(XS_FALSE_VAL);
+    /* single-shot watch: block until one event, call callback, return */
+    int ifd = inotify_init();
+    if (ifd < 0) return value_incref(XS_FALSE_VAL);
+    int wd = inotify_add_watch(ifd, a[0]->s, IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVE);
+    if (wd < 0) { close(ifd); return value_incref(XS_FALSE_VAL); }
+    char evbuf[4096];
+    ssize_t len = read(ifd, evbuf, sizeof(evbuf));
+    if (len > 0) {
+        struct inotify_event *ev = (struct inotify_event *)evbuf;
+        Value *info = xs_map_new();
+        const char *etype = "unknown";
+        if (ev->mask & IN_CREATE) etype = "create";
+        else if (ev->mask & IN_DELETE) etype = "delete";
+        else if (ev->mask & IN_MODIFY) etype = "modify";
+        else if (ev->mask & IN_MOVE) etype = "move";
+        Value *tv = xs_str(etype); map_set(info->map, "type", tv); value_decref(tv);
+        if (ev->len > 0) {
+            Value *nv = xs_str(ev->name); map_set(info->map, "name", nv); value_decref(nv);
+        }
+        Value *cb_args[1] = { info };
+        Value *r = call_value(ig, a[1], cb_args, 1, "fs.watch");
+        if (r) value_decref(r);
+        value_decref(info);
+    }
+    inotify_rm_watch(ifd, wd);
+    close(ifd);
+    return value_incref(XS_TRUE_VAL);
+#else
+    (void)a; (void)n;
+    return value_incref(XS_FALSE_VAL);
+#endif
+}
+
+/* toml module */
+static void toml_skip_ws_inline(const char *s, int *p) {
+    while (s[*p]==' '||s[*p]=='\t') (*p)++;
+}
+static void toml_skip_comment(const char *s, int *p) {
+    if (s[*p]=='#') { while (s[*p]&&s[*p]!='\n') (*p)++; }
+}
+static char *toml_parse_key(const char *s, int *p) {
+    if (s[*p]=='"'||s[*p]=='\'') {
+        char q=s[*p]; (*p)++;
+        int start=*p;
+        while (s[*p]&&s[*p]!=q) (*p)++;
+        int len=*p-start;
+        char *k=xs_malloc(len+1);
+        memcpy(k,s+start,len); k[len]='\0';
+        if (s[*p]==q) (*p)++;
+        return k;
+    }
+    int start=*p;
+    while (s[*p]&&(isalnum((unsigned char)s[*p])||s[*p]=='_'||s[*p]=='-')) (*p)++;
+    if (*p==start) return NULL;
+    int len=*p-start;
+    char *k=xs_malloc(len+1);
+    memcpy(k,s+start,len); k[len]='\0';
+    return k;
+}
+static Value *toml_parse_val(const char *s, int *p);
+static Value *toml_parse_string(const char *s, int *p) {
+    char q=s[*p]; (*p)++;
+    int cap=64; char *buf=xs_malloc(cap); int ri=0;
+    while (s[*p]&&s[*p]!=q) {
+        if (ri+4>=cap){cap*=2;buf=xs_realloc(buf,cap);}
+        if (s[*p]=='\\') {
+            (*p)++;
+            switch(s[*p]){
+            case 'n': buf[ri++]='\n'; break;
+            case 't': buf[ri++]='\t'; break;
+            case 'r': buf[ri++]='\r'; break;
+            case '\\': buf[ri++]='\\'; break;
+            case '"': buf[ri++]='"'; break;
+            default: buf[ri++]=s[*p]; break;
+            }
+        } else buf[ri++]=s[*p];
+        (*p)++;
+    }
+    if (s[*p]==q) (*p)++;
+    buf[ri]='\0'; Value *v=xs_str(buf); free(buf); return v;
+}
+static Value *toml_parse_array(const char *s, int *p) {
+    (*p)++;
+    Value *arr=xs_array_new();
+    while (s[*p]) {
+        toml_skip_ws_inline(s,p);
+        while (s[*p]=='\n'||s[*p]=='\r') (*p)++;
+        toml_skip_ws_inline(s,p);
+        toml_skip_comment(s,p);
+        if (s[*p]==']') { (*p)++; break; }
+        Value *v=toml_parse_val(s,p);
+        if (v) array_push(arr->arr,v);
+        toml_skip_ws_inline(s,p);
+        if (s[*p]==',') (*p)++;
+    }
+    return arr;
+}
+static Value *toml_parse_val(const char *s, int *p) {
+    toml_skip_ws_inline(s,p);
+    if (s[*p]=='"'||s[*p]=='\'') return toml_parse_string(s,p);
+    if (s[*p]=='[') return toml_parse_array(s,p);
+    if (strncmp(s+*p,"true",4)==0&&!isalnum((unsigned char)s[*p+4])){*p+=4;return value_incref(XS_TRUE_VAL);}
+    if (strncmp(s+*p,"false",5)==0&&!isalnum((unsigned char)s[*p+5])){*p+=5;return value_incref(XS_FALSE_VAL);}
+    int start=*p; int is_float=0;
+    if (s[*p]=='-'||s[*p]=='+') (*p)++;
+    while (isdigit((unsigned char)s[*p])||s[*p]=='_') (*p)++;
+    if (s[*p]=='.'){is_float=1;(*p)++;while(isdigit((unsigned char)s[*p])||s[*p]=='_')(*p)++;}
+    if (s[*p]=='e'||s[*p]=='E'){is_float=1;(*p)++;if(s[*p]=='+'||s[*p]=='-')(*p)++;while(isdigit((unsigned char)s[*p]))(*p)++;}
+    if (*p>start) {
+        int slen2=*p-start;
+        char *tmp=xs_malloc(slen2+1); int ti=0;
+        for(int j=start;j<*p;j++) if(s[j]!='_') tmp[ti++]=s[j];
+        tmp[ti]='\0';
+        Value *v;
+        if (is_float) v=xs_float(strtod(tmp,NULL));
+        else v=xs_int((int64_t)strtoll(tmp,NULL,10));
+        free(tmp); return v;
+    }
+    return value_incref(XS_NULL_VAL);
+}
+static XSMap *toml_ensure_section(XSMap *root, const char *section) {
+    char buf[512];
+    int len=(int)strlen(section);
+    if (len>=(int)sizeof(buf)-1) len=(int)sizeof(buf)-2;
+    memcpy(buf,section,len); buf[len]='\0';
+    XSMap *cur=root; char *pp=buf;
+    while (*pp) {
+        char *dot=strchr(pp,'.');
+        if (dot) *dot='\0';
+        Value *existing=map_get(cur,pp);
+        if (existing&&(existing->tag==XS_MAP||existing->tag==XS_MODULE)) cur=existing->map;
+        else { Value *nm=xs_map_new(); map_set(cur,pp,nm); cur=nm->map; value_decref(nm); }
+        if (dot) pp=dot+1; else break;
+    }
+    return cur;
+}
+static Value *native_toml_parse(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n<1||a[0]->tag!=XS_STR) return xs_map_new();
+    const char *s=a[0]->s; int pos=0; int slen=(int)strlen(s);
+    Value *root=xs_map_new(); XSMap *cur=root->map;
+    while (pos<slen) {
+        toml_skip_ws_inline(s,&pos);
+        if (s[pos]=='\n'||s[pos]=='\r') { pos++; continue; }
+        if (s[pos]=='#') { while(s[pos]&&s[pos]!='\n') pos++; continue; }
+        if (!s[pos]) break;
+        if (s[pos]=='[') {
+            pos++; int dbl=0;
+            if (s[pos]=='[') { dbl=1; pos++; }
+            toml_skip_ws_inline(s,&pos);
+            int kstart=pos;
+            while (s[pos]&&s[pos]!=']') pos++;
+            int klen=pos-kstart;
+            while (klen>0&&(s[kstart+klen-1]==' '||s[kstart+klen-1]=='\t')) klen--;
+            char *section=xs_malloc(klen+1);
+            memcpy(section,s+kstart,klen); section[klen]='\0';
+            cur=toml_ensure_section(root->map,section);
+            free(section);
+            if (s[pos]==']') pos++;
+            if (dbl&&s[pos]==']') pos++;
+            while (s[pos]&&s[pos]!='\n') pos++;
+            continue;
+        }
+        char *key=toml_parse_key(s,&pos);
+        if (!key) { while(s[pos]&&s[pos]!='\n') pos++; continue; }
+        toml_skip_ws_inline(s,&pos);
+        if (s[pos]!='=') { free(key); while(s[pos]&&s[pos]!='\n') pos++; continue; }
+        pos++;
+        toml_skip_ws_inline(s,&pos);
+        Value *val=toml_parse_val(s,&pos);
+        map_set(cur,key,val); value_decref(val); free(key);
+        toml_skip_ws_inline(s,&pos);
+        toml_skip_comment(s,&pos);
+        while (s[pos]=='\n'||s[pos]=='\r') pos++;
+    }
+    return root;
+}
+Value *make_toml_module(void) {
+    XSMap *m=map_new();
+    map_set(m,"parse",xs_native(native_toml_parse));
+    return xs_module(m);
+}
+
+/* http high-level module */
+static Value *native_http_get(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n<1||a[0]->tag!=XS_STR) return value_incref(XS_NULL_VAL);
+    XSMap *hdrs=NULL;
+    if (n>=2&&a[1]->tag==XS_MAP) {
+        Value *hv=map_get(a[1]->map,"headers");
+        if (hv&&hv->tag==XS_MAP) hdrs=hv->map;
+    }
+    return http_do_request("GET",a[0]->s,hdrs,NULL,0);
+#else
+    (void)a;(void)n; return value_incref(XS_NULL_VAL);
+#endif
+}
+static Value *native_http_post(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n<1||a[0]->tag!=XS_STR) return value_incref(XS_NULL_VAL);
+    const char *body=NULL; size_t body_len=0;
+    if (n>=2&&a[1]->tag==XS_STR) { body=a[1]->s; body_len=strlen(a[1]->s); }
+    XSMap *hdrs=NULL;
+    if (n>=3&&a[2]->tag==XS_MAP) {
+        Value *hv=map_get(a[2]->map,"headers");
+        if (hv&&hv->tag==XS_MAP) hdrs=hv->map; else hdrs=a[2]->map;
+    }
+    return http_do_request("POST",a[0]->s,hdrs,body,body_len);
+#else
+    (void)a;(void)n; return value_incref(XS_NULL_VAL);
+#endif
+}
+static Value *native_http_put(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n<1||a[0]->tag!=XS_STR) return value_incref(XS_NULL_VAL);
+    const char *body=NULL; size_t body_len=0;
+    if (n>=2&&a[1]->tag==XS_STR) { body=a[1]->s; body_len=strlen(a[1]->s); }
+    XSMap *hdrs=NULL;
+    if (n>=3&&a[2]->tag==XS_MAP) {
+        Value *hv=map_get(a[2]->map,"headers");
+        if (hv&&hv->tag==XS_MAP) hdrs=hv->map; else hdrs=a[2]->map;
+    }
+    return http_do_request("PUT",a[0]->s,hdrs,body,body_len);
+#else
+    (void)a;(void)n; return value_incref(XS_NULL_VAL);
+#endif
+}
+static Value *native_http_delete(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n<1||a[0]->tag!=XS_STR) return value_incref(XS_NULL_VAL);
+    XSMap *hdrs=NULL;
+    if (n>=2&&a[1]->tag==XS_MAP) {
+        Value *hv=map_get(a[1]->map,"headers");
+        if (hv&&hv->tag==XS_MAP) hdrs=hv->map;
+    }
+    return http_do_request("DELETE",a[0]->s,hdrs,NULL,0);
+#else
+    (void)a;(void)n; return value_incref(XS_NULL_VAL);
+#endif
+}
+static Value *native_http_patch(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n<1||a[0]->tag!=XS_STR) return value_incref(XS_NULL_VAL);
+    const char *body=NULL; size_t body_len=0;
+    if (n>=2&&a[1]->tag==XS_STR) { body=a[1]->s; body_len=strlen(a[1]->s); }
+    XSMap *hdrs=NULL;
+    if (n>=3&&a[2]->tag==XS_MAP) {
+        Value *hv=map_get(a[2]->map,"headers");
+        if (hv&&hv->tag==XS_MAP) hdrs=hv->map; else hdrs=a[2]->map;
+    }
+    return http_do_request("PATCH",a[0]->s,hdrs,body,body_len);
+#else
+    (void)a;(void)n; return value_incref(XS_NULL_VAL);
+#endif
+}
+
+/* http.request(method, url, opts) - full request with options map */
+static Value *native_http_request(Interp *ig, Value **a, int n) {
+    (void)ig;
+#if !defined(__MINGW32__) && !defined(__wasi__)
+    if (n<2||a[0]->tag!=XS_STR||a[1]->tag!=XS_STR) return value_incref(XS_NULL_VAL);
+    const char *method = a[0]->s;
+    const char *url = a[1]->s;
+    XSMap *hdrs = NULL;
+    const char *body = NULL;
+    size_t body_len = 0;
+    if (n >= 3 && a[2]->tag == XS_MAP) {
+        Value *hv = map_get(a[2]->map, "headers");
+        if (hv && hv->tag == XS_MAP) hdrs = hv->map;
+        Value *bv = map_get(a[2]->map, "body");
+        if (bv && bv->tag == XS_STR) { body = bv->s; body_len = strlen(bv->s); }
+    }
+    Value *result = http_do_request(method, url, hdrs, body, body_len);
+    /* add 'ok' field for convenience */
+    if (result && result->tag == XS_MAP) {
+        Value *sv = map_get(result->map, "status");
+        if (sv && sv->tag == XS_INT) {
+            int ok = (sv->i >= 200 && sv->i < 300) ? 1 : 0;
+            map_set(result->map, "ok", ok ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL));
+        }
+    }
+    return result;
+#else
+    (void)a;(void)n; return value_incref(XS_NULL_VAL);
+#endif
+}
+
+Value *make_http_module(void) {
+    XSMap *m=map_new();
+    map_set(m,"get",     xs_native(native_http_get));
+    map_set(m,"post",    xs_native(native_http_post));
+    map_set(m,"put",     xs_native(native_http_put));
+    map_set(m,"delete",  xs_native(native_http_delete));
+    map_set(m,"patch",   xs_native(native_http_patch));
+    map_set(m,"request", xs_native(native_http_request));
+    return xs_module(m);
+}
+
 Value *make_fs_module(void) {
     XSMap *m = map_new();
-    map_set(m, "read",    xs_native(native_fs_read));
-    map_set(m, "write",   xs_native(native_fs_write));
-    map_set(m, "append",  xs_native(native_fs_append));
-    map_set(m, "exists",  xs_native(native_fs_exists));
-    map_set(m, "remove",  xs_native(native_fs_remove));
-    map_set(m, "mkdir",   xs_native(native_fs_mkdir));
-    map_set(m, "ls",      xs_native(native_fs_ls));
-    map_set(m, "is_dir",  xs_native(native_fs_is_dir));
-    map_set(m, "is_file", xs_native(native_fs_is_file));
-    map_set(m, "size",    xs_native(native_fs_size));
+    map_set(m, "read",         xs_native(native_fs_read));
+    map_set(m, "read_bytes",   xs_native(native_fs_read_bytes));
+    map_set(m, "write",        xs_native(native_fs_write));
+    map_set(m, "write_bytes",  xs_native(native_fs_write_bytes));
+    map_set(m, "append",       xs_native(native_fs_append));
+    map_set(m, "exists",       xs_native(native_fs_exists));
+    map_set(m, "remove",       xs_native(native_fs_remove));
+    map_set(m, "mkdir",        xs_native(native_fs_mkdir));
+    map_set(m, "mkdir_p",      xs_native(native_fs_mkdir_p));
+    map_set(m, "rmdir",        xs_native(native_fs_rmdir));
+    map_set(m, "list",         xs_native(native_fs_ls));
+    map_set(m, "ls",           xs_native(native_fs_ls));
+    map_set(m, "is_dir",       xs_native(native_fs_is_dir));
+    map_set(m, "is_file",      xs_native(native_fs_is_file));
+    map_set(m, "size",         xs_native(native_fs_size));
+    map_set(m, "stat",         xs_native(native_fs_stat));
+    map_set(m, "rename",       xs_native(native_fs_rename));
+    map_set(m, "copy",         xs_native(native_fs_copy));
+    map_set(m, "join",         xs_native(native_fs_join));
+    map_set(m, "basename",     xs_native(native_fs_basename));
+    map_set(m, "dirname",      xs_native(native_fs_dirname));
+    map_set(m, "ext",          xs_native(native_fs_ext));
+    map_set(m, "abs",          xs_native(native_fs_abs));
+    map_set(m, "temp_dir",     xs_native(native_fs_temp_dir));
+    map_set(m, "temp_file",    xs_native(native_fs_temp_file));
+    map_set(m, "read_stream",  xs_native(native_fs_read_stream));
+    map_set(m, "write_stream", xs_native(native_fs_write_stream));
+    map_set(m, "read_lines",   xs_native(native_fs_read_lines));
+    map_set(m, "walk",         xs_native(native_fs_walk));
+    map_set(m, "glob",         xs_native(native_fs_glob));
+    map_set(m, "chmod",        xs_native(native_fs_chmod));
+    map_set(m, "symlink",      xs_native(native_fs_symlink));
+    map_set(m, "readlink",     xs_native(native_fs_readlink));
+    map_set(m, "realpath",     xs_native(native_fs_realpath));
+    map_set(m, "watch",        xs_native(native_fs_watch));
     return xs_module(m);
 }

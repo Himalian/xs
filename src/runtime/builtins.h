@@ -40,5 +40,9 @@ Value *make_ffi_module(void);
 Value *make_reflect_module(void);
 Value *make_gc_module(void);
 Value *make_reactive_module(void);
+Value *make_toml_module(void);
+Value *make_http_module(void);
+Value *make_fs_module(void);
+Value *make_test_module(void);
 
 #endif
