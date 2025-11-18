@@ -40,12 +40,19 @@ CORE_SRCS = src/core/value.c \
             src/core/lexer.c \
             src/core/env.c \
             src/core/parser.c \
-            src/core/xs_bigint.c
+            src/core/xs_bigint.c \
+            src/core/gc.c \
+            src/core/utf8.c \
+            src/core/strbuf.c
+
+COMPILER_SRCS = src/compiler/match_compiler.c
 
 RUNTIME_SRCS = src/runtime/interp.c \
                src/runtime/builtins.c \
                src/runtime/error.c \
-               src/runtime/stdlib.c
+               src/runtime/stdlib.c \
+               src/runtime/scheduler.c \
+               src/runtime/event_loop.c
 
 REPL_SRCS = src/repl/repl.c
 
@@ -67,9 +74,23 @@ TOOL_SRCS = src/fmt/fmt.c \
             src/profiler/profiler.c \
             src/coverage/coverage.c \
             src/optimizer/optimizer.c \
+            src/optimizer/ssa.c \
+            src/optimizer/inline_cache.c \
             src/ir/ir.c
 
+DB_SRCS = src/db/xsdb.c
+
+NET_SRCS = src/net/http_server.c
+
+REGEX_SRCS = src/core/regex.c
+
 MAIN_SRCS = src/main.c
+
+CHECKER_SRCS = src/types/checker.c
+
+MSGPACK_SRCS = src/core/msgpack.c
+
+ASYNC_SRCS = src/runtime/async.c
 
 SEMA_SRCS = src/types/types.c \
             src/semantic/exhaust.c \
@@ -81,7 +102,7 @@ SEMA_SRCS = src/types/types.c \
 
 TLS_SRCS = $(wildcard src/tls/*.c) $(wildcard src/tls/bearssl/**/*.c) $(wildcard src/tls/bearssl/*.c)
 
-SRCS = $(CORE_SRCS) $(RUNTIME_SRCS) $(REPL_SRCS) $(LINT_SRCS) $(TYPES_EXTRA_SRCS) $(EMBED_SRCS) $(DIAG_SRCS) $(TOOL_SRCS) $(MAIN_SRCS) $(SEMA_SRCS) $(TLS_SRCS)
+SRCS = $(CORE_SRCS) $(COMPILER_SRCS) $(RUNTIME_SRCS) $(REPL_SRCS) $(LINT_SRCS) $(TYPES_EXTRA_SRCS) $(EMBED_SRCS) $(DIAG_SRCS) $(TOOL_SRCS) $(MAIN_SRCS) $(SEMA_SRCS) $(TLS_SRCS) $(DB_SRCS) $(NET_SRCS) $(REGEX_SRCS) $(CHECKER_SRCS) $(MSGPACK_SRCS) $(ASYNC_SRCS)
 
 # Conditional sources
 ifeq ($(XSC_ENABLE_VM),1)
@@ -192,7 +213,8 @@ WASM_SRCS = src/wasm_main.c \
             $(DIAG_SRCS) $(SEMA_SRCS) \
             src/fmt/fmt.c src/doc/docgen.c src/lint/lint.c \
             src/pkg/pkg.c src/coverage/coverage.c \
-            src/optimizer/optimizer.c src/ir/ir.c src/profiler/profiler.c \
+            src/optimizer/optimizer.c src/optimizer/ssa.c src/optimizer/inline_cache.c \
+            src/ir/ir.c src/profiler/profiler.c \
             $(wildcard src/vm/*.c) \
             $(wildcard src/effects/*.c) \
             $(wildcard src/transpiler/*.c) \
