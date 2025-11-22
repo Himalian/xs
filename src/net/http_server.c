@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
+#ifndef _WIN32
 #include <strings.h>
+#endif
 /* http_server.c - HTTP/1.1 server with routing, middleware, and static files
  *
  * Features:
@@ -27,6 +29,9 @@
 #include <direct.h>
 #define close closesocket
 #define ssize_t int
+#define read(fd, buf, len)  recv(fd, buf, len, 0)
+#define write(fd, buf, len) send(fd, buf, len, 0)
+#pragma comment(lib, "ws2_32.lib")
 #else
 #include <unistd.h>
 #include <fcntl.h>
@@ -39,6 +44,32 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <time.h>
+
+#ifdef _WIN32
+/* portable strcasestr for Windows */
+static const char *xs_strcasestr(const char *haystack, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (!nlen) return haystack;
+    for (; *haystack; haystack++) {
+        if (_strnicmp(haystack, needle, nlen) == 0)
+            return haystack;
+    }
+    return NULL;
+}
+#define strcasestr xs_strcasestr
+#define strcasecmp  _stricmp
+#define strncasecmp _strnicmp
+
+static void xs_set_nonblocking(int fd) {
+    u_long mode = 1;
+    ioctlsocket(fd, FIONBIO, &mode);
+}
+#else
+static void xs_set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+#endif
 
 /* ================================================================
  *  Status code table
@@ -1235,18 +1266,23 @@ static void on_accept(int listen_fd, EventType ev, void *ctx) {
     socklen_t addr_len = sizeof(addr);
     int client_fd = accept(listen_fd, (struct sockaddr *)&addr, &addr_len);
     if (client_fd < 0) {
+#ifdef _WIN32
+        int err = WSAGetLastError();
+        if (err != WSAEWOULDBLOCK)
+            fprintf(stderr, "accept: error %d\n", err);
+#else
         if (errno != EAGAIN && errno != EWOULDBLOCK)
             perror("accept");
+#endif
         return;
     }
 
     /* set non-blocking */
-    int flags = fcntl(client_fd, F_GETFL, 0);
-    fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+    xs_set_nonblocking(client_fd);
 
     /* disable Nagle's algorithm */
     int one = 1;
-    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
 
     /* create connection */
     HTTPConnection *c = conn_new(client_fd, s);
@@ -1338,15 +1374,14 @@ int http_server_start(HTTPServer *s) {
     /* set socket options */
     int opt = 1;
 #ifdef SO_REUSEADDR
-    setsockopt(s->listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(s->listen_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
 #endif
 #ifdef SO_REUSEPORT
-    setsockopt(s->listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    setsockopt(s->listen_fd, SOL_SOCKET, SO_REUSEPORT, (const char *)&opt, sizeof(opt));
 #endif
 
     /* set non-blocking */
-    int flags = fcntl(s->listen_fd, F_GETFL, 0);
-    fcntl(s->listen_fd, F_SETFL, flags | O_NONBLOCK);
+    xs_set_nonblocking(s->listen_fd);
 
     /* bind */
     struct sockaddr_in addr;
@@ -1380,11 +1415,13 @@ int http_server_start(HTTPServer *s) {
     /* register with event loop */
     evloop_add_fd(s->evloop, s->listen_fd, EV_READ, on_accept, s);
 
+#ifndef _WIN32
     /* handle SIGINT for graceful shutdown */
     evloop_add_signal(s->evloop, SIGINT, on_sigint, s);
 
     /* ignore SIGPIPE */
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     /* run event loop */
     s->running = 1;
