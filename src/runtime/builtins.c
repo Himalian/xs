@@ -2989,10 +2989,16 @@ Value *make_os_module(Interp *ig) {
     /* platform / sep */
 #ifdef __APPLE__
     { Value *v=xs_str("darwin"); map_set(m,"platform",v); value_decref(v); }
+#elif defined(_WIN32)
+    { Value *v=xs_str("windows"); map_set(m,"platform",v); value_decref(v); }
 #else
     { Value *v=xs_str("linux"); map_set(m,"platform",v); value_decref(v); }
 #endif
+#ifdef _WIN32
+    { Value *v=xs_str("\\"); map_set(m,"sep",v); value_decref(v); }
+#else
     { Value *v=xs_str("/"); map_set(m,"sep",v); value_decref(v); }
+#endif
     /* env as a callable (getenv) + helper functions at top level */
     map_set(m,"env",      xs_native(native_os_env_get));
     map_set(m,"getenv",   xs_native(native_os_env_get));
@@ -7591,9 +7597,15 @@ static Value *native_fs_abs(Interp *ig, Value **a, int n) {
 static Value *native_fs_temp_dir(Interp *ig, Value **a, int n) {
     (void)ig; (void)a; (void)n;
     const char *t = getenv("TMPDIR");
+#ifdef _WIN32
+    if (!t) t = getenv("TEMP");
+    if (!t) t = getenv("TMP");
+#endif
     if (!t) t = "/tmp";
-#ifndef _WIN32
     char buf[4096];
+#ifdef _WIN32
+    if (_fullpath(buf, t, sizeof(buf))) return xs_str(buf);
+#else
     if (realpath(t, buf)) return xs_str(buf);
 #endif
     return xs_str(t);
@@ -7601,23 +7613,39 @@ static Value *native_fs_temp_dir(Interp *ig, Value **a, int n) {
 
 static Value *native_fs_temp_file(Interp *ig, Value **a, int n) {
     (void)ig; (void)a; (void)n;
+#ifdef __MINGW32__
+    /* mingw: use mkstemp from POSIX layer */
     const char *t = getenv("TMPDIR");
+    if (!t) t = getenv("TEMP");
+    if (!t) t = getenv("TMP");
     if (!t) t = "/tmp";
-    char resolved[4096];
-#ifndef _WIN32
-    if (realpath(t, resolved)) t = resolved;
-#endif
     char tmpl[4096];
     snprintf(tmpl, sizeof(tmpl), "%s/xs_tmp_XXXXXX", t);
-#ifdef _WIN32
-    if (_mktemp(tmpl)) { FILE *f = fopen(tmpl, "w"); if (f) fclose(f); }
-    else return xs_str("");
-#else
     int fd = mkstemp(tmpl);
     if (fd < 0) return xs_str("");
     close(fd);
-#endif
     return xs_str(tmpl);
+#elif defined(_WIN32)
+    const char *t = getenv("TEMP");
+    if (!t) t = getenv("TMP");
+    if (!t) t = ".";
+    char tmpl[4096];
+    snprintf(tmpl, sizeof(tmpl), "%s/xs_tmp_XXXXXX", t);
+    if (_mktemp(tmpl)) { FILE *f = fopen(tmpl, "w"); if (f) fclose(f); }
+    else return xs_str("");
+    return xs_str(tmpl);
+#else
+    const char *t = getenv("TMPDIR");
+    if (!t) t = "/tmp";
+    char resolved[4096];
+    if (realpath(t, resolved)) t = resolved;
+    char tmpl[4096];
+    snprintf(tmpl, sizeof(tmpl), "%s/xs_tmp_XXXXXX", t);
+    int fd = mkstemp(tmpl);
+    if (fd < 0) return xs_str("");
+    close(fd);
+    return xs_str(tmpl);
+#endif
 }
 
 /* fs.read_stream(path) - returns a reader map with read/read_line/read_all/close */
