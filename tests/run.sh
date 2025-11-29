@@ -19,8 +19,8 @@ for f in tests/test_*.xs; do
     if [ $rc -ne 0 ]; then
         fail=$((fail + 1))
         fails="$fails\n  FAIL: $name"
-        echo "  FAIL  $name"
-        echo "$output" | grep -E "assert|error" | head -3
+        echo "  FAIL  $name (exit $rc)"
+        echo "$output" | tail -5
     else
         pass=$((pass + 1))
         echo "  ok    $name"
