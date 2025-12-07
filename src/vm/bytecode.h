@@ -59,6 +59,7 @@ typedef enum {
     OP_MAKE_CLOSURE,  /* Bx=inner_proto_index_const */
     OP_CALL,          /* C=argc */
     OP_TAIL_CALL,     /* C=argc */
+    OP_CALL_KW,       /* A=n_positional  C=n_kwargs  stack: callee [pos...] [key_str,val]* */
     OP_RETURN,
     OP_SWAP,
 
@@ -92,6 +93,7 @@ typedef enum {
     OP_MAKE_ENUM,     /* Bx=name_const */
     OP_MAKE_INST,     /* A=nargs Bx=class_name */
     OP_IMPL_METHOD,
+    OP_TRAIT_APPLY,    /* stack: class, trait -> copy defaults onto class methods */
     OP_INHERIT,
 
     OP_MAKE_MODULE,   /* Bx=name_const */
@@ -138,6 +140,10 @@ struct XSProto {
     XSProto   **inner;
     int         n_inner, cap_inner;
     int         refcount;
+    char      **param_names;   /* owned, NULL-terminated slots */
+    int         n_params;
+    int         is_generator;  /* 1 if declared with `fn*` */
+    int         is_variadic;
 };
 
 XSProto *proto_new(const char *name, int arity);

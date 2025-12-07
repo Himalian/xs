@@ -363,9 +363,11 @@ static void emit_expr(SB *s, Node *n, int depth) {
         }
         break;
     }
-    case NODE_LAMBDA:
+    case NODE_LAMBDA: {
+        int lam_is_gen = n->lambda.is_generator ||
+                          node_has_perform(n->lambda.body);
         sb_addc(s, '(');
-        if (n->lambda.is_generator) {
+        if (lam_is_gen) {
             sb_add(s, "function*");
             emit_params(s, &n->lambda.params);
             sb_add(s, " {\n");
@@ -407,6 +409,7 @@ static void emit_expr(SB *s, Node *n, int depth) {
         }
         sb_addc(s, ')');
         break;
+    }
     case NODE_IF: {
         /* if used as expression -> IIFE */
         sb_add(s, "(() => { ");
@@ -1297,6 +1300,64 @@ static int block_has_defers(Node *block) {
     return 0;
 }
 
+/* does this subtree contain a NODE_PERFORM (outside of a nested fn)?
+   Used to decide whether to emit a function as a JS generator so that
+   effect handlers can intercept performs via yield. We do NOT descend
+   into nested NODE_FN_DECL / NODE_LAMBDA bodies because those get their
+   own generator decision. */
+static int node_has_perform(Node *n) {
+    if (!n) return 0;
+    if (n->tag == NODE_PERFORM) return 1;
+    switch (n->tag) {
+    case NODE_FN_DECL: case NODE_LAMBDA: return 0;
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmts.len; i++)
+            if (node_has_perform(n->block.stmts.items[i])) return 1;
+        return 0;
+    case NODE_EXPR_STMT:  return node_has_perform(n->expr_stmt.expr);
+    case NODE_RETURN:     return node_has_perform(n->ret.value);
+    case NODE_LET: case NODE_VAR: return node_has_perform(n->let.value);
+    case NODE_CONST:      return node_has_perform(n->const_.value);
+    case NODE_ASSIGN:     return node_has_perform(n->assign.value) ||
+                                 node_has_perform(n->assign.target);
+    case NODE_IF:
+        if (node_has_perform(n->if_expr.cond)) return 1;
+        if (node_has_perform(n->if_expr.then)) return 1;
+        for (int j = 0; j < n->if_expr.elif_conds.len; j++)
+            if (node_has_perform(n->if_expr.elif_conds.items[j])) return 1;
+        for (int j = 0; j < n->if_expr.elif_thens.len; j++)
+            if (node_has_perform(n->if_expr.elif_thens.items[j])) return 1;
+        if (node_has_perform(n->if_expr.else_branch)) return 1;
+        return 0;
+    case NODE_WHILE:      return node_has_perform(n->while_.cond) ||
+                                 node_has_perform(n->while_.body);
+    case NODE_FOR:        return node_has_perform(n->for_.iter) ||
+                                 node_has_perform(n->for_.body);
+    case NODE_BINOP:      return node_has_perform(n->binop.left) ||
+                                 node_has_perform(n->binop.right);
+    case NODE_UNARY:      return node_has_perform(n->unary.expr);
+    case NODE_CALL:
+        if (node_has_perform(n->call.callee)) return 1;
+        for (int j = 0; j < n->call.args.len; j++)
+            if (node_has_perform(n->call.args.items[j])) return 1;
+        return 0;
+    case NODE_METHOD_CALL:
+        if (node_has_perform(n->method_call.obj)) return 1;
+        for (int j = 0; j < n->method_call.args.len; j++)
+            if (node_has_perform(n->method_call.args.items[j])) return 1;
+        return 0;
+    case NODE_TRY:
+        if (node_has_perform(n->try_.body)) return 1;
+        if (node_has_perform(n->try_.catch_block)) return 1;
+        if (node_has_perform(n->try_.finally_block)) return 1;
+        return 0;
+    case NODE_HANDLE:
+        return node_has_perform(n->handle.body);
+    default:
+        return 0;
+    }
+}
+
 /* statement emitter */
 static void emit_stmt(SB *s, Node *n, int depth) {
     if (!n) return;
@@ -1338,7 +1399,12 @@ static void emit_stmt(SB *s, Node *n, int depth) {
         sb_indent(s, depth);
         if (n->fn_decl.is_pub) sb_add(s, "export ");
         if (n->fn_decl.is_async) sb_add(s, "async ");
-        if (n->fn_decl.is_generator) {
+        /* Auto-promote to generator if the body contains a perform.
+           That lets a handle-block IIFE iterate the generator and
+           dispatch effects at any call depth, not just inline ones. */
+        int fn_is_gen = n->fn_decl.is_generator ||
+                        node_has_perform(n->fn_decl.body);
+        if (fn_is_gen) {
             sb_printf(s, "function* %s", n->fn_decl.name);
         } else {
             sb_printf(s, "function %s", n->fn_decl.name);

@@ -450,6 +450,14 @@ void node_free(Node *n) {
     case NODE_PAT_REGEX:
         free(n->pat_regex.pattern);
         break;
+    case NODE_PAT_MAP:
+        for (int j = 0; j < n->pat_map.nfields; j++) {
+            free(n->pat_map.keys[j]);
+            node_free(n->pat_map.sub[j]);
+        }
+        free(n->pat_map.keys);
+        free(n->pat_map.sub);
+        break;
     case NODE_INLINE_C:
         free(n->inline_c.code);
         break;

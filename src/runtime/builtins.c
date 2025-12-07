@@ -210,6 +210,7 @@ static Value *builtin_type(Interp *i, Value **args, int argc) {
     case XS_MAP:    return xs_str("map");
     case XS_FUNC:   return xs_str("fn");
     case XS_NATIVE: return xs_str("fn");
+    case XS_CLOSURE: return xs_str("fn");
     case XS_STRUCT_VAL: return xs_str(args[0]->st->type_name ? args[0]->st->type_name : "struct");
     case XS_ENUM_VAL:   return xs_str(args[0]->en->type_name ? args[0]->en->type_name : "enum");
     case XS_CLASS_VAL:  return xs_str(args[0]->cls->name ? args[0]->cls->name : "class");
@@ -8238,6 +8239,168 @@ static Value *native_http_request(Interp *ig, Value **a, int n) {
 #endif
 }
 
+/* http.serve(port, handler)
+   Minimal blocking HTTP/1.1 server. `handler` is an XS function that takes
+   a request map {method, path, query, headers, body} and returns a response
+   map {status?, headers?, body}. Blocks until the process is killed; one
+   request is handled at a time. Not a replacement for the async router in
+   src/net/http_server.c; that is still not wired up. */
+#if !defined(__MINGW32__) && !defined(__wasi__)
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#endif
+
+static Value *native_http_serve(Interp *ig, Value **a, int n) {
+#if defined(__MINGW32__) || defined(__wasi__)
+    (void)ig; (void)a; (void)n;
+    fprintf(stderr, "http.serve: not available on this platform\n");
+    return value_incref(XS_NULL_VAL);
+#else
+    if (n < 2 || a[0]->tag != XS_INT ||
+        (a[1]->tag != XS_FUNC && a[1]->tag != XS_NATIVE)) {
+        fprintf(stderr, "http.serve: expected (port: int, handler: fn)\n");
+        return value_incref(XS_NULL_VAL);
+    }
+    int port = (int)a[0]->i;
+    Value *handler = a[1];
+
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) { perror("http.serve: socket"); return value_incref(XS_NULL_VAL); }
+    int opt = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof opt);
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+        perror("http.serve: bind"); close(lfd);
+        return value_incref(XS_NULL_VAL);
+    }
+    if (listen(lfd, 16) < 0) {
+        perror("http.serve: listen"); close(lfd);
+        return value_incref(XS_NULL_VAL);
+    }
+    fprintf(stderr, "http.serve: listening on :%d\n", port);
+
+    for (;;) {
+        struct sockaddr_in cli = {0};
+        socklen_t clen = sizeof cli;
+        int cfd = accept(lfd, (struct sockaddr *)&cli, &clen);
+        if (cfd < 0) { if (errno == EINTR) continue; perror("accept"); break; }
+
+        char buf[16384];
+        int got = (int)recv(cfd, buf, sizeof(buf) - 1, 0);
+        if (got <= 0) { close(cfd); continue; }
+        buf[got] = 0;
+
+        /* Parse request line: METHOD PATH VERSION\r\n */
+        char method[16] = "GET", url[2048] = "/", version[16] = "HTTP/1.1";
+        sscanf(buf, "%15s %2047s %15s", method, url, version);
+
+        /* Split path/query */
+        char path[2048] = {0}, query[2048] = {0};
+        const char *qmark = strchr(url, '?');
+        if (qmark) {
+            size_t plen = (size_t)(qmark - url);
+            if (plen >= sizeof path) plen = sizeof path - 1;
+            memcpy(path, url, plen); path[plen] = 0;
+            strncpy(query, qmark + 1, sizeof query - 1);
+        } else {
+            strncpy(path, url, sizeof path - 1);
+        }
+
+        /* Collect headers until blank line */
+        Value *hmap = xs_map_new();
+        char *p = strstr(buf, "\r\n");
+        if (p) p += 2;
+        while (p && *p && !(p[0] == '\r' && p[1] == '\n')) {
+            char *eol = strstr(p, "\r\n");
+            if (!eol) break;
+            char *colon = memchr(p, ':', (size_t)(eol - p));
+            if (colon) {
+                size_t nlen = (size_t)(colon - p);
+                char name[256]; if (nlen >= sizeof name) nlen = sizeof name - 1;
+                memcpy(name, p, nlen); name[nlen] = 0;
+                char *v = colon + 1;
+                while (v < eol && (*v == ' ' || *v == '\t')) v++;
+                size_t vlen = (size_t)(eol - v);
+                char val[4096]; if (vlen >= sizeof val) vlen = sizeof val - 1;
+                memcpy(val, v, vlen); val[vlen] = 0;
+                Value *sv = xs_str(val);
+                map_set(hmap->map, name, sv);
+                value_decref(sv);
+            }
+            p = eol + 2;
+        }
+
+        /* Body starts after \r\n\r\n */
+        const char *body = "";
+        char *body_start = strstr(buf, "\r\n\r\n");
+        if (body_start) body = body_start + 4;
+
+        /* Build request map */
+        Value *req = xs_map_new();
+        Value *mv = xs_str(method); map_set(req->map, "method", mv); value_decref(mv);
+        Value *pv = xs_str(path);   map_set(req->map, "path",   pv); value_decref(pv);
+        Value *qv = xs_str(query);  map_set(req->map, "query",  qv); value_decref(qv);
+        map_set(req->map, "headers", hmap); value_decref(hmap);
+        Value *bv = xs_str(body);   map_set(req->map, "body",   bv); value_decref(bv);
+
+        Value *args[1] = { req };
+        Value *res = call_value(ig, handler, args, 1, "http.serve handler");
+        value_decref(req);
+
+        int status = 200;
+        const char *rbody = "";
+        XSMap *rheaders = NULL;
+        if (res && (res->tag == XS_MAP || res->tag == XS_MODULE) && res->map) {
+            Value *sv = map_get(res->map, "status");
+            if (sv && sv->tag == XS_INT) status = (int)sv->i;
+            Value *bv2 = map_get(res->map, "body");
+            if (bv2 && bv2->tag == XS_STR) rbody = bv2->s;
+            Value *hv = map_get(res->map, "headers");
+            if (hv && hv->tag == XS_MAP && hv->map) rheaders = hv->map;
+        } else if (res && res->tag == XS_STR) {
+            rbody = res->s;
+        }
+
+        char resp_hdr[1024];
+        int rbody_len = (int)strlen(rbody);
+        int hlen = snprintf(resp_hdr, sizeof resp_hdr,
+            "HTTP/1.1 %d OK\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n",
+            status, rbody_len);
+        if (rheaders) {
+            int nk = 0; char **ks = map_keys(rheaders, &nk);
+            for (int k = 0; k < nk && hlen < (int)sizeof resp_hdr - 64; k++) {
+                Value *vv = map_get(rheaders, ks[k]);
+                if (vv && vv->tag == XS_STR) {
+                    hlen += snprintf(resp_hdr + hlen, sizeof resp_hdr - hlen,
+                                     "%s: %s\r\n", ks[k], vv->s);
+                }
+            }
+            if (ks) {
+                for (int k = 0; k < nk; k++) free(ks[k]);
+                free(ks);
+            }
+        }
+        hlen += snprintf(resp_hdr + hlen, sizeof resp_hdr - hlen, "\r\n");
+        if (send(cfd, resp_hdr, hlen, 0) < 0) { /* ignore */ }
+        if (rbody_len > 0) {
+            if (send(cfd, rbody, rbody_len, 0) < 0) { /* ignore */ }
+        }
+        if (res) value_decref(res);
+        close(cfd);
+    }
+    close(lfd);
+    return value_incref(XS_NULL_VAL);
+#endif
+}
+
 Value *make_http_module(void) {
     XSMap *m=map_new();
     map_set(m,"get",     xs_native(native_http_get));
@@ -8246,6 +8409,7 @@ Value *make_http_module(void) {
     map_set(m,"delete",  xs_native(native_http_delete));
     map_set(m,"patch",   xs_native(native_http_patch));
     map_set(m,"request", xs_native(native_http_request));
+    map_set(m,"serve",   xs_native(native_http_serve));
     return xs_module(m);
 }
 

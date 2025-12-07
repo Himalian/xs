@@ -1846,9 +1846,20 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
             }
             Value *v=xs_str(res); free(res); return v;
         }
-        if (strcmp(method, "chars") == 0) {
+        if (strcmp(method, "chars") == 0 || strcmp(method, "graphemes") == 0) {
+            /* codepoint-aware: yield each UTF-8 codepoint as its own str.
+               graphemes() is currently an alias (true grapheme clusters
+               would require Unicode tables the compiler tries to ship
+               without). */
             Value *arr = xs_array_new();
-            for (int j=0;j<slen;j++) array_push(arr->arr, xs_str_n(s+j,1));
+            int j = 0;
+            while (j < slen) {
+                int cp;
+                int n = utf8_decode(s + j, slen - j, &cp);
+                if (n <= 0) n = 1;
+                array_push(arr->arr, xs_str_n(s + j, n));
+                j += n;
+            }
             return arr;
         }
         if (strcmp(method, "bytes") == 0 || strcmp(method, "to_bytes") == 0) {

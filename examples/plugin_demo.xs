@@ -1,5 +1,5 @@
 -- plugin_demo.xs: exercise every feature of the showcase plugin
-use plugin "plugins/showcase_plugin.xs"
+load "plugins/showcase_plugin.xs"
 
 -- custom route syntax (plugin.lexer.add_keyword + plugin.parser.on_unknown)
 route GET "/hello" {

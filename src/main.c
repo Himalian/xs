@@ -97,6 +97,121 @@ static int program_has_plugin_use(Node *program) {
     return 0;
 }
 
+/* Detect whether a program registers AST-level runtime hooks
+   (plugin.runtime.after_eval, before_eval, ast_hook, etc.). These require
+   the tree-walk interpreter because the VM compiles AST nodes away before
+   execution. Returns 1 if any such call is present. */
+static int node_uses_plugin_runtime_hook(Node *n) {
+    if (!n) return 0;
+    if (n->tag == NODE_METHOD_CALL) {
+        const char *m = n->method_call.method;
+        if (m && (strcmp(m, "after_eval") == 0 ||
+                  strcmp(m, "before_eval") == 0 ||
+                  strcmp(m, "ast_hook") == 0)) {
+            Node *obj = n->method_call.obj;
+            if (obj && obj->tag == NODE_FIELD && obj->field.name &&
+                strcmp(obj->field.name, "runtime") == 0) {
+                Node *inner = obj->field.obj;
+                if (inner && inner->tag == NODE_IDENT && inner->ident.name &&
+                    strcmp(inner->ident.name, "plugin") == 0)
+                    return 1;
+            }
+        }
+    }
+    /* recurse into common children */
+    switch (n->tag) {
+    case NODE_PROGRAM:
+        for (int j = 0; j < n->program.stmts.len; j++)
+            if (node_uses_plugin_runtime_hook(n->program.stmts.items[j])) return 1;
+        break;
+    case NODE_BLOCK:
+        for (int j = 0; j < n->block.stmts.len; j++)
+            if (node_uses_plugin_runtime_hook(n->block.stmts.items[j])) return 1;
+        break;
+    case NODE_EXPR_STMT:
+        return node_uses_plugin_runtime_hook(n->expr_stmt.expr);
+    case NODE_IF:
+        if (node_uses_plugin_runtime_hook(n->if_expr.cond)) return 1;
+        if (node_uses_plugin_runtime_hook(n->if_expr.then)) return 1;
+        for (int j = 0; j < n->if_expr.elif_conds.len; j++)
+            if (node_uses_plugin_runtime_hook(n->if_expr.elif_conds.items[j])) return 1;
+        for (int j = 0; j < n->if_expr.elif_thens.len; j++)
+            if (node_uses_plugin_runtime_hook(n->if_expr.elif_thens.items[j])) return 1;
+        if (node_uses_plugin_runtime_hook(n->if_expr.else_branch)) return 1;
+        break;
+    case NODE_LET: case NODE_VAR:
+        return node_uses_plugin_runtime_hook(n->let.value);
+    case NODE_CONST:
+        return node_uses_plugin_runtime_hook(n->const_.value);
+    case NODE_METHOD_CALL:
+        if (node_uses_plugin_runtime_hook(n->method_call.obj)) return 1;
+        for (int j = 0; j < n->method_call.args.len; j++)
+            if (node_uses_plugin_runtime_hook(n->method_call.args.items[j])) return 1;
+        break;
+    case NODE_CALL:
+        if (node_uses_plugin_runtime_hook(n->call.callee)) return 1;
+        for (int j = 0; j < n->call.args.len; j++)
+            if (node_uses_plugin_runtime_hook(n->call.args.items[j])) return 1;
+        break;
+    case NODE_FN_DECL:
+        return node_uses_plugin_runtime_hook(n->fn_decl.body);
+    default: break;
+    }
+    return 0;
+}
+
+/* Look for a plugin file on disk and grep it for AST-level runtime hook
+   registrations. Returns 1 if any hook API call is present. */
+static int file_uses_runtime_hooks(const char *path) {
+    if (!path) return 0;
+    const char *candidates[6] = { path, NULL, NULL, NULL, NULL, NULL };
+    char buf_a[1024], buf_b[1024], buf_c[1024], buf_d[1024], buf_e[1024];
+    const char *base = path;
+    const char *slash = strrchr(path, '/');
+    if (slash) base = slash + 1;
+    snprintf(buf_a, sizeof buf_a, "tests/%s", path);
+    snprintf(buf_b, sizeof buf_b, "examples/%s", path);
+    snprintf(buf_c, sizeof buf_c, "plugins/%s", base);
+    snprintf(buf_d, sizeof buf_d, "tests/plugins/%s", base);
+    snprintf(buf_e, sizeof buf_e, "%s.xs", path);
+    candidates[1] = buf_a;
+    candidates[2] = buf_b;
+    candidates[3] = buf_c;
+    candidates[4] = buf_d;
+    candidates[5] = buf_e;
+    for (int k = 0; k < 6; k++) {
+        FILE *f = fopen(candidates[k], "rb");
+        if (!f) continue;
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (sz <= 0 || sz > 20 * 1024 * 1024) { fclose(f); continue; }
+        char *data = malloc((size_t)sz + 1);
+        if (!data) { fclose(f); continue; }
+        size_t got = fread(data, 1, (size_t)sz, f);
+        data[got] = '\0';
+        fclose(f);
+        int hit = strstr(data, "plugin.runtime.after_eval")  != NULL ||
+                  strstr(data, "plugin.runtime.before_eval") != NULL ||
+                  strstr(data, "plugin.runtime.ast_hook")    != NULL;
+        free(data);
+        if (hit) return 1;
+    }
+    return 0;
+}
+
+static int program_uses_plugin_runtime_hook(Node *program) {
+    if (node_uses_plugin_runtime_hook(program)) return 1;
+    if (!program || program->tag != NODE_PROGRAM) return 0;
+    for (int j = 0; j < program->program.stmts.len; j++) {
+        Node *s = program->program.stmts.items[j];
+        if (s && s->tag == NODE_LOAD && s->load_.path &&
+            file_uses_runtime_hooks(s->load_.path))
+            return 1;
+    }
+    return 0;
+}
+
 static SemaCache *g_sema_cache = NULL;
 
 #ifdef XSC_ENABLE_COVERAGE
@@ -668,13 +783,12 @@ int main(int argc, char **argv) {
     int emit_ir_ssa = 0;
     int do_trace    = 0;
 #ifdef XSC_ENABLE_VM
-    /* Default backend. The VM is faster and is the long-term target, but
-       the tree-walk interpreter still has wider feature coverage (plugin
-       eval hooks, some universal literals, a few match patterns). Flip
-       this to 1 and set do_interp to 0 once the VM passes every test in
-       tests/ on its own. See ROADMAP.md v0.5. */
-    int do_vm         = 0;
-    int do_interp     = 1;
+    /* Default backend is the bytecode VM. Programs that register AST-level
+       runtime hooks (plugin.runtime.after_eval etc.) are detected and
+       silently fall back to the tree-walk interpreter. --interp forces
+       the tree-walk path explicitly. */
+    int do_vm         = 1;
+    int do_interp     = 0;
     int emit_bytecode = 0;
 #else
     int do_interp     = 1;
@@ -1874,6 +1988,12 @@ test_again: ;
         else if (strcmp(argv[i], "--record")   == 0 && i+1 < argc) {
 #ifdef XSC_ENABLE_TRACER
             record_path = argv[++i];
+            /* The tracer needs AST-level hooks that only the interpreter
+               fires, so --record implies --interp. */
+#ifdef XSC_ENABLE_VM
+            do_vm = 0;
+#endif
+            do_interp = 1;
 #else
             fprintf(stderr, "xs: tracer not built (rebuild with XSC_ENABLE_TRACER=1)\n"); i++; return 1;
 #endif
@@ -2166,6 +2286,19 @@ run_file:;
 #endif
 
 #ifdef XSC_ENABLE_VM
+    if ((do_vm || emit_bytecode
+#ifdef XSC_ENABLE_JIT
+        || do_jit
+#endif
+        ) && program_uses_plugin_runtime_hook(program)) {
+        /* AST-level runtime hooks require the tree-walk interpreter. Fall
+           back silently so the program still runs. */
+        do_vm = 0; do_interp = 1;
+#ifdef XSC_ENABLE_JIT
+        do_jit = 0;
+#endif
+        emit_bytecode = 0;
+    }
     if (do_vm || emit_bytecode
 #ifdef XSC_ENABLE_JIT
         || do_jit

@@ -2,13 +2,16 @@
 #include "vm/vm.h"
 #include "core/value.h"
 #include "core/xs_bigint.h"
+#include "core/utf8.h"
 #include "runtime/builtins.h"
+#include "optimizer/inline_cache.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
 #include <time.h>
+#include <regex.h>
 
 #define PUSH(v)  do { \
     if (vm->sp - vm->stack >= vm->stack_cap) vm_grow_stack(vm); \
@@ -37,6 +40,15 @@ void upvalue_close_all(Upvalue **list, Value **cutoff) {
         u->ptr        = &u->closed_val;
         u->is_open    = 0;
         *list = u->next;
+        /* The open list held one reference; decrement now that we're
+           dropping it. If the last closure has already been freed (e.g.
+           a struct methods map getting torn down before the frame
+           returns), this is what actually frees the upvalue. */
+        u->refcount--;
+        if (u->refcount <= 0) {
+            if (u->closed_val) value_decref(u->closed_val);
+            free(u);
+        }
     }
 }
 
@@ -45,6 +57,10 @@ static Upvalue *capture_upvalue(VM *vm, Value **slot) {
     while (*p && (*p)->ptr > slot) p = &(*p)->next;
     if (*p && (*p)->ptr == slot) return *p;
     Upvalue *u = upvalue_new_open(slot);
+    /* Being in the open list counts as a reference. Closures bump this
+       further in OP_MAKE_CLOSURE. Paired with the decrement in
+       upvalue_close_all, so fresh upvalues never get freed while open. */
+    u->refcount = 1;
     u->next = *p; *p = u;
     return u;
 }
@@ -120,11 +136,15 @@ static Value *vm_float_fn(Interp *interp, Value **args, int argc) {
 static Value *vm_type(Interp *interp, Value **args, int argc) {
     (void)interp;
     if (argc < 1) return xs_str("null");
+    /* Index by ValueTag. Keep this aligned with src/core/xs.h so type(...)
+       returns the same name as the interpreter's builtin_type. A closure
+       is still a function from the user's perspective, so map it to "fn". */
     static const char *names[] = {
         "null","bool","int","int","float","str","char",
         "array","map","tuple","fn","native",
         "struct","enum","class","inst","range","signal","actor","re","module",
-        "closure"
+        "fn", /* overload */
+        "fn", /* closure */
     };
     int tag = (int)args[0]->tag;
     return xs_str(tag >= 0 && tag < (int)(sizeof names/sizeof *names) ? names[tag] : "?");
@@ -836,8 +856,20 @@ static Value *vm_signal_fn(Interp *interp, Value **args, int argc) {
     return v;
 }
 static Value *vm_derived(Interp *interp, Value **args, int argc) {
-    (void)interp; (void)args; (void)argc;
-    return xs_null();
+    (void)interp;
+    XSSignal *sig = xs_calloc(1, sizeof(XSSignal));
+    sig->value = xs_null();
+    sig->subscribers = NULL;
+    sig->nsubs = 0;
+    sig->subcap = 0;
+    sig->compute = (argc >= 1) ? value_incref(args[0]) : NULL;
+    sig->notifying = 0;
+    sig->refcount = 1;
+    Value *v = xs_calloc(1, sizeof(Value));
+    v->tag = XS_SIGNAL;
+    v->refcount = 1;
+    v->signal = sig;
+    return v;
 }
 
 static void vm_register_stdlib(VM *vm) {
@@ -954,6 +986,11 @@ static void vm_register_stdlib(VM *vm) {
         extern Value *make_reactive_module(void);
         extern Value *make_os_module(Interp *ig);
         extern Value *make_test_module(void);
+        extern Value *make_http_module(void);
+        extern Value *make_fs_module(void);
+        extern Value *make_toml_module(void);
+        extern Value *make_msgpack_module(void);
+        extern Value *make_promise_module(void);
 #define REG_MOD(name, fn) do { Value *_m = fn(); map_set(vm->globals, name, _m); value_decref(_m); } while(0)
         REG_MOD("math",        make_math_module);
         REG_MOD("time",        make_time_module);
@@ -990,6 +1027,11 @@ static void vm_register_stdlib(VM *vm) {
         REG_MOD("gc",          make_gc_module);
         REG_MOD("reactive",    make_reactive_module);
         REG_MOD("test",        make_test_module);
+        REG_MOD("http",        make_http_module);
+        REG_MOD("fs",          make_fs_module);
+        REG_MOD("toml",        make_toml_module);
+        REG_MOD("msgpack",     make_msgpack_module);
+        REG_MOD("Promise",     make_promise_module);
 #undef REG_MOD
         { Value *_m = make_os_module(NULL); map_set(vm->globals, "os", _m); value_decref(_m); }
         { Value *cv = xs_float(3.14159265358979323846); map_set(vm->globals, "PI", cv); value_decref(cv); }
@@ -1030,14 +1072,23 @@ static void vm_grow_stack(VM *vm) {
     int base_offs[vm->frame_count];
     for (int i = 0; i < vm->frame_count; i++)
         base_offs[i] = (int)(vm->frames[i].base - vm->stack);
-    int new_cap = vm->stack_cap * 2;
+    /* Fresh-VM case: stack_cap == 0 doubles to 0. Pick a real minimum. */
+    int new_cap = vm->stack_cap > 0 ? vm->stack_cap * 2 : 1024;
     ptrdiff_t old_base = (ptrdiff_t)vm->stack;
     vm->stack = realloc(vm->stack, new_cap * sizeof(Value *));
     memset(vm->stack + vm->stack_cap, 0, (new_cap - vm->stack_cap) * sizeof(Value *));
     vm->sp = vm->stack + sp_off;
-    /* fix frame base pointers */
-    for (int i = 0; i < vm->frame_count; i++)
+    /* fix frame base pointers and try_stack stack_top pointers */
+    for (int i = 0; i < vm->frame_count; i++) {
         vm->frames[i].base = vm->stack + base_offs[i];
+        for (int t = 0; t < vm->frames[i].try_depth; t++) {
+            TryEntry *te = &vm->frames[i].try_stack[t];
+            if (te->stack_top) {
+                ptrdiff_t off = (ptrdiff_t)te->stack_top - old_base;
+                te->stack_top = (Value **)((char *)vm->stack + off);
+            }
+        }
+    }
     /* fix open upvalue pointers if realloc moved the buffer */
     if ((ptrdiff_t)vm->stack != old_base) {
         for (Upvalue *u = vm->open_upvalues; u; u = u->next) {
@@ -1051,33 +1102,63 @@ static void vm_grow_stack(VM *vm) {
 }
 
 static void vm_grow_frames(VM *vm) {
-    int new_cap = vm->frames_cap * 2;
+    /* Handle the fresh-VM case: frames_cap == 0 means doubling stays at 0,
+       which realloc treats as "free and allocate 1 byte" and the caller
+       then writes 8 bytes into it. Start with a reasonable minimum. */
+    int new_cap = vm->frames_cap > 0 ? vm->frames_cap * 2 : 64;
     vm->frames = realloc(vm->frames, new_cap * sizeof(CallFrame));
     memset(vm->frames + vm->frames_cap, 0, (new_cap - vm->frames_cap) * sizeof(CallFrame));
     vm->frames_cap = new_cap;
 }
 
 static int call_frame_push(VM *vm, Value *closure_val, int argc) {
+    if (vm->frame_count >= 2048) {
+        /* Raise a catchable StackOverflow by unwinding to the nearest
+           try. If there is no try on the call stack, fall through to the
+           normal error-return path. */
+        XSClosure *cl = closure_val ? closure_val->cl : NULL;
+        const char *fname = (cl && cl->proto && cl->proto->name) ? cl->proto->name : "<anon>";
+        Value *err = xs_map_new();
+        Value *kind = xs_str("StackOverflow");
+        map_set(err->map, "kind", kind); value_decref(kind);
+        char msg[128];
+        snprintf(msg, sizeof msg, "stack overflow in '%s' (depth %d)",
+                 fname, vm->frame_count);
+        Value *mv = xs_str(msg);
+        map_set(err->map, "message", mv); value_decref(mv);
+
+        /* By the time we reach here OP_CALL has already shifted the
+           callee out of the stack and decremented sp, so only the args
+           remain above the caller's base. Drop them. */
+        for (int i = 0; i < argc; i++) value_decref(POP());
+
+        while (vm->frame_count > 0) {
+            CallFrame *cf = &vm->frames[vm->frame_count - 1];
+            if (cf->try_depth > 0) {
+                TryEntry *te = &cf->try_stack[--cf->try_depth];
+                while (vm->sp > te->stack_top) value_decref(POP());
+                PUSH(err);
+                cf->ip = te->catch_ip;
+                return 0;  /* resume at catch */
+            }
+            upvalue_close_all(&vm->open_upvalues, cf->base);
+            while (vm->sp > cf->base) value_decref(POP());
+            value_decref(cf->closure_val);
+            vm->frame_count--;
+        }
+        value_decref(err);
+        fprintf(stderr, "uncaught: stack overflow (depth %d)\n", 8192);
+        return 1;
+    }
     if (vm->frame_count >= vm->frames_cap) {
         vm_grow_frames(vm);
     }
     XSClosure *cl = closure_val->cl;
     int raw_arity = cl->proto->arity;
-    int is_gen = 0;
-    int is_variadic = 0;
+    int is_gen = cl->proto->is_generator;
+    int is_variadic = cl->proto->is_variadic;
     int arity = raw_arity;
-    if (arity < 0) {
-        /* could be generator (old encoding) or variadic (new encoding) */
-        int decoded = -(arity + 1);
-        /* check if proto has more locals than decoded: variadic indicator */
-        if (cl->proto->nlocals > decoded + 1 || argc != decoded) {
-            is_variadic = 1;
-            arity = decoded;
-        } else {
-            is_gen = 1;
-            arity = decoded;
-        }
-    }
+    if (arity < 0) arity = -(arity + 1);
     if (is_variadic) {
         /* arity = min required. Collect extra args into array for variadic param */
         if (argc < arity) {
@@ -1165,6 +1246,24 @@ static Value *vm_try_dunder(VM *vm, Value *obj, const char *dunder, Value *other
     return vm_invoke(vm, fn, args, 2);
 }
 
+/* Try an operator method (e.g. "+", "-") on an instance-shaped map.
+   Structs compiled with OP_MAKE_INST live as maps tagged with __type; the
+   operator impl is registered on the class global's __methods. */
+static Value *vm_try_map_op(VM *vm, Value *a, const char *op, Value *b) {
+    if (a->tag != XS_MAP || !a->map) return NULL;
+    Value *type = map_get(a->map, "__type");
+    if (!type || type->tag != XS_STR || !type->s) return NULL;
+    Value *cls = map_get(vm->globals, type->s);
+    if (!cls || (cls->tag != XS_MAP && cls->tag != XS_MODULE) || !cls->map) return NULL;
+    Value *methods = map_get(cls->map, "__methods");
+    if (!methods || methods->tag != XS_MAP) return NULL;
+    Value *fn = map_get(methods->map, op);
+    if (!fn || (fn->tag != XS_CLOSURE && fn->tag != XS_FUNC && fn->tag != XS_NATIVE))
+        return NULL;
+    Value *args[2] = { a, b };
+    return vm_invoke(vm, fn, args, 2);
+}
+
 int vm_run(VM *vm, XSProto *proto) {
     g_vm_for_invoke = vm;
     g_plugin_vm = vm;
@@ -1177,6 +1276,12 @@ int vm_run(VM *vm, XSProto *proto) {
     top_val->refcount    = 1;
     top_val->cl          = top_cl;
 
+    /* Ensure frames is allocated. Plugin loads create a freshly-zeroed VM
+       (via memset), so frames is NULL until grown; the first frame push
+       would otherwise deref a null pointer. */
+    if (vm->frame_count >= vm->frames_cap) {
+        vm_grow_frames(vm);
+    }
     CallFrame *frame     = &vm->frames[vm->frame_count++];
     frame->closure_val   = top_val;
     frame->ip            = proto->chunk.code;
@@ -1257,6 +1362,7 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                 free(as); free(bs);
                 r = xs_str(buf); free(buf);
             } else if (a->tag == XS_MAP && (r = vm_try_dunder(vm, a, "__add__", b)) != NULL) {
+            } else if (a->tag == XS_MAP && (r = vm_try_map_op(vm, a, "+", b)) != NULL) {
             } else if (a->tag == XS_STRUCT_VAL && (r = vm_try_struct_op(vm, a, "+", b)) != NULL) {
             } else {
                 double av = a->tag==XS_INT?(double)a->i:(a->tag==XS_BIGINT?bigint_to_double(a->bigint):a->f);
@@ -1273,6 +1379,7 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                 r = xs_numeric_sub(a, b);
             } else if (a->tag == XS_MAP && (r = vm_try_dunder(vm, a, "__sub__", b)) != NULL) {
                 /* dunder */
+            } else if (a->tag == XS_MAP && (r = vm_try_map_op(vm, a, "-", b)) != NULL) {
             } else if (a->tag == XS_STRUCT_VAL && (r = vm_try_struct_op(vm, a, "-", b)) != NULL) {
             } else {
                 double av = a->tag==XS_INT?(double)a->i:(a->tag==XS_BIGINT?bigint_to_double(a->bigint):a->f);
@@ -1289,6 +1396,7 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                 r = xs_numeric_mul(a, b);
             } else if (a->tag == XS_MAP && (r = vm_try_dunder(vm, a, "__mul__", b)) != NULL) {
                 /* dunder */
+            } else if (a->tag == XS_MAP && (r = vm_try_map_op(vm, a, "*", b)) != NULL) {
             } else if (a->tag == XS_STRUCT_VAL && (r = vm_try_struct_op(vm, a, "*", b)) != NULL) {
             } else if (a->tag==XS_STR && b->tag==XS_INT) {
                 int64_t count = b->i;
@@ -1317,6 +1425,7 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                 r = xs_numeric_div(a, b);
             } else if (a->tag == XS_MAP && (r = vm_try_dunder(vm, a, "__div__", b)) != NULL) {
                 /* dunder */
+            } else if (a->tag == XS_MAP && (r = vm_try_map_op(vm, a, "/", b)) != NULL) {
             } else {
                 double bv = b->tag==XS_INT?(double)b->i:(b->tag==XS_BIGINT?bigint_to_double(b->bigint):b->f);
                 if (bv == 0.0) { r = value_incref(XS_NULL_VAL); } else {
@@ -1334,6 +1443,7 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                 else r = xs_int(a->i % b->i);
             } else if (a->tag == XS_MAP && (r = vm_try_dunder(vm, a, "__mod__", b)) != NULL) {
                 /* dunder */
+            } else if (a->tag == XS_MAP && (r = vm_try_map_op(vm, a, "%", b)) != NULL) {
             } else {
                 r = xs_numeric_mod(a, b);
             }
@@ -1688,6 +1798,86 @@ static int vm_dispatch(VM *vm, int stop_frame) {
             break;
         }
 
+        case OP_CALL_KW: {
+            int nargs = (int)INSTR_A(instr);
+            int nkw   = (int)INSTR_C(instr);
+            /* stack: callee, pos_1..pos_n, key_1, val_1, ..., key_k, val_k */
+            Value **kwslot = vm->sp - 2 * nkw;
+            Value **posslot = kwslot - nargs;
+            Value *callee = posslot[-1];
+            XSProto *target = NULL;
+            if (callee->tag == XS_CLOSURE) target = callee->cl->proto;
+            if (target && target->param_names && target->n_params > 0) {
+                int total = target->n_params;
+                Value **merged = xs_malloc((size_t)total * sizeof(Value *));
+                for (int i = 0; i < total; i++) merged[i] = NULL;
+                int copy = nargs < total ? nargs : total;
+                for (int i = 0; i < copy; i++)
+                    merged[i] = value_incref(posslot[i]);
+                for (int i = 0; i < nkw; i++) {
+                    Value *k = kwslot[i * 2];
+                    Value *v = kwslot[i * 2 + 1];
+                    if (!k || k->tag != XS_STR) continue;
+                    for (int p = 0; p < total; p++) {
+                        if (target->param_names[p] &&
+                            strcmp(target->param_names[p], k->s) == 0) {
+                            if (merged[p]) value_decref(merged[p]);
+                            merged[p] = value_incref(v);
+                            break;
+                        }
+                    }
+                }
+                for (int i = 0; i < total; i++)
+                    if (!merged[i]) merged[i] = value_incref(XS_NULL_VAL);
+                /* tear down the old stack items (positional + kwargs) */
+                for (int i = 0; i < nkw * 2; i++) value_decref(POP());
+                for (int i = 0; i < nargs; i++) value_decref(POP());
+                /* push merged positional args */
+                for (int i = 0; i < total; i++) PUSH(merged[i]);
+                free(merged);
+                /* do the call */
+                Value *saved = callee;
+                value_incref(saved);
+                for (int i = -total - 1; i < -1; i++) vm->sp[i] = vm->sp[i + 1];
+                vm->sp--;
+                value_decref(saved);
+                if (call_frame_push(vm, saved, total)) {
+                    value_decref(saved);
+                    return 1;
+                }
+                value_decref(saved);
+                frame = FRAME;
+            } else {
+                /* callee has no known param names (native, non-closure, or
+                   unknown): drop kwargs and call with positional only. */
+                for (int i = 0; i < nkw * 2; i++) value_decref(POP());
+                /* positional args are now at top; reuse OP_CALL logic */
+                if (callee->tag == XS_NATIVE) {
+                    Value **args = vm->sp - nargs;
+                    Value *result = callee->native(NULL, args, nargs);
+                    for (int i = 0; i < nargs; i++) value_decref(POP());
+                    value_decref(POP());
+                    PUSH(result ? result : value_incref(XS_NULL_VAL));
+                } else if (callee->tag == XS_CLOSURE) {
+                    Value *saved = callee;
+                    value_incref(saved);
+                    for (int i = -nargs - 1; i < -1; i++) vm->sp[i] = vm->sp[i + 1];
+                    vm->sp--;
+                    value_decref(saved);
+                    if (call_frame_push(vm, saved, nargs)) {
+                        value_decref(saved);
+                        return 1;
+                    }
+                    value_decref(saved);
+                    frame = FRAME;
+                } else {
+                    fprintf(stderr, "call_kw on non-callable (tag=%d)\n", callee->tag);
+                    return 1;
+                }
+            }
+            break;
+        }
+
         case OP_TAIL_CALL: {
             int argc   = (int)INSTR_C(instr);
             Value *callee = vm->sp[-argc - 1];
@@ -1905,7 +2095,38 @@ static int vm_dispatch(VM *vm, int stop_frame) {
             Value *mc_result = NULL;
             int mc_called = 0; /* set to 1 if we pushed a call frame */
 
+            /* inline cache: key the site by the caller proto + IP offset so
+               it survives across vm_invoke reentry without aliasing between
+               protos. */
+            int mc_site_id = ic_site_id(
+                (int)((uintptr_t)PROTO ^
+                      (uintptr_t)(frame->ip - PROTO->chunk.code)));
+            uint32_t mc_hash = ic_method_hash(mc_name);
+            Value *mc_cached_fn = NULL;
+
             if (mc_obj->tag == XS_MAP || mc_obj->tag == XS_MODULE) {
+                /* hot path: the cache already has the resolved callable. */
+                {
+                    int64_t type_tag = (int64_t)(intptr_t)mc_obj->map;
+                    Value *cached = ic_lookup(mc_site_id, type_tag, mc_hash);
+                    if (cached && (cached->tag == XS_CLOSURE ||
+                                   cached->tag == XS_NATIVE ||
+                                   cached->tag == XS_FUNC)) {
+                        mc_cached_fn = cached;
+                        goto map_generic_method;
+                    }
+                }
+                /* Prefer a user-defined method stored on the map over
+                   generic fallbacks. Modules like `fs` define their own
+                   size/len that must not be shadowed by the map method. */
+                {
+                    Value *user_fn = map_get(mc_obj->map, mc_name);
+                    if (user_fn && (user_fn->tag == XS_NATIVE ||
+                                    user_fn->tag == XS_CLOSURE ||
+                                    user_fn->tag == XS_FUNC)) {
+                        goto map_generic_method;
+                    }
+                }
                 Value *_gen_type = map_get(mc_obj->map, "__type");
                 if (_gen_type && _gen_type->tag == XS_STR &&
                     strcmp(_gen_type->s, "generator") == 0 &&
@@ -1953,6 +2174,46 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                         }
                     }
                     mc_result=arr;
+                } else if (strcmp(mc_name,"map")==0 && mc_argc>=1) {
+                    Value *out = xs_map_new();
+                    for (int j = 0; j < mc_obj->map->cap; j++) {
+                        if (!mc_obj->map->keys[j]) continue;
+                        Value *k = xs_str(mc_obj->map->keys[j]);
+                        Value *v = mc_obj->map->vals[j];
+                        Value *a[2] = { k, v ? v : XS_NULL_VAL };
+                        Value *r = vm_invoke(vm, mc_args[0], a, 2);
+                        frame = FRAME;
+                        if (r) { map_set(out->map, mc_obj->map->keys[j], r); value_decref(r); }
+                        value_decref(k);
+                    }
+                    mc_result = out;
+                } else if (strcmp(mc_name,"filter")==0 && mc_argc>=1) {
+                    Value *out = xs_map_new();
+                    for (int j = 0; j < mc_obj->map->cap; j++) {
+                        if (!mc_obj->map->keys[j]) continue;
+                        Value *k = xs_str(mc_obj->map->keys[j]);
+                        Value *v = mc_obj->map->vals[j];
+                        Value *a[2] = { k, v ? v : XS_NULL_VAL };
+                        Value *r = vm_invoke(vm, mc_args[0], a, 2);
+                        frame = FRAME;
+                        int keep = r && value_truthy(r);
+                        if (r) value_decref(r);
+                        if (keep && v) map_set(out->map, mc_obj->map->keys[j], value_incref(v));
+                        value_decref(k);
+                    }
+                    mc_result = out;
+                } else if (strcmp(mc_name,"merge")==0 && mc_argc>=1 &&
+                           (mc_args[0]->tag==XS_MAP || mc_args[0]->tag==XS_MODULE)) {
+                    Value *out = xs_map_new();
+                    for (int j = 0; j < mc_obj->map->cap; j++)
+                        if (mc_obj->map->keys[j])
+                            map_set(out->map, mc_obj->map->keys[j],
+                                    value_incref(mc_obj->map->vals[j]));
+                    for (int j = 0; j < mc_args[0]->map->cap; j++)
+                        if (mc_args[0]->map->keys[j])
+                            map_set(out->map, mc_args[0]->map->keys[j],
+                                    value_incref(mc_args[0]->map->vals[j]));
+                    mc_result = out;
                 } else if (strcmp(mc_name,"len")==0||strcmp(mc_name,"size")==0) {
                     Value *ch_type = map_get(mc_obj->map, "__type");
                     if (ch_type && ch_type->tag == XS_STR && strcmp(ch_type->s, "channel") == 0) {
@@ -2169,7 +2430,8 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                            strcmp(mc_name,"elapsed_ms")==0) {
                     mc_result = value_incref(XS_NULL_VAL);
                 } else { map_generic_method: {
-                    Value *fn = map_get(mc_obj->map, mc_name);
+                    Value *fn = mc_cached_fn;
+                    if (!fn) fn = map_get(mc_obj->map, mc_name);
                     if (!fn) {
                         Value *methods = map_get(mc_obj->map, "__methods");
                         if (methods && methods->tag == XS_MAP)
@@ -2198,6 +2460,11 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                         }
                     }
                     if (fn && (fn->tag == XS_CLOSURE || fn->tag == XS_NATIVE)) {
+                        /* populate the inline cache so the next call with
+                           the same map pointer + method name hits fast. */
+                        ic_update(mc_site_id,
+                                  (int64_t)(intptr_t)mc_obj->map,
+                                  mc_hash, fn);
                         int is_module_call = (mc_obj->tag == XS_MODULE) ||
                             (mc_obj->tag == XS_MAP && !map_get(mc_obj->map, "__type") &&
                              !map_get(mc_obj->map, "__methods") && !map_get(mc_obj->map, "__fields"));
@@ -2258,11 +2525,60 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                 }}
             }
 
+            else if (mc_obj->tag == XS_SIGNAL && mc_obj->signal) {
+                XSSignal *sig = mc_obj->signal;
+                if (strcmp(mc_name,"get")==0 || strcmp(mc_name,"value")==0) {
+                    if (sig->compute) {
+                        mc_result = vm_invoke(vm, sig->compute, NULL, 0);
+                        frame = FRAME;
+                        if (!mc_result) mc_result = value_incref(XS_NULL_VAL);
+                    } else {
+                        mc_result = sig->value ? value_incref(sig->value) : value_incref(XS_NULL_VAL);
+                    }
+                } else if (strcmp(mc_name,"set")==0 && mc_argc>=1) {
+                    if (sig->value) value_decref(sig->value);
+                    sig->value = value_incref(mc_args[0]);
+                    if (!sig->notifying) {
+                        sig->notifying = 1;
+                        for (int j = 0; j < sig->nsubs; j++) {
+                            Value *r = vm_invoke(vm, sig->subscribers[j], mc_args, 1);
+                            frame = FRAME;
+                            if (r) value_decref(r);
+                        }
+                        sig->notifying = 0;
+                    }
+                    mc_result = value_incref(XS_NULL_VAL);
+                } else if (strcmp(mc_name,"subscribe")==0 && mc_argc>=1) {
+                    if (sig->nsubs >= sig->subcap) {
+                        sig->subcap = sig->subcap ? sig->subcap * 2 : 4;
+                        sig->subscribers = xs_realloc(sig->subscribers,
+                            (size_t)sig->subcap * sizeof(Value*));
+                    }
+                    sig->subscribers[sig->nsubs++] = value_incref(mc_args[0]);
+                    mc_result = value_incref(XS_NULL_VAL);
+                } else if (strcmp(mc_name,"update")==0 && mc_argc>=1) {
+                    Value *cur = sig->value ? sig->value : XS_NULL_VAL;
+                    Value *nv = vm_invoke(vm, mc_args[0], &cur, 1);
+                    frame = FRAME;
+                    if (nv) {
+                        if (sig->value) value_decref(sig->value);
+                        sig->value = nv;
+                    }
+                    mc_result = value_incref(XS_NULL_VAL);
+                } else {
+                    mc_result = value_incref(XS_NULL_VAL);
+                }
+            }
+
             else if (mc_obj->tag == XS_STR) {
                 const char *s = mc_obj->s;
                 int slen = (int)strlen(s);
-                if (strcmp(mc_name,"len")==0||strcmp(mc_name,"size")==0)
+                if (strcmp(mc_name,"len")==0||strcmp(mc_name,"size")==0||strcmp(mc_name,"length")==0)
                     mc_result = xs_int(slen);
+                else if (strcmp(mc_name,"byte_len")==0)
+                    mc_result = xs_int(slen);
+                else if (strcmp(mc_name,"char_len")==0)
+                    mc_result = xs_int(utf8_strlen(s, slen));
                 else if (strcmp(mc_name,"upper")==0||strcmp(mc_name,"to_upper")==0) {
                     char *r=xs_strdup(s); for(int j=0;r[j];j++) r[j]=(char)toupper((unsigned char)r[j]);
                     mc_result=xs_str(r); free(r);
@@ -2309,9 +2625,17 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                         Value *cv=xs_str(p3); array_push(arr->arr,cv); value_decref(cv);
                     }
                     mc_result=arr;
-                } else if (strcmp(mc_name,"chars")==0) {
+                } else if (strcmp(mc_name,"chars")==0 || strcmp(mc_name,"graphemes")==0) {
                     Value *arr=xs_array_new();
-                    for(int j=0;j<slen;j++){char b[2]={s[j],0};Value*cv=xs_str(b);array_push(arr->arr,cv);value_decref(cv);}
+                    int j=0;
+                    while (j < slen) {
+                        int cp;
+                        int n = utf8_decode(s+j, slen-j, &cp);
+                        if (n <= 0) n = 1;
+                        Value *cv = xs_str_n(s+j, (size_t)n);
+                        array_push(arr->arr, cv); value_decref(cv);
+                        j += n;
+                    }
                     mc_result=arr;
                 } else if (strcmp(mc_name,"replace")==0&&mc_argc>=2&&mc_args[0]->tag==XS_STR&&mc_args[1]->tag==XS_STR) {
                     const char *from=mc_args[0]->s,*to=mc_args[1]->s;
@@ -3161,13 +3485,21 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                     mc_result=xs_bool(strcmp(mc_args[0]->s,"array")==0||strcmp(mc_args[0]->s,"Array")==0||strcmp(mc_args[0]->s,"List")==0);
                 } else mc_result=value_incref(XS_NULL_VAL);
             }
-            else if (mc_obj->tag==XS_INT||mc_obj->tag==XS_FLOAT) {
-                double num_f=(mc_obj->tag==XS_FLOAT)?mc_obj->f:(double)mc_obj->i;
-                int64_t num_i=(mc_obj->tag==XS_INT)?mc_obj->i:(int64_t)mc_obj->f;
-                if (strcmp(mc_name,"is_even")==0)
-                    mc_result=mc_obj->tag==XS_INT?xs_bool(mc_obj->i%2==0):value_incref(XS_FALSE_VAL);
-                else if (strcmp(mc_name,"is_odd")==0)
-                    mc_result=mc_obj->tag==XS_INT?xs_bool(mc_obj->i%2!=0):value_incref(XS_FALSE_VAL);
+            else if (mc_obj->tag==XS_INT||mc_obj->tag==XS_FLOAT||mc_obj->tag==XS_BIGINT) {
+                double num_f=(mc_obj->tag==XS_FLOAT)?mc_obj->f:(mc_obj->tag==XS_BIGINT?bigint_to_double(mc_obj->bigint):(double)mc_obj->i);
+                int64_t num_i=(mc_obj->tag==XS_INT)?mc_obj->i:(mc_obj->tag==XS_BIGINT?(int64_t)bigint_to_double(mc_obj->bigint):(int64_t)mc_obj->f);
+                if (strcmp(mc_name,"is_even")==0) {
+                    if (mc_obj->tag==XS_INT) mc_result=xs_bool(mc_obj->i%2==0);
+                    else if (mc_obj->tag==XS_BIGINT)
+                        mc_result=xs_bool((mc_obj->bigint->len==0) || (mc_obj->bigint->limbs[0]%2==0));
+                    else mc_result=value_incref(XS_FALSE_VAL);
+                }
+                else if (strcmp(mc_name,"is_odd")==0) {
+                    if (mc_obj->tag==XS_INT) mc_result=xs_bool(mc_obj->i%2!=0);
+                    else if (mc_obj->tag==XS_BIGINT)
+                        mc_result=xs_bool((mc_obj->bigint->len>0) && (mc_obj->bigint->limbs[0]%2!=0));
+                    else mc_result=value_incref(XS_FALSE_VAL);
+                }
                 else if (strcmp(mc_name,"is_nan")==0)
                     mc_result=mc_obj->tag==XS_FLOAT?xs_bool(isnan(mc_obj->f)):value_incref(XS_FALSE_VAL);
                 else if (strcmp(mc_name,"is_inf")==0)
@@ -3227,6 +3559,64 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                     mc_result=xs_bool(match);
                 } else mc_result=value_incref(XS_NULL_VAL);
                 (void)num_f; (void)num_i;
+            }
+            else if (mc_obj->tag == XS_REGEX && mc_obj->s) {
+                /* Regex methods: .test/.is_match, .match/.find, .replace,
+                   .source/.pattern. Mirrors interp.c. */
+                const char *pat = mc_obj->s;
+                if ((strcmp(mc_name,"test")==0 || strcmp(mc_name,"is_match")==0)
+                        && mc_argc>=1 && mc_args[0]->tag==XS_STR) {
+                    regex_t re;
+                    if (regcomp(&re, pat, REG_EXTENDED | REG_NOSUB) == 0) {
+                        int ok = (regexec(&re, mc_args[0]->s, 0, NULL, 0) == 0);
+                        regfree(&re);
+                        mc_result = xs_bool(ok);
+                    } else {
+                        mc_result = value_incref(XS_FALSE_VAL);
+                    }
+                } else if ((strcmp(mc_name,"match")==0 || strcmp(mc_name,"find")==0)
+                        && mc_argc>=1 && mc_args[0]->tag==XS_STR) {
+                    regex_t re;
+                    if (regcomp(&re, pat, REG_EXTENDED) == 0) {
+                        regmatch_t m[1];
+                        if (regexec(&re, mc_args[0]->s, 1, m, 0) == 0) {
+                            int len = m[0].rm_eo - m[0].rm_so;
+                            mc_result = xs_str_n(mc_args[0]->s + m[0].rm_so, (size_t)len);
+                        } else {
+                            mc_result = value_incref(XS_NULL_VAL);
+                        }
+                        regfree(&re);
+                    } else {
+                        mc_result = value_incref(XS_NULL_VAL);
+                    }
+                } else if (strcmp(mc_name,"replace")==0 && mc_argc>=2
+                        && mc_args[0]->tag==XS_STR && mc_args[1]->tag==XS_STR) {
+                    regex_t re;
+                    if (regcomp(&re, pat, REG_EXTENDED) == 0) {
+                        regmatch_t m[1];
+                        if (regexec(&re, mc_args[0]->s, 1, m, 0) == 0) {
+                            int pre_len = m[0].rm_so;
+                            int post_start = m[0].rm_eo;
+                            int rlen = (int)strlen(mc_args[1]->s);
+                            int slen = (int)strlen(mc_args[0]->s);
+                            char *buf = xs_malloc((size_t)(pre_len + rlen + slen - post_start + 1));
+                            memcpy(buf, mc_args[0]->s, (size_t)pre_len);
+                            memcpy(buf + pre_len, mc_args[1]->s, (size_t)rlen);
+                            memcpy(buf + pre_len + rlen, mc_args[0]->s + post_start, (size_t)(slen - post_start));
+                            buf[pre_len + rlen + slen - post_start] = '\0';
+                            mc_result = xs_str(buf); free(buf);
+                        } else {
+                            mc_result = value_incref(mc_args[0]);
+                        }
+                        regfree(&re);
+                    } else {
+                        mc_result = value_incref(mc_args[0]);
+                    }
+                } else if (strcmp(mc_name,"source")==0 || strcmp(mc_name,"pattern")==0) {
+                    mc_result = xs_str(pat);
+                } else {
+                    mc_result = value_incref(XS_NULL_VAL);
+                }
             }
             else {
                 /* generic methods for any remaining types */
@@ -3756,6 +4146,31 @@ static int vm_dispatch(VM *vm, int stop_frame) {
             map_set(cls->map, "__methods", methods);
             value_decref(methods);
             PUSH(cls);
+            break;
+        }
+
+        case OP_TRAIT_APPLY: {
+            /* stack: class, trait  ->  copy trait.__defaults methods onto
+               class.__methods for any method the class does not already
+               define. */
+            Value *trait_val = POP();
+            Value *class_val = POP();
+            if ((class_val->tag == XS_MAP || class_val->tag == XS_MODULE) &&
+                (trait_val->tag == XS_MAP || trait_val->tag == XS_MODULE)) {
+                Value *methods = map_get(class_val->map, "__methods");
+                Value *defaults = map_get(trait_val->map, "__defaults");
+                if (methods && methods->tag == XS_MAP &&
+                    defaults && defaults->tag == XS_MAP) {
+                    XSMap *dm = defaults->map;
+                    for (int j = 0; j < dm->cap; j++) {
+                        if (!dm->keys[j]) continue;
+                        if (map_get(methods->map, dm->keys[j])) continue;
+                        map_set(methods->map, dm->keys[j], dm->vals[j]);
+                    }
+                }
+            }
+            value_decref(trait_val);
+            value_decref(class_val);
             break;
         }
 

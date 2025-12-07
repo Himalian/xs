@@ -22,6 +22,10 @@ void proto_free(XSProto *p) {
     for (int i = 0; i < p->n_inner; i++) proto_free(p->inner[i]);
     free(p->inner);
     free(p->uv_descs);
+    if (p->param_names) {
+        for (int i = 0; i < p->n_params; i++) free(p->param_names[i]);
+        free(p->param_names);
+    }
     free(p);
 }
 

@@ -114,6 +114,7 @@ typedef enum {
     NODE_PAT_CAPTURE,       /* x @ pattern */
     NODE_PAT_STRING_CONCAT, /* "prefix" ++ rest */
     NODE_PAT_REGEX,         /* r"\d+" regex match */
+    NODE_PAT_MAP,           /* #{"key": pat, ...} */
 
     // effects
     NODE_EFFECT_DECL,
@@ -556,6 +557,17 @@ struct Node {
             char *pattern;  /* regex pattern string */
         } pat_regex;
 
+        struct {
+            /* Parallel arrays: keys are string-valued (map keys are strings
+               in XS's map model), sub-patterns are normal patterns. A bare
+               identifier `name` with no `:` desugars to `name: name` (matches
+               key "name", binds to local `name`). `..` enables rest/open. */
+            char   **keys;
+            Node   **sub;
+            int      nfields;
+            int      rest;
+        } pat_map;
+
         struct { char *code; } inline_c;
 
         struct {
@@ -601,6 +613,7 @@ struct Node {
             char **rename_keys;
             char **rename_vals;
             int    nrenames;
+            int    sandbox_flags; /* 1=inject_only, 2=no_override, 4=no_eval_hook */
         } load_;
 
         struct {

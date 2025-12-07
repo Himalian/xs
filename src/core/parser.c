@@ -865,7 +865,14 @@ static Node *parse_primary(Parser *p) {
                     }
                     Token *fn_tok = pp_peek(p, 0);
                     char *fname = NULL;
-                    if (fn_tok->kind == TK_IDENT) {
+                    /* Accept soft keywords as field names. They are only
+                       keywords in their declaration position; as field names
+                       they are plain identifiers. */
+                    if (fn_tok->kind == TK_IDENT ||
+                        fn_tok->kind == TK_TYPE || fn_tok->kind == TK_FROM ||
+                        fn_tok->kind == TK_AS   || fn_tok->kind == TK_EXPORT ||
+                        fn_tok->kind == TK_PUB  || fn_tok->kind == TK_ASYNC ||
+                        fn_tok->kind == TK_AWAIT) {
                         pp_advance(p);
                         fname = xs_strdup(fn_tok->sval ? fn_tok->sval : "");
                     } else break;
@@ -889,9 +896,18 @@ static Node *parse_primary(Parser *p) {
             Token *t1 = pp_peek(p, 1);
             Token *t2 = pp_peek(p, 2);
             int is_si = 0;
+            /* Soft keywords that should count as valid field names in a
+               struct initializer. These are declaration-position keywords
+               everywhere else but plain identifiers at a `{ <name>: ... }`
+               shape. */
+            int t1_field_ident =
+                t1->kind == TK_IDENT || t1->kind == TK_TYPE ||
+                t1->kind == TK_FROM  || t1->kind == TK_AS   ||
+                t1->kind == TK_EXPORT || t1->kind == TK_PUB ||
+                t1->kind == TK_ASYNC || t1->kind == TK_AWAIT;
             if (next->kind == TK_LBRACE) {
                 if (t1->kind == TK_RBRACE) is_si = 1; /* empty */
-                else if (t1->kind == TK_IDENT && t2->kind == TK_COLON) is_si = 1;
+                else if (t1_field_ident && t2->kind == TK_COLON) is_si = 1;
                 else if (t1->kind == TK_DOTDOT || t1->kind == TK_DOTDOTDOT) is_si = 1;
             }
             if (is_si) {
@@ -909,7 +925,11 @@ static Node *parse_primary(Parser *p) {
                     }
                     Token *fn_tok = pp_peek(p, 0);
                     char *fname = NULL;
-                    if (fn_tok->kind == TK_IDENT) {
+                    if (fn_tok->kind == TK_IDENT ||
+                        fn_tok->kind == TK_TYPE || fn_tok->kind == TK_FROM ||
+                        fn_tok->kind == TK_AS   || fn_tok->kind == TK_EXPORT ||
+                        fn_tok->kind == TK_PUB  || fn_tok->kind == TK_ASYNC ||
+                        fn_tok->kind == TK_AWAIT) {
                         pp_advance(p);
                         fname = xs_strdup(fn_tok->sval ? fn_tok->sval : "");
                     } else break;
@@ -2089,6 +2109,66 @@ static Node *parse_block(Parser *p) {
 static Node *parse_pattern(Parser *p) {
     Token *tok = pp_peek(p, 0);
     Span span = tok->span;
+
+    /* Map pattern: `{ "key": sub, ident: sub, short_ident, .. }`
+       The `#` in `#{...}` is already stripped by the lexer, so we see
+       a bare LBRACE here. Distinguish from something else by looking
+       at the head: a map pattern always starts with a string literal
+       key, or `ident :`, or `..`, or is empty. */
+    if (tok->kind == TK_LBRACE) {
+        Token *a = pp_peek(p, 1);
+        Token *b = pp_peek(p, 2);
+        int looks_like_map =
+            a->kind == TK_RBRACE ||
+            a->kind == TK_DOTDOT ||
+            a->kind == TK_STRING ||
+            (a->kind == TK_IDENT && (b->kind == TK_COLON || b->kind == TK_COMMA || b->kind == TK_RBRACE));
+        if (looks_like_map) {
+            pp_advance(p); /* consume '{' */
+            char **keys = NULL; Node **subs = NULL;
+            int nfields = 0, cap = 0; int rest = 0;
+            while (!pp_check2(p, TK_RBRACE, TK_EOF)) {
+                if (pp_check(p, TK_DOTDOT)) { pp_advance(p); rest = 1; break; }
+                Token *kt = pp_peek(p, 0);
+                char *key = NULL;
+                if (kt->kind == TK_STRING) {
+                    pp_advance(p);
+                    key = xs_strdup(kt->sval ? kt->sval : "");
+                } else if (kt->kind == TK_IDENT) {
+                    pp_advance(p);
+                    key = xs_strdup(kt->sval ? kt->sval : "");
+                } else {
+                    break;
+                }
+                Node *sub = NULL;
+                if (pp_match(p, TK_COLON)) {
+                    sub = parse_pattern(p);
+                } else {
+                    /* shorthand: `name` matches key "name" and binds to local name */
+                    Node *id = node_new(NODE_PAT_IDENT, kt->span);
+                    id->pat_ident.name    = xs_strdup(key);
+                    id->pat_ident.mutable = 0;
+                    sub = id;
+                }
+                if (nfields == cap) {
+                    cap = cap ? cap * 2 : 4;
+                    keys = xs_realloc(keys, sizeof(char*) * cap);
+                    subs = xs_realloc(subs, sizeof(Node*) * cap);
+                }
+                keys[nfields] = key;
+                subs[nfields] = sub;
+                nfields++;
+                if (!pp_match(p, TK_COMMA)) break;
+            }
+            pp_expect(p, TK_RBRACE, "expected '}' in map pattern");
+            Node *n = node_new(NODE_PAT_MAP, span);
+            n->pat_map.keys = keys;
+            n->pat_map.sub = subs;
+            n->pat_map.nfields = nfields;
+            n->pat_map.rest = rest;
+            return n;
+        }
+    }
 
     /* Wildcard */
     if (tok->kind == TK_IDENT && strcmp(tok->sval ? tok->sval : "", "_") == 0) {
@@ -3635,6 +3715,25 @@ static Node *parse_load_stmt(Parser *p) {
         pp_expect(p, TK_RBRACE, "expected '}'");
     }
 
+    /* optional: sandbox { flags } -- same set as `use plugin`. */
+    int sandbox_flags = 0;
+    if (pp_peek(p, 0)->kind == TK_IDENT && pp_peek(p, 0)->sval &&
+        strcmp(pp_peek(p, 0)->sval, "sandbox") == 0) {
+        pp_advance(p); /* consume 'sandbox' */
+        pp_expect(p, TK_LBRACE, "expected '{' after sandbox");
+        while (!pp_check2(p, TK_RBRACE, TK_EOF)) {
+            Token *flag = pp_peek(p, 0);
+            if (flag->kind == TK_IDENT && flag->sval) {
+                if      (strcmp(flag->sval, "inject_only")  == 0) sandbox_flags |= 1;
+                else if (strcmp(flag->sval, "no_override")  == 0) sandbox_flags |= 2;
+                else if (strcmp(flag->sval, "no_eval_hook") == 0) sandbox_flags |= 4;
+            }
+            pp_advance(p);
+            pp_match(p, TK_COMMA);
+        }
+        pp_expect(p, TK_RBRACE, "expected '}' after sandbox flags");
+    }
+
     if (!pp_match(p, TK_SEMICOLON)) pp_match(p, TK_NEWLINE);
 
     Node *n = node_new(NODE_LOAD, span);
@@ -3642,6 +3741,7 @@ static Node *parse_load_stmt(Parser *p) {
     n->load_.rename_keys = rename_keys;
     n->load_.rename_vals = rename_vals;
     n->load_.nrenames = nrenames;
+    n->load_.sandbox_flags = sandbox_flags;
     return n;
 }
 
