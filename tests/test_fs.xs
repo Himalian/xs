@@ -142,13 +142,6 @@ fs.rmdir(walk_dir)
 
 -- glob
 let glob_results = fs.glob("tests/test_*.xs")
-if glob_results.len() < 10 {
-    print("glob returned " + str(glob_results.len()) + " results")
-    if glob_results.len() > 0 {
-        print(", first: " + glob_results[0])
-    }
-    print("\n")
-}
 assert(glob_results.len() >= 10)
 
 -- chmod (unix only, windows has limited permission model)

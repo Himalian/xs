@@ -2762,7 +2762,7 @@ static Value *native_io_stdin_lines(Interp *ig, Value **a, int n) {
 static Value *native_io_glob(Interp *ig, Value **a, int n) {
     (void)ig;
     if (n<1||a[0]->tag!=XS_STR) return xs_array_new();
-#if !defined(__MINGW32__) && !defined(__wasi__)
+#if !defined(__wasi__)
     glob_t g; memset(&g,0,sizeof(g));
     Value *arr=xs_array_new();
     if (glob(a[0]->s,0,NULL,&g)==0) {
@@ -7830,7 +7830,7 @@ static Value *native_fs_read_lines(Interp *ig, Value **a, int n) {
 
 /* fs.walk(path) - recursive directory walker, returns array of entry maps */
 static void fs_walk_recurse(const char *dir, Value *arr) {
-#if !defined(__MINGW32__) && !defined(__wasi__)
+#if !defined(__wasi__)
     DIR *d = opendir(dir);
     if (!d) return;
     struct dirent *ent;
