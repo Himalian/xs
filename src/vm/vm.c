@@ -11,7 +11,7 @@
 #include <math.h>
 #include <ctype.h>
 #include <time.h>
-#include <regex.h>
+#include "core/xs_regex.h"
 
 #define PUSH(v)  do { \
     if (vm->sp - vm->stack >= vm->stack_cap) vm_grow_stack(vm); \
