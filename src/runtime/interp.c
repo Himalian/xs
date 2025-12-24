@@ -2984,18 +2984,32 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
                     }
                     if (strcmp(method,"recv")==0) {
                         if (da->len == 0) {
-                            fprintf(stderr, "xs: error at %s:%d:%d: channel: recv on empty channel\n",
-                                    i->current_span.file ? i->current_span.file : "<unknown>",
-                                    i->current_span.line, i->current_span.col);
+                            /* No cooperative scheduler: block-on-empty would
+                               deadlock. Raise a catchable ChannelEmpty so
+                               the caller sees the real shape of the problem
+                               rather than a silent null. */
+                            Value *err = xs_error_new("ChannelEmpty",
+                                "recv on empty channel would deadlock "
+                                "(no concurrent sender); use try_recv() for non-blocking",
+                                NULL);
+                            if (i->cf.value) value_decref(i->cf.value);
+                            i->cf.signal = CF_THROW;
+                            i->cf.value = err;
                             return value_incref(XS_NULL_VAL);
                         }
-                        /* Dequeue from front */
                         Value *v = da->items[0];
                         for (int idx2 = 1; idx2 < da->len; idx2++)
                             da->items[idx2-1] = da->items[idx2];
                         da->len--;
-                        /* v is already ref-counted (owned by array slot) */
-                        return v; /* transfer ownership */
+                        return v;
+                    }
+                    if (strcmp(method,"try_recv")==0) {
+                        if (da->len == 0) return value_incref(XS_NULL_VAL);
+                        Value *v = da->items[0];
+                        for (int idx2 = 1; idx2 < da->len; idx2++)
+                            da->items[idx2-1] = da->items[idx2];
+                        da->len--;
+                        return v;
                     }
                     if (strcmp(method,"len")==0) return xs_int(da->len);
                     if (strcmp(method,"is_empty")==0)

@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "core/xs_compat.h"
 #include "runtime/interp.h"
+#include "runtime/error.h"
 #include "core/xs_bigint.h"
 #include "tls/xs_tls.h"
 #include "core/gc.h"
@@ -4558,9 +4559,39 @@ static Value *native_channel_recv(Interp *ig, Value **a, int n) {
     if ((ch_val->tag != XS_MAP && ch_val->tag != XS_MODULE) || !ch_val->map)
         return value_incref(XS_NULL_VAL);
     Value *buf = map_get(ch_val->map, "_buf");
+    if (!buf || buf->tag != XS_ARRAY || buf->arr->len == 0) {
+        /* No cooperative scheduler yet: recv on an empty channel cannot
+           suspend and wait. Throw a catchable error instead of silently
+           returning null, so the caller does not treat "no data" as a
+           valid value. Use try_recv() if you want the non-blocking form. */
+        if (ig) {
+            Value *err = xs_error_new("ChannelEmpty",
+                "recv on empty channel would deadlock "
+                "(no concurrent sender); use try_recv() for non-blocking",
+                NULL);
+            if (ig->cf.value) value_decref(ig->cf.value);
+            ig->cf.signal = CF_THROW;
+            ig->cf.value = err;
+        }
+        return value_incref(XS_NULL_VAL);
+    }
+    /* Remove and return the first element */
+    Value *val = value_incref(buf->arr->items[0]);
+    for (int j = 0; j < buf->arr->len - 1; j++)
+        buf->arr->items[j] = buf->arr->items[j + 1];
+    buf->arr->len--;
+    return val;
+}
+
+static Value *native_channel_try_recv(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1) return value_incref(XS_NULL_VAL);
+    Value *ch_val = a[0];
+    if ((ch_val->tag != XS_MAP && ch_val->tag != XS_MODULE) || !ch_val->map)
+        return value_incref(XS_NULL_VAL);
+    Value *buf = map_get(ch_val->map, "_buf");
     if (!buf || buf->tag != XS_ARRAY || buf->arr->len == 0)
         return value_incref(XS_NULL_VAL);
-    /* Remove and return the first element */
     Value *val = value_incref(buf->arr->items[0]);
     for (int j = 0; j < buf->arr->len - 1; j++)
         buf->arr->items[j] = buf->arr->items[j + 1];
@@ -4577,6 +4608,7 @@ static Value *native_async_channel(Interp *ig, Value **a, int n) {
     value_decref(buf);
     map_set(ch, "send", xs_native(native_channel_send));
     map_set(ch, "recv", xs_native(native_channel_recv));
+    map_set(ch, "try_recv", xs_native(native_channel_try_recv));
     return xs_module(ch);
 }
 

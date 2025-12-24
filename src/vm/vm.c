@@ -2249,16 +2249,57 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                         if (buf && buf->tag == XS_ARRAY) array_push(buf->arr, value_incref(mc_args[0]));
                         mc_result = value_incref(XS_NULL_VAL);
                     } else goto map_generic_method;
-                } else if (strcmp(mc_name,"recv")==0) {
+                } else if (strcmp(mc_name,"recv")==0 || strcmp(mc_name,"try_recv")==0) {
                     Value *ch_type = map_get(mc_obj->map, "__type");
                     if (ch_type && ch_type->tag == XS_STR && strcmp(ch_type->s, "channel") == 0) {
                         Value *buf = map_get(mc_obj->map, "_buf");
+                        int nonblocking = (mc_name[0] == 't');
                         if (buf && buf->tag == XS_ARRAY && buf->arr->len > 0) {
                             mc_result = value_incref(buf->arr->items[0]);
                             value_decref(buf->arr->items[0]);
                             for (int j = 1; j < buf->arr->len; j++) buf->arr->items[j-1] = buf->arr->items[j];
                             buf->arr->len--;
-                        } else mc_result = value_incref(XS_NULL_VAL);
+                        } else if (nonblocking) {
+                            mc_result = value_incref(XS_NULL_VAL);
+                        } else {
+                            /* No cooperative scheduler: throw instead of
+                               silently returning null so the caller does
+                               not mistake "nothing to read" for data. */
+                            Value *err = xs_map_new();
+                            Value *kind = xs_str("ChannelEmpty");
+                            map_set(err->map, "kind", kind); value_decref(kind);
+                            Value *msg = xs_str("recv on empty channel would deadlock "
+                                                "(no concurrent sender); use try_recv() for non-blocking");
+                            map_set(err->map, "message", msg); value_decref(msg);
+                            /* clean up stack: args + callee */
+                            for (int j = 0; j < mc_argc; j++) value_decref(POP());
+                            value_decref(POP());
+                            /* inline unwind to nearest try */
+                            int handled = 0;
+                            while (vm->frame_count > 0) {
+                                CallFrame *cf = &vm->frames[vm->frame_count - 1];
+                                if (cf->try_depth > 0) {
+                                    TryEntry *te = &cf->try_stack[--cf->try_depth];
+                                    while (vm->sp > te->stack_top) value_decref(POP());
+                                    PUSH(err);
+                                    cf->ip = te->catch_ip;
+                                    frame = cf;
+                                    handled = 1;
+                                    break;
+                                }
+                                upvalue_close_all(&vm->open_upvalues, cf->base);
+                                while (vm->sp > cf->base) value_decref(POP());
+                                value_decref(cf->closure_val);
+                                vm->frame_count--;
+                            }
+                            if (!handled) {
+                                fprintf(stderr, "uncaught ChannelEmpty: %s\n",
+                                        "recv on empty channel");
+                                value_decref(err);
+                                return 1;
+                            }
+                            break; /* exit the OP_METHOD_CALL switch case */
+                        }
                     } else goto map_generic_method;
                 } else if (strcmp(mc_name,"is_empty")==0) {
                     Value *ch_type = map_get(mc_obj->map, "__type");

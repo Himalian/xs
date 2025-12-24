@@ -103,6 +103,9 @@ static int program_has_plugin_use(Node *program) {
    execution. Returns 1 if any such call is present. */
 static int node_uses_plugin_runtime_hook(Node *n) {
     if (!n) return 0;
+    /* bind requires interp-side reactive tracking; VM compiles it as a
+       plain let so subsequent mutations of dependencies do not propagate. */
+    if (n->tag == NODE_BIND) return 1;
     if (n->tag == NODE_METHOD_CALL) {
         const char *m = n->method_call.method;
         if (m && (strcmp(m, "after_eval") == 0 ||
