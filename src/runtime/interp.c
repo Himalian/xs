@@ -23,6 +23,7 @@
 #include "core/utf8.h"
 #include "optimizer/inline_cache.h"
 #include "runtime/async.h"
+#include "runtime/concurrent.h"
 #include <time.h>
 #include <limits.h>
 #ifndef PATH_MAX
@@ -897,7 +898,8 @@ static int match_pattern(Interp *i, Node *pat, Value *val, Env *env) {
         }
     }
     case NODE_PAT_TUPLE: {
-        if (val->tag != XS_ARRAY && val->tag != XS_TUPLE) return 0;
+        /* Tuple patterns ((..)) match tuples only; arrays need [..]. */
+        if (val->tag != XS_TUPLE) return 0;
         if (val->arr->len != pat->pat_tuple.elems.len) return 0;
         for (int j = 0; j < pat->pat_tuple.elems.len; j++) {
             if (!match_pattern(i, pat->pat_tuple.elems.items[j],
@@ -1002,7 +1004,8 @@ static int match_pattern(Interp *i, Node *pat, Value *val, Env *env) {
         return ok;
     }
     case NODE_PAT_SLICE: {
-        if (val->tag != XS_ARRAY && val->tag != XS_TUPLE) return 0;
+        /* Slice patterns ([..]) match arrays only; tuples need (..). */
+        if (val->tag != XS_ARRAY) return 0;
         XSArray *arr = val->arr;
         int nfixed = pat->pat_slice.elems.len;
         if (!pat->pat_slice.rest && arr->len != nfixed) return 0;
@@ -1338,29 +1341,54 @@ tail_call_entry: ;
         Value *result = NULL;
         if (fn->body) {
             if (fn->is_generator) {
-                Value *collector = xs_array_new();
-                Value *saved_collector = i->yield_collect;
-                int saved_limit = i->yield_limit;
-                i->yield_collect = collector;
-                if (i->yield_limit == 0) i->yield_limit = 100000;
+                /* Lazy generator: spin up a worker thread that runs
+                   the body. The worker blocks on a resume channel
+                   between yields, so infinite generators with break
+                   no longer hang. The generator object exposes
+                   _yield_chan and _resume_chan for .next() / for. */
+                Value *yield_chan  = xs_map_new();
+                Value *resume_chan = xs_map_new();
+                int yc_id = xs_chan_alloc();
+                int rc_id = xs_chan_alloc();
+                {
+                    Value *t = xs_str("Channel");
+                    map_set(yield_chan->map, "_type", t); value_decref(t);
+                    Value *idv = xs_int(yc_id);
+                    map_set(yield_chan->map, "_chan_id", idv); value_decref(idv);
+                    Value *bf = xs_array_new();
+                    map_set(yield_chan->map, "_buf", bf); value_decref(bf);
+                }
+                {
+                    Value *t = xs_str("Channel");
+                    map_set(resume_chan->map, "_type", t); value_decref(t);
+                    Value *idv = xs_int(rc_id);
+                    map_set(resume_chan->map, "_chan_id", idv); value_decref(idv);
+                    Value *bf = xs_array_new();
+                    map_set(resume_chan->map, "_buf", bf); value_decref(bf);
+                }
 
-                Value *body_val = interp_eval(i, fn->body);
-                value_decref(body_val);
+                /* Build a zero-arg wrapper whose closure env IS the
+                   already-populated call_env. The worker invokes it with
+                   no args and the body sees the parameters as locals
+                   (start, end, etc) just like the regular eager path. */
+                XSFunc *gen_fn = func_new_ex(fn->name, NULL, 0,
+                                             fn->body, call_env,
+                                             NULL, NULL);
+                gen_fn->is_generator = 0;
+                Value *closure = xs_func_new(gen_fn);
 
-                i->yield_collect = saved_collector;
-                i->yield_limit = saved_limit;
-
-                if (i->cf.signal == CF_RETURN || i->cf.signal == CF_YIELD)
-                    CF_CLEAR(i);
+                xs_spawn_generator(i, closure, yield_chan, resume_chan);
+                value_decref(closure);
 
                 Value *gen = xs_map_new();
                 Value *type_v = xs_str("generator");
                 map_set(gen->map, "__type", type_v); value_decref(type_v);
-                map_set(gen->map, "_yields", collector); value_decref(collector);
-                Value *idx_v = xs_int(0);
-                map_set(gen->map, "_index", idx_v); value_decref(idx_v);
+                map_set(gen->map, "_yield_chan",  yield_chan);
+                map_set(gen->map, "_resume_chan", resume_chan);
                 Value *done_v = value_incref(XS_FALSE_VAL);
                 map_set(gen->map, "_done", done_v); value_decref(done_v);
+                value_decref(yield_chan);
+                value_decref(resume_chan);
                 result = gen;
             } else {
                 Value *body_val = interp_eval(i, fn->body);
@@ -2198,6 +2226,13 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
             res[ri] = '\0';
             Value *v = xs_str(res); free(res); return v;
         }
+        if (strcmp(method, "is_a") == 0) {
+            if (argc >= 1 && args[0]->tag == XS_STR) {
+                return xs_bool(strcmp(args[0]->s, "str") == 0 ||
+                               strcmp(args[0]->s, "String") == 0);
+            }
+            return value_incref(XS_FALSE_VAL);
+        }
     }
 
     // --- array methods
@@ -2414,7 +2449,7 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
                 if (value_equal(arr->items[j],args[0])) return xs_int(j);
             return xs_int(-1);
         }
-        if (strcmp(method, "flatten") == 0) {
+        if (strcmp(method, "flatten") == 0 || strcmp(method, "flat") == 0) {
             Value *res=xs_array_new();
             for (int j=0;j<arr->len;j++) {
                 if (arr->items[j]->tag==XS_ARRAY) {
@@ -2854,6 +2889,77 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
     // --- map methods
     if (obj->tag == XS_MAP || obj->tag == XS_MODULE) {
         XSMap *m = obj->map;
+        /* Generator: .next() drives the worker via the resume channel
+           and reads one value. End-of-stream is signaled by a
+           {_gen_eos: true} sentinel sent by the worker. */
+        {
+            Value *gtype = map_get(m, "__type");
+            Value *ych   = map_get(m, "_yield_chan");
+            Value *rch   = map_get(m, "_resume_chan");
+            if (gtype && gtype->tag == XS_STR &&
+                strcmp(gtype->s, "generator") == 0 &&
+                ych && rch) {
+                if (strcmp(method, "next") == 0) {
+                    Value *done = map_get(m, "_done");
+                    Value *result = xs_map_new();
+                    if (done && done->tag == XS_BOOL && done->i) {
+                        Value *nv = value_incref(XS_NULL_VAL);
+                        map_set(result->map, "value", nv); value_decref(nv);
+                        Value *dv = value_incref(XS_TRUE_VAL);
+                        map_set(result->map, "done", dv); value_decref(dv);
+                        return result;
+                    }
+                    Value *go = value_incref(XS_NULL_VAL);
+                    xs_chan_send(rch, go); value_decref(go);
+                    Value *v = xs_chan_recv(ych, i);
+                    int eos = 0;
+                    if (v && v->tag == XS_MAP) {
+                        Value *e = map_get(v->map, "_gen_eos");
+                        if (e && e->tag == XS_BOOL && e->i) eos = 1;
+                    }
+                    if (eos) {
+                        Value *dv = value_incref(XS_TRUE_VAL);
+                        map_set(m, "_done", dv); value_decref(dv);
+                        Value *nv = value_incref(XS_NULL_VAL);
+                        map_set(result->map, "value", nv); value_decref(nv);
+                        Value *dv2 = value_incref(XS_TRUE_VAL);
+                        map_set(result->map, "done", dv2); value_decref(dv2);
+                        if (v) value_decref(v);
+                    } else {
+                        map_set(result->map, "value", v ? v : value_incref(XS_NULL_VAL));
+                        if (v) value_decref(v);
+                        Value *dv = value_incref(XS_FALSE_VAL);
+                        map_set(result->map, "done", dv); value_decref(dv);
+                    }
+                    return result;
+                }
+            }
+        }
+
+        /* Channels: handle send/recv/etc. before the generic native
+           dispatch so we can route through xs_chan_* with the channel
+           as receiver (the bound natives don't get self prepended). */
+        {
+            Value *cid = map_get(m, "_chan_id");
+            if (cid && cid->tag == XS_INT) {
+                if (strcmp(method,"send")==0) {
+                    if (argc < 1) return value_incref(XS_NULL_VAL);
+                    return xs_chan_send(obj, args[0]);
+                }
+                if (strcmp(method,"recv")==0)
+                    return xs_chan_recv(obj, i);
+                if (strcmp(method,"try_recv")==0)
+                    return xs_chan_try_recv(obj);
+                if (strcmp(method,"len")==0)
+                    return xs_int(xs_chan_len(obj));
+                if (strcmp(method,"is_empty")==0)
+                    return xs_chan_len(obj) == 0
+                        ? value_incref(XS_TRUE_VAL)
+                        : value_incref(XS_FALSE_VAL);
+                if (strcmp(method,"is_full")==0)
+                    return value_incref(XS_FALSE_VAL);
+            }
+        }
         /* Generator iterator protocol */
         {
             Value *ct = map_get(m, "__type");
@@ -2962,63 +3068,26 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
                         return call_value(i, fn, NULL, 0, "derived_get");
                     }
                 }
-                /* Channel: send/recv/len */
+                /* Channel: dispatch via concurrent runtime so the same
+                   buffer + condvar is shared with .send/.recv natives
+                   bound on the map and with the VM-side channel calls. */
                 if (strcmp(ct->s,"Channel")==0) {
-                    Value *data = map_get(m, "_data");
-                    if (!data || data->tag != XS_ARRAY)
-                        return value_incref(XS_NULL_VAL);
-                    XSArray *da = data->arr;
                     if (strcmp(method,"send")==0) {
                         if (argc < 1) return value_incref(XS_NULL_VAL);
-                        /* Check capacity */
-                        Value *cap_v = map_get(m, "_cap");
-                        int cap = cap_v ? (int)cap_v->i : 0;
-                        if (cap > 0 && da->len >= cap) {
-                            fprintf(stderr, "xs: error at %s:%d:%d: channel: buffer full (capacity %d)\n",
-                                    i->current_span.file ? i->current_span.file : "<unknown>",
-                                    i->current_span.line, i->current_span.col, cap);
-                            return value_incref(XS_NULL_VAL);
-                        }
-                        array_push(da, value_incref(args[0]));
-                        return value_incref(XS_NULL_VAL);
+                        return xs_chan_send(obj, args[0]);
                     }
-                    if (strcmp(method,"recv")==0) {
-                        if (da->len == 0) {
-                            /* No cooperative scheduler: block-on-empty would
-                               deadlock. Raise a catchable ChannelEmpty so
-                               the caller sees the real shape of the problem
-                               rather than a silent null. */
-                            Value *err = xs_error_new("ChannelEmpty",
-                                "recv on empty channel would deadlock "
-                                "(no concurrent sender); use try_recv() for non-blocking",
-                                NULL);
-                            if (i->cf.value) value_decref(i->cf.value);
-                            i->cf.signal = CF_THROW;
-                            i->cf.value = err;
-                            return value_incref(XS_NULL_VAL);
-                        }
-                        Value *v = da->items[0];
-                        for (int idx2 = 1; idx2 < da->len; idx2++)
-                            da->items[idx2-1] = da->items[idx2];
-                        da->len--;
-                        return v;
-                    }
-                    if (strcmp(method,"try_recv")==0) {
-                        if (da->len == 0) return value_incref(XS_NULL_VAL);
-                        Value *v = da->items[0];
-                        for (int idx2 = 1; idx2 < da->len; idx2++)
-                            da->items[idx2-1] = da->items[idx2];
-                        da->len--;
-                        return v;
-                    }
-                    if (strcmp(method,"len")==0) return xs_int(da->len);
+                    if (strcmp(method,"recv")==0)
+                        return xs_chan_recv(obj, i);
+                    if (strcmp(method,"try_recv")==0)
+                        return xs_chan_try_recv(obj);
+                    if (strcmp(method,"len")==0)
+                        return xs_int(xs_chan_len(obj));
                     if (strcmp(method,"is_empty")==0)
-                        return da->len==0?value_incref(XS_TRUE_VAL):value_incref(XS_FALSE_VAL);
-                    if (strcmp(method,"is_full")==0) {
-                        Value *cap_v = map_get(m, "_cap");
-                        int cap = cap_v ? (int)cap_v->i : 0;
-                        return (cap > 0 && da->len >= cap)?value_incref(XS_TRUE_VAL):value_incref(XS_FALSE_VAL);
-                    }
+                        return xs_chan_len(obj) == 0
+                            ? value_incref(XS_TRUE_VAL)
+                            : value_incref(XS_FALSE_VAL);
+                    if (strcmp(method,"is_full")==0)
+                        return value_incref(XS_FALSE_VAL); /* unbounded */
                 }
                 /* Counter is now routed via the early goto above */
             }
@@ -4289,6 +4358,19 @@ static Value *eval_binop(Interp *i, Node *n) {
         }
     }
 
+    /* array + array concatenates (same shape as ++ for arrays). Without
+       this branch the two arrays fell through to the float coerce and
+       silently produced null. */
+    if (op[0]=='+' && op[1]=='\0' &&
+        left->tag==XS_ARRAY && right->tag==XS_ARRAY) {
+        Value *res=xs_array_new();
+        for (int j=0;j<left->arr->len;j++)
+            array_push(res->arr, left->arr->items[j]);
+        for (int j=0;j<right->arr->len;j++)
+            array_push(res->arr, right->arr->items[j]);
+        result=res; goto done;
+    }
+
     if (strcmp(op, "is") == 0) {
         const char *tname = (right->tag == XS_STR) ? right->s : "";
         int match = 0;
@@ -4954,6 +5036,20 @@ Value *interp_eval(Interp *i, Node *n) {
                 }
             }
             value_decref(obj); value_decref(idx);
+            /* Reactive notify: walk the target back to its root identifier
+               so reactive bindings that depend on it re-evaluate. Without
+               this, `arr[1] = v` mutated the array in place but no bind
+               that referenced `arr` ever fired. */
+            {
+                Node *cur = target;
+                while (cur && cur->tag != NODE_IDENT) {
+                    if (cur->tag == NODE_INDEX) cur = cur->index.obj;
+                    else if (cur->tag == NODE_FIELD) cur = cur->field.obj;
+                    else break;
+                }
+                if (cur && cur->tag == NODE_IDENT)
+                    env_notify_reactive(i->env, cur->ident.name);
+            }
         } else if (target->tag == NODE_FIELD) {
             Value *obj = EVAL(i, target->field.obj);
             if (obj->tag == XS_INST) {
@@ -4966,6 +5062,17 @@ Value *interp_eval(Interp *i, Node *n) {
                 map_set(obj->actor->state, target->field.name, value_incref(result));
             }
             value_decref(obj);
+            /* Reactive notify: see comment above. */
+            {
+                Node *cur = target;
+                while (cur && cur->tag != NODE_IDENT) {
+                    if (cur->tag == NODE_INDEX) cur = cur->index.obj;
+                    else if (cur->tag == NODE_FIELD) cur = cur->field.obj;
+                    else break;
+                }
+                if (cur && cur->tag == NODE_IDENT)
+                    env_notify_reactive(i->env, cur->ident.name);
+            }
         }
 
         Value *ret = value_incref(result);
@@ -5227,6 +5334,16 @@ do_call: ;
             } else {
                 result = value_incref(XS_NULL_VAL);
             }
+        } else if (obj->tag == XS_NULL) {
+            xs_runtime_error(n->span, "null index", NULL,
+                "cannot index a null value");
+            result = value_incref(XS_NULL_VAL);
+        } else if (obj->tag == XS_INT || obj->tag == XS_FLOAT ||
+                   obj->tag == XS_BOOL || obj->tag == XS_BIGINT) {
+            xs_runtime_error(n->span, "not indexable", NULL,
+                "cannot index a value of tag %d (only arrays, tuples, maps, strings, ranges)",
+                (int)obj->tag);
+            result = value_incref(XS_NULL_VAL);
         } else {
             result = value_incref(XS_NULL_VAL);
         }
@@ -5453,16 +5570,22 @@ do_call: ;
         } else if (iter->tag == XS_MAP && map_get(iter->map, "__type") &&
                    map_get(iter->map, "__type")->tag == XS_STR &&
                    strcmp(map_get(iter->map, "__type")->s, "generator") == 0) {
-            /* Generator iterator: iterate over yielded values via next() */
-            Value *yields = map_get(iter->map, "_yields");
-            if (yields && yields->tag == XS_ARRAY) {
-                for (int fi = 0; fi < yields->arr->len; fi++) {
-                    push_env(i);
-                    bind_pattern(i, n->for_loop.pattern, yields->arr->items[fi], i->env, 1);
-                    interp_exec(i, n->for_loop.body);
-                    pop_env(i);
-                    FOR_BREAK_CHECK
-                }
+            /* Generator iterator: drive the worker via .next() until
+               EOS. Break inside the body unwinds the loop without
+               draining the generator (the worker eventually finishes
+               on its own when the channel handle is dropped). */
+            while (1) {
+                Value *res = eval_method(i, iter, "next", NULL, 0);
+                if (!res || res->tag != XS_MAP) { if (res) value_decref(res); break; }
+                Value *done = map_get(res->map, "done");
+                if (done && done->tag == XS_BOOL && done->i) { value_decref(res); break; }
+                Value *val = map_get(res->map, "value");
+                push_env(i);
+                bind_pattern(i, n->for_loop.pattern, val ? val : XS_NULL_VAL, i->env, 1);
+                interp_exec(i, n->for_loop.body);
+                pop_env(i);
+                value_decref(res);
+                FOR_BREAK_CHECK
             }
         } else if ((iter->tag == XS_INST &&
                     (map_has(iter->inst->methods, "next") ||
@@ -5623,9 +5746,17 @@ do_call: ;
         }
         Value *val = n->yield_.value ? EVAL(i, n->yield_.value) : value_incref(XS_NULL_VAL);
         if (i->cf.signal) { value_decref(val); return value_incref(XS_NULL_VAL); }
-        if (i->yield_collect) {
-            /* generator collect mode: push value into collector array */
-            array_push(i->yield_collect->arr, val); /* array_push takes ownership */
+        if (i->lazy_yield_chan && i->lazy_resume_chan) {
+            /* Lazy mode: hand the value to the consumer and block until
+               they ask for the next one. The chan funcs release the GIL
+               during the wait so the consumer can actually run. */
+            xs_chan_send(i->lazy_yield_chan, val);
+            value_decref(val);
+            Value *go = xs_chan_recv(i->lazy_resume_chan, i);
+            if (go) value_decref(go);
+        } else if (i->yield_collect) {
+            /* legacy eager mode: push value into collector array */
+            array_push(i->yield_collect->arr, val);
             if (i->yield_limit > 0 && i->yield_collect->arr->len >= i->yield_limit) {
                 i->cf.signal = CF_RETURN;
                 i->cf.value = value_incref(XS_NULL_VAL);
@@ -5648,8 +5779,12 @@ do_call: ;
     }
 
     case NODE_TRY: {
+        /* Bump try_depth so xs_runtime_error knows the throw it raises
+           will land in a catch arm (and can suppress its inline render). */
+        i->try_depth++;
         /* Execute body and capture result */
         Value *result = EVAL(i, n->try_.body);
+        i->try_depth--;
         if (i->cf.signal == CF_THROW) {
             value_decref(result);
             result = value_incref(XS_NULL_VAL);
@@ -6066,37 +6201,21 @@ do_call: ;
     }
 
     case NODE_AWAIT: {
-        /* Cooperative await: evaluate expression, then check if it's a task handle */
+        /* await on a future returned by spawn: blocks until the spawned
+           thread finishes, releasing the GIL so the spawned thread can
+           actually run. */
         Value *v = EVAL(i, n->await_.expr);
         if (i->cf.signal) { value_decref(v); return value_incref(XS_NULL_VAL); }
         if (v->tag == XS_MAP) {
             Value *tid_val = map_get(v->map, "_task_id");
             if (tid_val && tid_val->tag == XS_INT) {
-                /* Task queue entry: run all pending tasks up to this one */
                 int tid = (int)tid_val->i;
-                for (int t = 0; t <= tid && t < i->n_tasks; t++) {
-                    if (i->task_queue[t].done) continue;
-                    Value *tfn = i->task_queue[t].fn;
-                    Value *tres = NULL;
-                    if (tfn) tres = call_value(i, tfn, NULL, 0, "spawn_task");
-                    i->task_queue[t].result = tres ? tres : value_incref(XS_NULL_VAL);
-                    i->task_queue[t].done = 1;
-                }
-                /* Return the awaited task's result */
-                Value *result = value_incref(XS_NULL_VAL);
-                if (tid >= 0 && tid < i->n_tasks && i->task_queue[tid].done) {
-                    value_decref(result);
-                    result = i->task_queue[tid].result
-                        ? value_incref(i->task_queue[tid].result)
-                        : value_incref(XS_NULL_VAL);
-                    /* Update task handle */
-                    { Value *sv = xs_str("done"); map_set(v->map, "_status", sv); value_decref(sv); }
-                    map_set(v->map, "_result", i->task_queue[tid].result);
-                }
+                Value *r = xs_await_task(tid);
+                Value *sv = xs_str("done"); map_set(v->map, "_status", sv); value_decref(sv);
+                map_set(v->map, "_result", r);
                 value_decref(v);
-                return result;
+                return r;
             }
-            /* Check for legacy _status / _result maps */
             Value *status = map_get(v->map, "_status");
             if (status && status->tag == XS_STR && strcmp(status->s, "done") == 0) {
                 Value *res = map_get(v->map, "_result");
@@ -6110,7 +6229,7 @@ do_call: ;
             value_decref(v);
             return result;
         }
-        return v; /* Already a concrete value */
+        return v;
     }
 
     case NODE_NURSERY: {
@@ -6151,52 +6270,37 @@ do_call: ;
     }
 
     case NODE_SPAWN: {
-        /* Queue or execute a task expression.
-         * When a nursery is active, wrap the expression as a zero-param function
-         * and add it to the nursery queue for deferred execution.
-         * Otherwise defer into cooperative task queue. */
+        /* Nursery-scoped spawn: queue for the parent's nursery to drain. */
         if (i->nursery_queue) {
-            /* Wrap the expression body as a zero-param closure */
             XSFunc *fn = func_new_ex("__spawn__", NULL, 0,
                                      n->spawn_.expr, i->env, NULL, NULL);
             Value *task = xs_func_new(fn);
-            array_push(i->nursery_queue->arr, task); /* queue takes ownership */
+            array_push(i->nursery_queue->arr, task);
             return value_incref(XS_NULL_VAL);
-        } else {
-            /* Wrap the spawn expression as a zero-param closure for deferred execution */
-            XSFunc *spawn_fn = func_new_ex("__spawn__", NULL, 0,
-                                           n->spawn_.expr, i->env, NULL, NULL);
-            Value *v = xs_func_new(spawn_fn);
-
-            /* Check for actors first */
-            if (n->spawn_.expr->tag == NODE_IDENT) {
-                Value *check = EVAL(i, n->spawn_.expr);
-                if (!i->cf.signal && check && check->tag == XS_ACTOR) {
-                    value_decref(v);
-                    Value *inst = call_value(i, check, NULL, 0, "spawn");
-                    value_decref(check);
-                    return inst;
-                }
-                if (check) value_decref(check);
-                i->cf.signal = 0; /* clear any error from check */
-            }
-
-            /* Execute immediately (no real threads yet) and return task handle */
-            Value *task = xs_map_new();
-            Value *r = call_value(i, v, NULL, 0, "spawn");
-            { Value *sv = xs_str("done"); map_set(task->map, "_status", sv); value_decref(sv); }
-            map_set(task->map, "_result", r ? r : value_incref(XS_NULL_VAL));
-            if (r) value_decref(r);
-            if (i->n_tasks < 64) {
-                int tid = i->n_tasks++;
-                i->task_queue[tid].fn     = value_incref(v);
-                i->task_queue[tid].result = map_get(task->map, "_result") ? value_incref(map_get(task->map, "_result")) : value_incref(XS_NULL_VAL);
-                i->task_queue[tid].done   = 1;
-                { Value *iv = xs_int(tid); map_set(task->map, "_task_id", iv); value_decref(iv); }
-            }
-            value_decref(v);
-            return task;
         }
+
+        /* Actor spawn: `spawn ActorClass` constructs a new actor instance. */
+        if (n->spawn_.expr->tag == NODE_IDENT) {
+            Value *check = EVAL(i, n->spawn_.expr);
+            if (!i->cf.signal && check && check->tag == XS_ACTOR) {
+                Value *inst = call_value(i, check, NULL, 0, "spawn");
+                value_decref(check);
+                return inst;
+            }
+            if (check) value_decref(check);
+            i->cf.signal = 0;
+        }
+
+        /* Real concurrent spawn: wrap the expression as a zero-arg
+           closure and hand it to the pthread-backed runtime. The
+           resulting future has _task_id which the parent can pass to
+           xs_await_task to block until completion. */
+        XSFunc *spawn_fn = func_new_ex("__spawn__", NULL, 0,
+                                       n->spawn_.expr, i->env, NULL, NULL);
+        Value *v = xs_func_new(spawn_fn);
+        Value *fut = xs_spawn_thread(i, v);
+        value_decref(v);
+        return fut;
     }
 
     case NODE_SEND_EXPR: {

@@ -83,8 +83,7 @@ assert_eq(1, 1)
 assert_eq("hello", "hello")
 assert_eq([1, 2], [1, 2])
 
--- division by zero gives null, not crash
-let d = 10 / 0
-assert_eq(d, null)
+-- division by zero now raises a runtime error (tests/negative/divide_by_zero.xs).
+-- It used to silently return null; that behavior was a silent correctness bug.
 
 println("test_error_handling: all passed")

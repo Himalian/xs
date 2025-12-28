@@ -116,6 +116,10 @@ typedef enum {
     OP_IN,
     OP_IS,
     OP_MAP_MERGE,
+    OP_CLOSE_UPVALUES,  /* Bx=slot_threshold; close every open upvalue
+                            whose slot >= base + Bx. Emitted on scope exit
+                            so that loop-iteration locals captured by a
+                            closure get their own value. */
 
     OP__MAX
 } Opcode;

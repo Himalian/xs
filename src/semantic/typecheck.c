@@ -475,12 +475,28 @@ static void tc_walk(Node *n, SymTab *st, SemaCtx *ctx) {
                     ? texpr_to_xstype(n->fn_decl.ret_type)
                     : ty_unknown();
         ret_push(ret);
-        for (int i = 0; i < n->fn_decl.params.len; i++) {
+        int np = n->fn_decl.params.len;
+        XsType **param_tys = np ? xs_calloc(np, sizeof(XsType *)) : NULL;
+        for (int i = 0; i < np; i++) {
             Param *pm = &n->fn_decl.params.items[i];
-            if (!pm->name) continue;
             XsType *pt = pm->type_ann ? texpr_to_xstype(pm->type_ann) : ty_unknown();
-            Symbol *sym = sym_lookup(st, pm->name);
-            if (sym) sym->type = pt;
+            param_tys[i] = pt;
+            if (pm->name) {
+                Symbol *sym = sym_lookup(st, pm->name);
+                if (sym) sym->type = pt;
+            }
+        }
+        /* Register the function symbol with its full TY_FN signature so
+           call sites (`let r: T = f(...)`) can verify return-type
+           compatibility. Previously only the parameter symbols were
+           typed; the fn name itself had no type, so call return types
+           collapsed to UNKNOWN and ill-typed lets slipped through. */
+        if (n->fn_decl.name) {
+            Symbol *fsym = sym_lookup(st, n->fn_decl.name);
+            if (fsym && !fsym->type) {
+                XsType *fnty = ty_fn(param_tys, np, ret);
+                fsym->type = fnty;
+            }
         }
         if (n->fn_decl.body) tc_walk(n->fn_decl.body, st, ctx);
         ret_pop();

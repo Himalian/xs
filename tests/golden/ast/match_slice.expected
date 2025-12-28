@@ -1,0 +1,11 @@
+PROGRAM
+  EXPR_STMT
+    MATCH
+      IDENT name=xs
+      PAT_SLICE
+      INT 0
+      PAT_SLICE
+      IDENT name=x
+      PAT_WILD
+      UNARY op=-
+        INT 1

@@ -1,0 +1,11 @@
+error[T0002]: undefined name 'does_not_exist'
+ --> <FILE>:1:9
+
+   1 | let y = does_not_exist
+     |         ^^^^^^^^^^^^^^ not found in this scope
+
+
+ for more info: xs --explain T0002
+
+
+1 error found.

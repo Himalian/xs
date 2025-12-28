@@ -3,31 +3,22 @@
 -- so regressions like "yield outside generator silently works" slipped
 -- through. Each assertion here pins a specific failure mode.
 
--- channel.recv on empty throws instead of returning null silently
-let ch = channel()
-var got_empty_err = false
-try {
-    ch.recv()
-} catch e {
-    got_empty_err = (e.kind == "ChannelEmpty")
-}
-assert(got_empty_err, "recv on empty channel must throw ChannelEmpty")
-
--- try_recv is the non-blocking form and returns null
+-- channel.recv now blocks until a value is available (real concurrent
+-- channel backed by mutex+condvar). The "throws ChannelEmpty" behavior
+-- only applied to the old buffer-only placeholder. try_recv is the
+-- non-blocking form.
 let ch2 = channel()
 assert_eq(ch2.try_recv(), null)
 
 -- recv after send works
+let ch = channel()
 ch.send(1)
 ch.send(2)
 assert_eq(ch.recv(), 1)
 assert_eq(ch.recv(), 2)
 
--- divide by zero returns null (and should print a runtime error to
--- stderr, but we cannot assert on stderr here)
-let d = 10 / 0
-assert_eq(d, null)
-let m = 10 % 0
-assert_eq(m, null)
+-- divide by zero reports a runtime error; the expression yields null
+-- so downstream code keeps running, but the process exits non-zero.
+-- Tested in tests/negative/divide_by_zero.xs.
 
 println("test_runtime_errors: all passed")

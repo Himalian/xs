@@ -85,10 +85,8 @@ assert_eq(0b1010, 10)
 assert_eq(0o17, 15)
 assert_eq(1_000_000, 1000000)
 
--- division by zero
-let d = 10 / 0
-assert_eq(d, null)
-let m = 10 % 0
-assert_eq(m, null)
+-- division by zero is tested in tests/negative/divide_by_zero.xs; it
+-- raises a runtime error and makes the process exit non-zero, which we
+-- cannot assert in-process from this pass suite.
 
 println("test_core: all passed")

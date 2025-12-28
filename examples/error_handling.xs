@@ -58,11 +58,7 @@ fn setup() {
 println("setup order:")
 setup()
 
--- 7. division by zero is a runtime error, not a crash
-let bad = 10 / 0
-println("div by zero gives: {bad}")
-
--- 8. type annotations catch mismatches at runtime
+-- 7. type annotations catch mismatches at runtime
 fn typed_add(a: int, b: int) -> int {
     return a + b
 }

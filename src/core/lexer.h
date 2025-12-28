@@ -105,6 +105,7 @@ typedef struct {
     uint8_t     literals;    /* bitfield: 0=duration,1=color,2=date,3=size,4=angle */
     TokenArray  tokens;
     CommentList comments;
+    int         n_errors;    /* incremented on every lexer diagnostic */
 } Lexer;
 
 void       lexer_init(Lexer *l, const char *source, const char *filename);

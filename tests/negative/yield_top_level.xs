@@ -1,0 +1,2 @@
+-- EXPECT_ERROR: S0040
+yield 99

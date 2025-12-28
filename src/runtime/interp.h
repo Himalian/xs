@@ -46,6 +46,13 @@ struct Interp {
     struct { Node **items; int len, cap; } defers;
     Value  *yield_collect;
     int     yield_limit;     /* max yields before stopping, 0 = unlimited */
+    /* Lazy-generator handoff. When lazy_yield_chan is set, every
+       NODE_YIELD sends the value on it and then blocks on
+       lazy_resume_chan until the consumer calls .next() again. The
+       worker thread that runs a generator body sets these on entry
+       and clears them on exit. */
+    Value  *lazy_yield_chan;
+    Value  *lazy_resume_chan;
 
     /* effects */
     EffectFrame *effect_stack;
@@ -86,6 +93,12 @@ struct Interp {
 
     /* runtime hook cancel flag */
     int          hook_cancelled;
+
+    /* depth of NODE_TRY frames currently on the eval stack. Bumped on
+       entry, decremented on exit. xs_runtime_error checks this so it
+       can suppress the inline diagnostic render when the throw it
+       raises will be caught upstream. */
+    int          try_depth;
 
     /* current program AST (set during interp_run, for pass execution) */
     Node        *current_program;

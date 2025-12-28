@@ -591,11 +591,14 @@ static void emit_expr(SB *s, Node *n, int depth) {
             emit_expr(s, n->binop.right, depth);
             sb_addc(s, ')');
         } else if (strcmp(op, "**") == 0) {
-            sb_add(s, "XS_FLOAT(pow((double)(");
+            /* Match VM/interp: int**int (with non-negative RHS) stays
+               int; otherwise promote to float. xs_pow does the check
+               at runtime using the tag of both operands. */
+            sb_add(s, "xs_pow(");
             emit_expr(s, n->binop.left, depth);
-            sb_add(s, ").i, (double)(");
+            sb_add(s, ", ");
             emit_expr(s, n->binop.right, depth);
-            sb_add(s, ").i))");
+            sb_add(s, ")");
         } else if (strcmp(op, "++") == 0) {
             sb_add(s, "xs_strcat(");
             emit_expr(s, n->binop.left, depth);
@@ -623,6 +626,13 @@ static void emit_expr(SB *s, Node *n, int depth) {
             sb_add(s, ") ");
             sb_add(s, op);
             sb_add(s, " 0)");
+        } else if (strcmp(op, "<=>") == 0) {
+            /* spaceship: -1 / 0 / 1 */
+            sb_add(s, "XS_INT(xs_cmp(");
+            emit_expr(s, n->binop.left, depth);
+            sb_add(s, ", ");
+            emit_expr(s, n->binop.right, depth);
+            sb_add(s, "))");
         } else if (strcmp(op, "and") == 0) {
             sb_add(s, "XS_BOOL(xs_truthy(");
             emit_expr(s, n->binop.left, depth);
@@ -667,6 +677,27 @@ static void emit_expr(SB *s, Node *n, int depth) {
             sb_add(s, " : ");
             emit_expr(s, n->binop.left, depth);
             sb_addc(s, ')');
+        } else if (strcmp(op, "&&") == 0) {
+            /* short-circuit AND: returns the left value if falsy, else
+               the right value, mirroring VM/interp semantics. */
+            sb_add(s, "({ xs_val __l = ");
+            emit_expr(s, n->binop.left, depth);
+            sb_add(s, "; xs_truthy(__l) ? (");
+            emit_expr(s, n->binop.right, depth);
+            sb_add(s, ") : __l; })");
+        } else if (strcmp(op, "||") == 0) {
+            sb_add(s, "({ xs_val __l = ");
+            emit_expr(s, n->binop.left, depth);
+            sb_add(s, "; xs_truthy(__l) ? __l : (");
+            emit_expr(s, n->binop.right, depth);
+            sb_add(s, "); })");
+        } else if (strcmp(op, "is") == 0) {
+            /* Right side is a type-name string. Bool-ify the tag check. */
+            sb_add(s, "XS_BOOL(xs_is(");
+            emit_expr(s, n->binop.left, depth);
+            sb_add(s, ", ");
+            emit_expr(s, n->binop.right, depth);
+            sb_add(s, "))");
         } else {
             sb_add(s, "/* binop ");
             sb_add(s, op);
@@ -2794,11 +2825,41 @@ char *transpile_c(Node *program, const char *filename) {
         "}\n\n"
         "static xs_val xs_mod(xs_val a, xs_val b) {\n"
         "    if (b.i == 0) return XS_NULL;\n"
-        "    return XS_INT(a.i % b.i);\n"
+        "    /* Math modulo: result has the sign of the divisor. */\n"
+        "    int64_t r = a.i % b.i;\n"
+        "    if (r != 0 && ((r ^ b.i) < 0)) r += b.i;\n"
+        "    return XS_INT(r);\n"
         "}\n\n"
         "static xs_val xs_idiv(xs_val a, xs_val b) {\n"
         "    if (b.i == 0) return XS_NULL;\n"
-        "    return XS_INT(a.i / b.i);\n"
+        "    /* Floor division: matches VM (-7 // 2 = -4, not -3). */\n"
+        "    int64_t q = a.i / b.i;\n"
+        "    if ((a.i ^ b.i) < 0 && a.i % b.i != 0) q--;\n"
+        "    return XS_INT(q);\n"
+        "}\n\n"
+        "static int xs_is(xs_val a, xs_val type) {\n"
+        "    if (type.tag != 2 || !type.s) return 0;\n"
+        "    const char *t = type.s;\n"
+        "    if (strcmp(t, \"int\") == 0 || strcmp(t, \"i64\") == 0) return a.tag == 0;\n"
+        "    if (strcmp(t, \"float\") == 0 || strcmp(t, \"f64\") == 0) return a.tag == 1;\n"
+        "    if (strcmp(t, \"str\") == 0 || strcmp(t, \"string\") == 0) return a.tag == 2;\n"
+        "    if (strcmp(t, \"bool\") == 0) return a.tag == 3;\n"
+        "    if (strcmp(t, \"null\") == 0) return a.tag == 4;\n"
+        "    if (strcmp(t, \"array\") == 0) return a.tag == 5;\n"
+        "    if (strcmp(t, \"map\") == 0) return a.tag == 6;\n"
+        "    return 0;\n"
+        "}\n\n"
+        "static xs_val xs_pow(xs_val a, xs_val b) {\n"
+        "    /* int ** non-negative-int stays int (matches VM); any\n"
+        "       other combo promotes to float. */\n"
+        "    if (a.tag == 0 && b.tag == 0 && b.i >= 0) {\n"
+        "        int64_t r = 1, base = a.i, exp = b.i;\n"
+        "        while (exp > 0) { if (exp & 1) r *= base; base *= base; exp >>= 1; }\n"
+        "        return XS_INT(r);\n"
+        "    }\n"
+        "    double da = (a.tag == 1) ? a.f : (double)a.i;\n"
+        "    double db = (b.tag == 1) ? b.f : (double)b.i;\n"
+        "    return XS_FLOAT(pow(da, db));\n"
         "}\n\n"
         "static xs_val xs_neg(xs_val a) {\n"
         "    if (a.tag == 1) return XS_FLOAT(-a.f);\n"

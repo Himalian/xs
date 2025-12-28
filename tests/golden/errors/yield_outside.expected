@@ -1,0 +1,12 @@
+error[S0040]: yield outside generator
+ --> <FILE>:2:5
+
+   2 |     yield 1
+     |     ^^^^^ yield is only valid inside fn*
+
+ hint: declare the enclosing function as fn* or drop the yield
+
+ for more info: xs --explain S0040
+
+
+1 error found.

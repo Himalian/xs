@@ -58,6 +58,8 @@ static void scope_pop(Compiler *c) {
     c->current = c->current->enclosing;
 }
 
+static void emit(Compiler *c, Instruction instr);
+
 static void scope_begin(Compiler *c) {
     c->current->scope_depth++;
 }
@@ -65,9 +67,19 @@ static void scope_begin(Compiler *c) {
 static void scope_end(Compiler *c) {
     CompilerScope *s = c->current;
     s->scope_depth--;
+    /* If any local in the popped scope was captured by a nested closure,
+       emit OP_CLOSE_UPVALUES so the upvalue takes its current value
+       before the slot gets reused (e.g. the next loop iteration). */
+    int min_captured_slot = -1;
     while (s->n_locals > 0 &&
            s->locals[s->n_locals - 1].depth > s->scope_depth) {
+        Local *l = &s->locals[s->n_locals - 1];
+        if (l->is_captured && (min_captured_slot < 0 || l->slot < min_captured_slot))
+            min_captured_slot = l->slot;
         s->n_locals--;
+    }
+    if (min_captured_slot >= 0) {
+        emit(c, MAKE_A(OP_CLOSE_UPVALUES, 0, (uint16_t)min_captured_slot));
     }
 }
 
@@ -258,6 +270,21 @@ static void compile_sub_pattern_tos(Compiler *c, Node *sub,
 
 static void compile_tuple_pattern_at(Compiler *c, Node *pat, int val_slot,
                                      int *fail_jumps, int *n_fail, int max_fails) {
+    /* Guard: subject must actually be a tuple. Without this, tuple
+       patterns silently fired on arrays of the same length. */
+    emit_a(c, OP_LOAD_LOCAL, val_slot);
+    emit_const(c, xs_str("<tuple-like>"));
+    emit(c, MAKE_A(OP_IS, 0, 0));
+    if (*n_fail < max_fails)
+        fail_jumps[(*n_fail)++] = emit_jump(c, OP_JUMP_IF_FALSE);
+    /* Arity guard: a tuple pattern of length N only matches a tuple of
+       length N. Without this, (_, _) silently matched (1,). */
+    emit_a(c, OP_LOAD_LOCAL, val_slot);
+    emit(c, MAKE_A(OP_ITER_LEN, 0, 0));
+    emit_const(c, xs_int(pat->pat_tuple.elems.len));
+    emit(c, MAKE_A(OP_EQ, 0, 0));
+    if (*n_fail < max_fails)
+        fail_jumps[(*n_fail)++] = emit_jump(c, OP_JUMP_IF_FALSE);
     for (int ti = 0; ti < pat->pat_tuple.elems.len; ti++) {
         Node *sub = pat->pat_tuple.elems.items[ti];
         emit_a(c, OP_LOAD_LOCAL, val_slot);
@@ -882,6 +909,17 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
         int has_spread = 0;
         for (int i = 0; i < cnt; i++)
             if (n->lit_map.keys.items[i] && n->lit_map.keys.items[i]->tag == NODE_SPREAD) { has_spread = 1; break; }
+        /* In `#{ name: v }`, a bareword key parses as NODE_IDENT. The
+           interpreter treats it as the string "name", so we must too -
+           otherwise the VM emits LOAD_GLOBAL "name" which usually
+           returns null and silently produces an empty map. */
+        #define EMIT_KEY(KEYNODE) do { \
+            Node *_k = (KEYNODE); \
+            if (_k && _k->tag == NODE_IDENT && _k->ident.name) \
+                emit_const(c, xs_str(_k->ident.name)); \
+            else \
+                compile_node(c, _k, 1); \
+        } while (0)
         if (has_spread) {
             emit(c, MAKE_B(OP_MAKE_MAP, 0, 0, 0));
             int map_slot = local_add_hidden(c);
@@ -895,7 +933,7 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
                     emit(c, MAKE_A(OP_POP, 0, 0));
                 } else {
                     emit_a(c, OP_LOAD_LOCAL, map_slot);
-                    compile_node(c, key, 1);
+                    EMIT_KEY(key);
                     compile_node(c, n->lit_map.vals.items[i], 1);
                     emit(c, MAKE_A(OP_INDEX_SET, 0, 0));
                 }
@@ -903,11 +941,12 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
             emit_a(c, OP_LOAD_LOCAL, map_slot);
         } else {
             for (int i = 0; i < cnt; i++) {
-                compile_node(c, n->lit_map.keys.items[i], 1);
+                EMIT_KEY(n->lit_map.keys.items[i]);
                 compile_node(c, n->lit_map.vals.items[i], 1);
             }
             emit(c, MAKE_B(OP_MAKE_MAP, 0, 0, (uint8_t)(unsigned)cnt));
         }
+        #undef EMIT_KEY
         break;
     }
 

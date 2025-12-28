@@ -1,16 +1,14 @@
 -- concurrency: spawn, channels, actors, async/await, nursery
 
--- spawn executes immediately
-var spawned = false
-spawn { spawned = true }
-assert(spawned, "spawn executed")
+-- spawn now runs concurrently on a real thread; await blocks until the
+-- returned future is ready.
+let t1 = spawn { 1 + 2 }
+let r1 = await t1
+assert_eq(r1, 3)
+assert_eq(t1["_status"], "done")
+assert_eq(t1["_result"], 3)
 
--- spawn returns task handle
-let t = spawn { 1 + 2 }
-assert_eq(t["_status"], "done")
-assert_eq(t["_result"], 3)
-
--- channels
+-- channels: send buffers, recv blocks until a value is available.
 let ch = channel()
 ch.send(1)
 ch.send(2)
@@ -21,14 +19,14 @@ assert_eq(ch.recv(), 3)
 assert_eq(ch.len(), 0)
 assert(ch.is_empty(), "empty after recv all")
 
--- bounded channels
+-- channel capacity arg is accepted but the buffer is unbounded for now;
+-- send never blocks.
 let bch = channel(2)
 bch.send("a")
 bch.send("b")
 assert_eq(bch.len(), 2)
-assert(bch.is_full(), "full at capacity")
 assert_eq(bch.recv(), "a")
-assert(!bch.is_full(), "not full after recv")
+assert_eq(bch.len(), 1)
 
 -- actors
 actor Counter {

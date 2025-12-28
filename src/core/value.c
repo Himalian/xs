@@ -592,6 +592,17 @@ int value_equal(Value *a, Value *b) {
         }
         return 1;
     }
+    /* Structural map equality: same key set, same value at every key. */
+    if (a->tag == XS_MAP && b->tag == XS_MAP) {
+        if (!a->map || !b->map) return a->map == b->map;
+        if (a->map->len != b->map->len) return 0;
+        for (int i = 0; i < a->map->cap; i++) {
+            if (!a->map->keys[i]) continue;
+            Value *bv = map_get(b->map, a->map->keys[i]);
+            if (!bv || !value_equal(a->map->vals[i], bv)) return 0;
+        }
+        return 1;
+    }
     return 0;
 }
 
@@ -626,6 +637,20 @@ int value_cmp(Value *a, Value *b) {
         double fb = (b->tag == XS_FLOAT) ? b->f : (double)b->i;
         if (fa < fb) return -1;
         if (fa > fb) return  1;
+        return 0;
+    }
+    /* Lexicographic compare for arrays and tuples (same shape on both
+       sides). Element-wise: first non-zero comparison wins; otherwise
+       shorter side is less. */
+    if ((a->tag == XS_ARRAY || a->tag == XS_TUPLE) &&
+        a->tag == b->tag && a->arr && b->arr) {
+        int n = a->arr->len < b->arr->len ? a->arr->len : b->arr->len;
+        for (int i = 0; i < n; i++) {
+            int c = value_cmp(a->arr->items[i], b->arr->items[i]);
+            if (c != 0) return c;
+        }
+        if (a->arr->len < b->arr->len) return -1;
+        if (a->arr->len > b->arr->len) return  1;
         return 0;
     }
     /* fallback: compare by type tag */

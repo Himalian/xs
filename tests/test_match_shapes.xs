@@ -9,6 +9,8 @@ fn kind(x) {
         [_] => "singleton-slice"
         [_, _] => "pair-slice"
         [_, ..rest] => "open-slice"
+        (_,) => "singleton-tuple"
+        (_, _) => "pair-tuple"
         #{} => "empty-map"
         _ => "other"
     }
@@ -33,9 +35,9 @@ assert_eq(kind([1]), "singleton-slice")
 assert_eq(kind([1, 2]), "pair-slice")
 assert_eq(kind([1, 2, 3]), "open-slice")
 
--- tuples (array-like)
-assert_eq(kind((1,)), "singleton-slice")
-assert_eq(kind((1, 2)), "pair-slice")
+-- tuples need their own (..) patterns; [..] only matches arrays
+assert_eq(kind((1,)), "singleton-tuple")
+assert_eq(kind((1, 2)), "pair-tuple")
 
 -- maps
 assert_eq(kind(#{}), "empty-map")

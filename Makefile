@@ -52,7 +52,8 @@ RUNTIME_SRCS = src/runtime/interp.c \
                src/runtime/error.c \
                src/runtime/stdlib.c \
                src/runtime/scheduler.c \
-               src/runtime/event_loop.c
+               src/runtime/event_loop.c \
+               src/runtime/concurrent.c
 
 REPL_SRCS = src/repl/repl.c
 
@@ -180,7 +181,7 @@ endif
 OBJS = $(SRCS:.c=.o)
 
 # Targets
-.PHONY: all clean debug release test install wasm
+.PHONY: all clean debug release test test-unit test-e2e test-negative test-property test-golden test-regression test-conformance test-all install wasm
 
 all: $(TARGET)
 
@@ -204,6 +205,60 @@ release: clean $(TARGET)
 
 test: $(TARGET)
 	@bash tests/run.sh
+
+# Unit tests: isolated C tests that exercise compiler internals (lexer,
+# parser, sema, vm) without going through the full `xs` binary. Each
+# tests/unit/*_test.c is a self-contained program.
+UNIT_CFLAGS = -O0 -g -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -std=c11 \
+              -Isrc -Isrc/tls/bearssl -Itests/unit \
+              $(foreach f,VM PLUGINS SANDBOX EFFECTS TRANSPILER FMT PKG DOC,-DXSC_ENABLE_$(f))
+UNIT_LINK_SRCS = $(CORE_SRCS) $(COMPILER_SRCS) $(DIAG_SRCS) $(SEMA_SRCS) \
+                 $(MSGPACK_SRCS) $(REGEX_SRCS) tests/unit/stubs.c
+UNIT_LDFLAGS = -lm -lpthread
+ifeq ($(OS),Windows_NT)
+  UNIT_LDFLAGS += -lws2_32
+else ifeq ($(UNAME),Linux)
+  UNIT_LDFLAGS += -ldl
+endif
+
+UNIT_TESTS = tests/unit/lexer_test tests/unit/parser_test tests/unit/sema_test
+
+tests/unit/%_test: tests/unit/%_test.c $(UNIT_LINK_SRCS)
+	$(CC) $(UNIT_CFLAGS) -o $@ $< $(UNIT_LINK_SRCS) $(UNIT_LDFLAGS)
+
+test-unit: $(UNIT_TESTS)
+	@failed=0; for t in $(UNIT_TESTS); do \
+	    ./$$t || failed=1; \
+	done; \
+	if [ $$failed -ne 0 ]; then echo "[unit] FAILED"; exit 1; fi
+
+test-e2e: $(TARGET)
+	@bash tests/run.sh
+
+test-negative: $(TARGET)
+	@bash tests/negative/run.sh
+
+test-property: $(TARGET)
+	@bash tests/property/run.sh
+
+test-golden: $(TARGET)
+	@bash tests/golden/run.sh
+
+test-regression: $(TARGET)
+	@for f in tests/regression/*.xs; do \
+	    [ -f "$$f" ] || continue; \
+	    ./$(TARGET) "$$f" >/dev/null || { echo "FAIL $$f"; exit 1; }; \
+	done; echo "[regression] ok"
+
+test-conformance: $(TARGET)
+	@for f in tests/conformance/*.xs; do \
+	    [ -f "$$f" ] || continue; \
+	    ./$(TARGET) "$$f" >/dev/null || { echo "FAIL $$f"; exit 1; }; \
+	done; echo "[conformance] ok"
+
+# Full 7-layer test architecture. See tests/run-all.sh for details.
+test-all: $(TARGET)
+	@bash tests/run-all.sh
 
 # Cross-backend diff tests: run a program on the interpreter, VM, transpiled
 # C, and transpiled JS, and assert all four produce the same stdout. Not part

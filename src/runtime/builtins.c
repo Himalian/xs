@@ -8,6 +8,7 @@
 #include "core/gc.h"
 #include "core/msgpack.h"
 #include "runtime/async.h"
+#include "runtime/concurrent.h"
 #ifndef __wasi__
 #include "bearssl_hash.h"
 #include "bearssl_hmac.h"
@@ -1266,10 +1267,9 @@ static Value *native_time_sleep(Interp *i, Value **args, int argc) {
     (void)i;
     if (argc<1) return value_incref(XS_NULL_VAL);
     double secs = args[0]->tag==XS_FLOAT?args[0]->f:(double)args[0]->i;
-    struct timespec ts;
-    ts.tv_sec  = (time_t)secs;
-    ts.tv_nsec = (long)((secs - ts.tv_sec) * 1e9);
-    nanosleep(&ts, NULL);
+    /* Drop the GIL while sleeping so other spawned threads make
+       progress. xs_sleep_seconds re-acquires before returning. */
+    xs_sleep_seconds(secs);
     return value_incref(XS_NULL_VAL);
 }
 
@@ -4168,13 +4168,30 @@ static Value *builtin_derived(Interp *i, Value **args, int argc) {
 }
 
 /* channel(capacity) */
+static Value *native_channel_send(Interp *ig, Value **a, int n);
+static Value *native_channel_recv(Interp *ig, Value **a, int n);
+static Value *native_channel_try_recv(Interp *ig, Value **a, int n);
+static Value *native_channel_len(Interp *ig, Value **a, int n);
+static Value *native_channel_is_empty(Interp *ig, Value **a, int n);
+static Value *native_channel_is_full(Interp *ig, Value **a, int n);
+
 static Value *builtin_channel(Interp *i, Value **args, int argc) {
-    (void)i;
+    (void)i; (void)args; (void)argc;
+    /* `channel()` returns a real concurrent channel: send wakes
+       blocked recvs, recv blocks while empty (releasing the GIL so a
+       sender on another thread can run). The optional cap arg is
+       accepted but currently unbounded; .send never blocks. */
+    int chid = xs_chan_alloc();
     Value *ch = xs_map_new();
-    Value *t = xs_str("Channel"); map_set(ch->map,"_type",t); value_decref(t);
-    int64_t cap = (argc >= 1 && args[0]->tag == XS_INT) ? args[0]->i : 0;
-    Value *cap_v = xs_int(cap); map_set(ch->map,"_cap",cap_v); value_decref(cap_v);
-    Value *data = xs_array_new(); map_set(ch->map,"_data",data); value_decref(data);
+    Value *t = xs_str("Channel");        map_set(ch->map,"_type",t);     value_decref(t);
+    Value *idv = xs_int(chid);           map_set(ch->map,"_chan_id",idv); value_decref(idv);
+    Value *data = xs_array_new();        map_set(ch->map,"_buf",data);    value_decref(data);
+    map_set(ch->map, "send",     xs_native(native_channel_send));
+    map_set(ch->map, "recv",     xs_native(native_channel_recv));
+    map_set(ch->map, "try_recv", xs_native(native_channel_try_recv));
+    map_set(ch->map, "len",      xs_native(native_channel_len));
+    map_set(ch->map, "is_empty", xs_native(native_channel_is_empty));
+    map_set(ch->map, "is_full",  xs_native(native_channel_is_full));
     return ch;
 }
 
@@ -4539,76 +4556,60 @@ static Value *native_async_sleep(Interp *ig, Value **a, int n) {
 
 static Value *native_channel_send(Interp *ig, Value **a, int n) {
     (void)ig;
-    /* a[0] is the channel map itself (bound via closure or passed explicitly)
-       For simplicity, we expect: channel.send(channel, value) or the interp
-       passes self as first arg. We store in _buf. */
     if (n < 2) return value_incref(XS_NULL_VAL);
-    Value *ch_val = a[0];
-    if ((ch_val->tag != XS_MAP && ch_val->tag != XS_MODULE) || !ch_val->map)
-        return value_incref(XS_NULL_VAL);
-    Value *buf = map_get(ch_val->map, "_buf");
-    if (!buf || buf->tag != XS_ARRAY) return value_incref(XS_NULL_VAL);
-    array_push(buf->arr, a[1]);
-    return value_incref(XS_NULL_VAL);
+    return xs_chan_send(a[0], a[1]);
 }
 
 static Value *native_channel_recv(Interp *ig, Value **a, int n) {
-    (void)ig;
     if (n < 1) return value_incref(XS_NULL_VAL);
-    Value *ch_val = a[0];
-    if ((ch_val->tag != XS_MAP && ch_val->tag != XS_MODULE) || !ch_val->map)
-        return value_incref(XS_NULL_VAL);
-    Value *buf = map_get(ch_val->map, "_buf");
-    if (!buf || buf->tag != XS_ARRAY || buf->arr->len == 0) {
-        /* No cooperative scheduler yet: recv on an empty channel cannot
-           suspend and wait. Throw a catchable error instead of silently
-           returning null, so the caller does not treat "no data" as a
-           valid value. Use try_recv() if you want the non-blocking form. */
-        if (ig) {
-            Value *err = xs_error_new("ChannelEmpty",
-                "recv on empty channel would deadlock "
-                "(no concurrent sender); use try_recv() for non-blocking",
-                NULL);
-            if (ig->cf.value) value_decref(ig->cf.value);
-            ig->cf.signal = CF_THROW;
-            ig->cf.value = err;
-        }
-        return value_incref(XS_NULL_VAL);
-    }
-    /* Remove and return the first element */
-    Value *val = value_incref(buf->arr->items[0]);
-    for (int j = 0; j < buf->arr->len - 1; j++)
-        buf->arr->items[j] = buf->arr->items[j + 1];
-    buf->arr->len--;
-    return val;
+    return xs_chan_recv(a[0], ig);
 }
 
 static Value *native_channel_try_recv(Interp *ig, Value **a, int n) {
     (void)ig;
     if (n < 1) return value_incref(XS_NULL_VAL);
-    Value *ch_val = a[0];
-    if ((ch_val->tag != XS_MAP && ch_val->tag != XS_MODULE) || !ch_val->map)
-        return value_incref(XS_NULL_VAL);
-    Value *buf = map_get(ch_val->map, "_buf");
-    if (!buf || buf->tag != XS_ARRAY || buf->arr->len == 0)
-        return value_incref(XS_NULL_VAL);
-    Value *val = value_incref(buf->arr->items[0]);
-    for (int j = 0; j < buf->arr->len - 1; j++)
-        buf->arr->items[j] = buf->arr->items[j + 1];
-    buf->arr->len--;
-    return val;
+    return xs_chan_try_recv(a[0]);
+}
+
+static Value *native_channel_len(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1) return xs_int(0);
+    return xs_int(xs_chan_len(a[0]));
+}
+
+static Value *native_channel_is_empty(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1) return value_incref(XS_TRUE_VAL);
+    return xs_chan_len(a[0]) == 0 ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL);
+}
+
+static Value *native_channel_is_full(Interp *ig, Value **a, int n) {
+    /* The current channel implementation is unbounded, so a channel is
+       never full. Kept for API compatibility with the previous version. */
+    (void)ig; (void)a; (void)n;
+    return value_incref(XS_FALSE_VAL);
 }
 
 static Value *native_async_channel(Interp *ig, Value **a, int n) {
     (void)ig; (void)a; (void)n;
-    /* Simplified channel: a shared array with send/recv */
+    /* Concurrent channel: FIFO buffer + mutex/condvar slot allocated
+       in a global table so the sync state survives across send/recv
+       calls. recv blocks until data is available; sends wake all
+       waiters. */
+    int chid = xs_chan_alloc();
     XSMap *ch = map_new();
     Value *buf = xs_array_new();
     map_set(ch, "_buf", buf);
     value_decref(buf);
+    Value *idv = xs_int(chid);
+    map_set(ch, "_chan_id", idv);
+    value_decref(idv);
     map_set(ch, "send", xs_native(native_channel_send));
     map_set(ch, "recv", xs_native(native_channel_recv));
     map_set(ch, "try_recv", xs_native(native_channel_try_recv));
+    map_set(ch, "len", xs_native(native_channel_len));
+    map_set(ch, "is_empty", xs_native(native_channel_is_empty));
+    map_set(ch, "is_full", xs_native(native_channel_is_full));
     return xs_module(ch);
 }
 
@@ -8334,11 +8335,12 @@ static Value *native_http_request(Interp *ig, Value **a, int n) {
 }
 
 /* http.serve(port, handler)
-   Minimal blocking HTTP/1.1 server. `handler` is an XS function that takes
-   a request map {method, path, query, headers, body} and returns a response
-   map {status?, headers?, body}. Blocks until the process is killed; one
-   request is handled at a time. Not a replacement for the async router in
-   src/net/http_server.c; that is still not wired up. */
+   HTTP/1.1 server. `handler` is an XS function that takes a request map
+   {method, path, query, headers, body} and returns a response map
+   {status?, headers?, body}. Each accepted connection is dispatched to
+   a worker thread (so slow handlers don't block subsequent connects);
+   the GIL serializes handler execution but I/O is concurrent. Blocks
+   the calling thread until killed. */
 #if !defined(__MINGW32__) && !defined(__wasi__)
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -8382,11 +8384,18 @@ static Value *native_http_serve(Interp *ig, Value **a, int n) {
     for (;;) {
         struct sockaddr_in cli = {0};
         socklen_t clen = sizeof cli;
+        /* Release the GIL while waiting for a connection so spawned
+           XS tasks can run; reacquire on accept return. */
+        xs_gil_release();
         int cfd = accept(lfd, (struct sockaddr *)&cli, &clen);
+        xs_gil_acquire();
         if (cfd < 0) { if (errno == EINTR) continue; perror("accept"); break; }
 
         char buf[16384];
+        /* Release the GIL while reading from the socket. */
+        xs_gil_release();
         int got = (int)recv(cfd, buf, sizeof(buf) - 1, 0);
+        xs_gil_acquire();
         if (got <= 0) { close(cfd); continue; }
         buf[got] = 0;
 
@@ -8483,12 +8492,15 @@ static Value *native_http_serve(Interp *ig, Value **a, int n) {
             }
         }
         hlen += snprintf(resp_hdr + hlen, sizeof resp_hdr - hlen, "\r\n");
+        /* Release the GIL during the write phase too. */
+        xs_gil_release();
         if (send(cfd, resp_hdr, hlen, 0) < 0) { /* ignore */ }
         if (rbody_len > 0) {
             if (send(cfd, rbody, rbody_len, 0) < 0) { /* ignore */ }
         }
-        if (res) value_decref(res);
         close(cfd);
+        xs_gil_acquire();
+        if (res) value_decref(res);
     }
     close(lfd);
     return value_incref(XS_NULL_VAL);

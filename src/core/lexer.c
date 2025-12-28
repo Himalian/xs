@@ -250,6 +250,7 @@ static char *lex_string_body(Lexer *l, char quote, int *out_interp) {
                     diag_hint(d, "add a closing quote, or use triple quotes for multi-line strings");
                     diag_render_one(d, l->source, l->filename);
                     diag_free(d);
+                    l->n_errors++;
                     break;
                 }
             }
@@ -315,6 +316,7 @@ static char *lex_string_body(Lexer *l, char quote, int *out_interp) {
         diag_hint(d, "add a closing triple-quote %c%c%c", quote, quote, quote);
         diag_render_one(d, l->source, l->filename);
         diag_free(d);
+        l->n_errors++;
     }
     char *result = sb_finish(&sb);
 
@@ -863,6 +865,7 @@ static void lex_next(Lexer *l) {
                           depth, depth);
             diag_render_one(d, l->source, l->filename);
             diag_free(d);
+            l->n_errors++;
         }
         char *ctxt = sb_finish(&csb);
         cl_push(&l->comments, cline, ccol, ctxt, 1);
@@ -1103,6 +1106,7 @@ void lexer_init(Lexer *l, const char *source, const char *filename) {
     l->comments.items = NULL;
     l->comments.len   = 0;
     l->comments.cap   = 0;
+    l->n_errors       = 0;
 }
 
 /* Pre-scan source for `use literals ...` to set lexer flags before tokenizing */

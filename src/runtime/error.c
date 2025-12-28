@@ -47,8 +47,18 @@ Value *xs_error_cause(Value *err) {
 
 /* runtime error reporting */
 
+int g_xs_runtime_error_count = 0;
+int g_xs_in_try              = 0;
+Value *g_xs_pending_throw    = NULL;
+
 void xs_runtime_error(Span span, const char *label, const char *hint,
                       const char *fmt, ...) {
+    int in_try = g_xs_in_try > 0
+              || (g_current_interp && g_current_interp->try_depth > 0);
+    /* Only count this against the process exit when there's no live
+       try/catch frame to absorb it. A caught error must not poison
+       the program's exit code. */
+    if (!in_try) g_xs_runtime_error_count++;
     va_list ap;
     va_start(ap, fmt);
     char buf[512];
@@ -108,6 +118,30 @@ void xs_runtime_error(Span span, const char *label, const char *hint,
         #undef MAX_FRAMES
     }
 
-    diag_render_one(d, g_current_source, span.file);
+    /* Make the error catchable: install a throw signal carrying a
+       structured error value. If the surrounding code is inside a
+       try/catch, the unwinder will pick this up and the catch block
+       sees an error map with kind/message. If nothing catches it the
+       process exits non-zero via g_xs_runtime_error_count. We do not
+       overwrite an in-flight throw (e.g. one nested error during
+       cleanup); the first error wins. */
+    Value *err_value = NULL;
+    if (g_current_interp && g_current_interp->cf.signal != CF_THROW) {
+        err_value = xs_error_new(label ? label : "RuntimeError", buf, NULL);
+        if (g_current_interp->cf.value) value_decref(g_current_interp->cf.value);
+        g_current_interp->cf.signal = CF_THROW;
+        g_current_interp->cf.value  = value_incref(err_value);
+    }
+    /* Install a pending throw for the VM dispatcher. The VM has no
+       interp pointer to set cf.signal on, so it polls this slot at the
+       top of each instruction. The first error to install wins; later
+       errors are dropped while the throw is still pending. */
+    if (g_xs_in_try > 0 && !g_xs_pending_throw) {
+        g_xs_pending_throw = err_value
+            ? value_incref(err_value)
+            : xs_error_new(label ? label : "RuntimeError", buf, NULL);
+    }
+    if (err_value) value_decref(err_value);
+    if (!in_try) diag_render_one(d, g_current_source, span.file);
     diag_free(d);
 }

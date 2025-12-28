@@ -13,6 +13,15 @@
 
 typedef HANDLE          xs_thread_t;
 typedef CRITICAL_SECTION xs_mutex_t;
+typedef CONDITION_VARIABLE xs_cond_t;
+
+static inline int xs_cond_init(xs_cond_t *c)    { InitializeConditionVariable(c); return 0; }
+static inline int xs_cond_destroy(xs_cond_t *c) { (void)c; return 0; }
+static inline int xs_cond_wait(xs_cond_t *c, xs_mutex_t *m) {
+    return SleepConditionVariableCS(c, m, INFINITE) ? 0 : -1;
+}
+static inline int xs_cond_signal(xs_cond_t *c)    { WakeConditionVariable(c); return 0; }
+static inline int xs_cond_broadcast(xs_cond_t *c) { WakeAllConditionVariable(c); return 0; }
 
 /* bridge POSIX-style callback to Win32 thread entry */
 typedef struct {
@@ -94,9 +103,17 @@ static inline void xs_thread_sleep_ns(double secs) {
 
 #include <pthread.h>
 #include <time.h>
+#include <stdint.h>
 
 typedef pthread_t       xs_thread_t;
 typedef pthread_mutex_t xs_mutex_t;
+typedef pthread_cond_t  xs_cond_t;
+
+static inline int xs_cond_init(xs_cond_t *c)    { return pthread_cond_init(c, NULL); }
+static inline int xs_cond_destroy(xs_cond_t *c) { return pthread_cond_destroy(c); }
+static inline int xs_cond_wait(xs_cond_t *c, xs_mutex_t *m) { return pthread_cond_wait(c, m); }
+static inline int xs_cond_signal(xs_cond_t *c)    { return pthread_cond_signal(c); }
+static inline int xs_cond_broadcast(xs_cond_t *c) { return pthread_cond_broadcast(c); }
 
 static inline int xs_thread_create(xs_thread_t *t, void *(*fn)(void *), void *arg) {
     return pthread_create(t, NULL, fn, arg);

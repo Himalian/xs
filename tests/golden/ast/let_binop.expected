@@ -1,0 +1,5 @@
+PROGRAM
+  LET name=x
+    BINOP op=+
+      INT 1
+      INT 2
