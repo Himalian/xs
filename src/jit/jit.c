@@ -1518,6 +1518,98 @@ void *jit_compile(XSJIT *j, XSProto *proto) {
     EMIT_SMI_BINOP_FINISH();
     PATCH_JNE_HERE(jne_patch);
 
+    /* ---- OP_LTE (SMI <= SMI) ---- */
+    INLINE_CMP_JNE(OP_LTE);
+    jne_patch = em.pos - 4;
+    EMIT_BOTH_SMI_CHECK();
+    emit_byte(&em, 0x48); emit_byte(&em, 0x39); emit_byte(&em, 0xc1);
+    /* jle +12 (signed less-or-equal) */
+    emit_byte(&em, 0x7e); emit_byte(&em, 12);
+    emit_mov_reg_imm64(&em, RAX, (uint64_t)(uintptr_t)&XS_FALSE_VAL);
+    emit_byte(&em, 0xeb); emit_byte(&em, 10);
+    emit_mov_reg_imm64(&em, RAX, (uint64_t)(uintptr_t)&XS_TRUE_VAL);
+    emit_byte(&em, 0x48); emit_byte(&em, 0x8b); emit_byte(&em, 0x00);
+    emit_inline_incref_rax(&em);
+    emit_byte(&em, 0x48); emit_byte(&em, 0x89); emit_byte(&em, 0xc1);
+    EMIT_SMI_BINOP_FINISH();
+    PATCH_JNE_HERE(jne_patch);
+
+    /* ---- OP_GTE (SMI >= SMI) ---- */
+    INLINE_CMP_JNE(OP_GTE);
+    jne_patch = em.pos - 4;
+    EMIT_BOTH_SMI_CHECK();
+    emit_byte(&em, 0x48); emit_byte(&em, 0x39); emit_byte(&em, 0xc1);
+    /* jge +12 */
+    emit_byte(&em, 0x7d); emit_byte(&em, 12);
+    emit_mov_reg_imm64(&em, RAX, (uint64_t)(uintptr_t)&XS_FALSE_VAL);
+    emit_byte(&em, 0xeb); emit_byte(&em, 10);
+    emit_mov_reg_imm64(&em, RAX, (uint64_t)(uintptr_t)&XS_TRUE_VAL);
+    emit_byte(&em, 0x48); emit_byte(&em, 0x8b); emit_byte(&em, 0x00);
+    emit_inline_incref_rax(&em);
+    emit_byte(&em, 0x48); emit_byte(&em, 0x89); emit_byte(&em, 0xc1);
+    EMIT_SMI_BINOP_FINISH();
+    PATCH_JNE_HERE(jne_patch);
+
+    /* ---- OP_EQ (SMI == SMI) ----
+       Two SMIs are equal iff their pointer bits are equal. No need to
+       extract or compare int values. */
+    INLINE_CMP_JNE(OP_EQ);
+    jne_patch = em.pos - 4;
+    EMIT_BOTH_SMI_CHECK();
+    emit_byte(&em, 0x48); emit_byte(&em, 0x39); emit_byte(&em, 0xc1);
+    /* je +12 */
+    emit_byte(&em, 0x74); emit_byte(&em, 12);
+    emit_mov_reg_imm64(&em, RAX, (uint64_t)(uintptr_t)&XS_FALSE_VAL);
+    emit_byte(&em, 0xeb); emit_byte(&em, 10);
+    emit_mov_reg_imm64(&em, RAX, (uint64_t)(uintptr_t)&XS_TRUE_VAL);
+    emit_byte(&em, 0x48); emit_byte(&em, 0x8b); emit_byte(&em, 0x00);
+    emit_inline_incref_rax(&em);
+    emit_byte(&em, 0x48); emit_byte(&em, 0x89); emit_byte(&em, 0xc1);
+    EMIT_SMI_BINOP_FINISH();
+    PATCH_JNE_HERE(jne_patch);
+
+    /* ---- OP_NEQ (SMI != SMI) ---- */
+    INLINE_CMP_JNE(OP_NEQ);
+    jne_patch = em.pos - 4;
+    EMIT_BOTH_SMI_CHECK();
+    emit_byte(&em, 0x48); emit_byte(&em, 0x39); emit_byte(&em, 0xc1);
+    /* jne +12 */
+    emit_byte(&em, 0x75); emit_byte(&em, 12);
+    emit_mov_reg_imm64(&em, RAX, (uint64_t)(uintptr_t)&XS_FALSE_VAL);
+    emit_byte(&em, 0xeb); emit_byte(&em, 10);
+    emit_mov_reg_imm64(&em, RAX, (uint64_t)(uintptr_t)&XS_TRUE_VAL);
+    emit_byte(&em, 0x48); emit_byte(&em, 0x8b); emit_byte(&em, 0x00);
+    emit_inline_incref_rax(&em);
+    emit_byte(&em, 0x48); emit_byte(&em, 0x89); emit_byte(&em, 0xc1);
+    EMIT_SMI_BINOP_FINISH();
+    PATCH_JNE_HERE(jne_patch);
+
+    /* ---- OP_MUL (SMI * SMI) ----
+       a_int * b_int. Need to extract payloads, multiply, detect overflow,
+       re-encode. Pointer tricks don't cancel here as cleanly as add/sub,
+       so this uses explicit shifts. */
+    INLINE_CMP_JNE(OP_MUL);
+    jne_patch = em.pos - 4;
+    EMIT_BOTH_SMI_CHECK();
+    /* sar rcx, 1   ; a_int  (arithmetic shift preserves sign) */
+    emit_byte(&em, 0x48); emit_byte(&em, 0xd1); emit_byte(&em, 0xf9);
+    /* sar rax, 1   ; b_int */
+    emit_byte(&em, 0x48); emit_byte(&em, 0xd1); emit_byte(&em, 0xf8);
+    /* imul rcx, rax   ; rcx = a_int * b_int (sets OF on overflow) */
+    emit_byte(&em, 0x48); emit_byte(&em, 0x0f); emit_byte(&em, 0xaf); emit_byte(&em, 0xc8);
+    EMIT_JO_SLOW();
+    /* Re-encode: rcx << 1 | 1 = (rcx + rcx) | 1
+       Also need to check re-encoding doesn't overflow -- if the int
+       result doesn't fit in 63 bits, the shl below overflows and the
+       low bit OR gives garbage. Guard with a bounds check. */
+    /* add rcx, rcx   ; rcx = rcx * 2, sets OF if overflow */
+    emit_byte(&em, 0x48); emit_byte(&em, 0x01); emit_byte(&em, 0xc9);
+    EMIT_JO_SLOW();
+    /* or rcx, 1 */
+    emit_byte(&em, 0x48); emit_byte(&em, 0x83); emit_byte(&em, 0xc9); emit_byte(&em, 0x01);
+    EMIT_SMI_BINOP_FINISH();
+    PATCH_JNE_HERE(jne_patch);
+
     /* ---- OP_JUMP_IF_FALSE / OP_JUMP_IF_TRUE ----
        Pop the condition off the stack, run value_truthy, decref the
        condition, then either advance ip by 4 (no branch) or by
