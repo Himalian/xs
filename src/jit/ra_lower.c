@@ -9,8 +9,11 @@
 #include "jit/ra_ir.h"
 #include "core/xs.h"
 #include "vm/bytecode.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static int ir_try_inline_self(IRFunc *f);
 
 /* --- small growable array for the IR instruction stream --- */
 
@@ -369,7 +372,307 @@ IRFunc *ralow_lower(XSProto *proto) {
             f->local_written[in->imm] = 1;
     }
 
+    /* Attempt one level of self-recursive inlining. Controlled by
+     * XS_JIT_INLINE (default on; set to 0/n/N to disable). */
+    {
+        const char *off = getenv("XS_JIT_INLINE");
+        if (!off || (off[0] != '0' && off[0] != 'n' && off[0] != 'N'))
+            ir_try_inline_self(f);
+    }
+
     return f;
+}
+
+/* ================================================================
+ *         Self-recursion inliner (single-level, no guard).
+ *
+ * Splices a clone of the proto's IR at every CALL site whose callee
+ * is a LOAD_GLOBAL of the proto's own name. Safe without a runtime
+ * guard because tier-2 already rejects protos containing
+ * OP_STORE_GLOBAL (so `globals[self_name]` cannot change during
+ * execution of our body), and we additionally require that every
+ * CALL in the body is itself a self-call -- meaning no external
+ * callee can perturb globals either.
+ *
+ * Strategy per call site at instruction index `ci` inside block B:
+ *   1. Split B at `ci`: keep [B.start, ci] and overwrite `ci` with
+ *      an IR_JUMP to the clone's entry block. Move [ci+1, B.end)
+ *      into a fresh `B_post` block that inherits B's original succs.
+ *   2. Emit a clone of each original block with all vregs remapped
+ *      to fresh IDs. Inject at the top of the clone entry the arg
+ *      plumbing (IR_MOVE from caller args to the clone's fresh
+ *      local_vregs, plus IR_PUSH_NULL for slots beyond arity).
+ *   3. Rewrite each cloned IR_RETURN as IR_MOVE(outer_dst, ret_val)
+ *      followed by IR_JUMP to B_post. Those blocks point at B_post
+ *      as their sole successor.
+ * ================================================================ */
+
+static void ensure_inst_cap(IRFunc *f, int need) {
+    if (f->cap_insts >= need) return;
+    int n = f->cap_insts ? f->cap_insts * 2 : 64;
+    while (n < need) n *= 2;
+    f->insts = xs_realloc(f->insts, (size_t)n * sizeof(IRInst));
+    f->cap_insts = n;
+}
+static void ensure_block_cap(IRFunc *f, int need) {
+    if (f->cap_blocks >= need) return;
+    int n = f->cap_blocks ? f->cap_blocks * 2 : 16;
+    while (n < need) n *= 2;
+    f->blocks = xs_realloc(f->blocks, (size_t)n * sizeof(IRBlock));
+    f->cap_blocks = n;
+}
+
+static int ir_callees_are_all_self(IRFunc *f, int up_to) {
+    if (!f->proto || !f->proto->name) return 0;
+    for (int i = 0; i < up_to; i++) {
+        IRInst *in = &f->insts[i];
+        if (in->op != IR_CALL) continue;
+        IRVReg callee = in->src1;
+        int di = -1;
+        for (int j = i - 1; j >= 0; j--) {
+            if (f->insts[j].dst == callee) { di = j; break; }
+        }
+        if (di < 0 || f->insts[di].op != IR_LOAD_GLOBAL) return 0;
+        int ci = f->insts[di].imm;
+        if (ci < 0 || ci >= f->proto->chunk.nconsts) return 0;
+        Value *nv = f->proto->chunk.consts[ci];
+        if (!nv || VAL_TAG(nv) != XS_STR || !nv->s) return 0;
+        if (strcmp(nv->s, f->proto->name) != 0) return 0;
+    }
+    return 1;
+}
+
+/* Inline a single CALL at `ci`. Uses the snapshot captured before
+ * any mutation so we always clone the ORIGINAL body even when
+ * several inline passes run back-to-back. */
+static void ir_inline_one(IRFunc *f, int ci,
+                           const IRInst *orig_insts, int orig_n_insts,
+                           const IRBlock *orig_blocks, int orig_n_blocks,
+                           int orig_n_vregs, int orig_n_locals,
+                           const IRVReg *orig_local_vregs) {
+    (void)orig_n_insts;
+
+    /* Capture call details from the live IR (it may have already
+     * been mutated by an earlier rewrite of this same site, which
+     * shouldn't happen but be defensive). */
+    IRInst call = f->insts[ci];
+    IRVReg dst_outer = call.dst;
+    int argc = call.imm;
+    IRVReg args[IR_MAX_CALL_ARGS];
+    for (int i = 0; i < argc; i++) args[i] = call.call_args[i];
+
+    /* Find the block that contains ci. */
+    int B_idx = -1;
+    for (int b = 0; b < f->n_blocks; b++) {
+        if (f->blocks[b].start <= ci && ci < f->blocks[b].end) {
+            B_idx = b; break;
+        }
+    }
+    if (B_idx < 0) return;
+
+    IRBlock B_orig = f->blocks[B_idx];
+
+    /* Allocate per-vreg remap. Original vreg ids 0..orig_n_vregs-1
+     * map to fresh ids starting at f->n_vregs. Original local_vregs
+     * get their fresh-id slots overwritten below so the cloned
+     * LOAD_LOCAL / STORE_LOCAL pick up the clone's own locals. */
+    IRVReg *vmap = xs_calloc((size_t)orig_n_vregs, sizeof(IRVReg));
+    for (int v = 0; v < orig_n_vregs; v++) vmap[v] = (IRVReg)(f->n_vregs++);
+
+    IRVReg *clone_locals = xs_malloc((size_t)orig_n_locals * sizeof(IRVReg));
+    for (int i = 0; i < orig_n_locals; i++) {
+        clone_locals[i] = (IRVReg)(f->n_vregs++);
+        if (orig_local_vregs && orig_local_vregs[i] >= 0
+            && orig_local_vregs[i] < orig_n_vregs)
+            vmap[orig_local_vregs[i]] = clone_locals[i];
+    }
+
+    /* Reserve block slots: one B_post plus orig_n_blocks clones. */
+    int B_post_idx = f->n_blocks;
+    int clone_base = f->n_blocks + 1;
+    int new_n_blocks = f->n_blocks + 1 + orig_n_blocks;
+    ensure_block_cap(f, new_n_blocks);
+    for (int b = B_post_idx; b < new_n_blocks; b++) {
+        memset(&f->blocks[b], 0, sizeof(IRBlock));
+        f->blocks[b].succ[0] = f->blocks[b].succ[1] = -1;
+    }
+    f->n_blocks = new_n_blocks;
+
+    /* Copy the post-CALL slice of B into B_post. */
+    int post_count = B_orig.end - (ci + 1);
+    ensure_inst_cap(f, f->n_insts + post_count);
+    int post_start = f->n_insts;
+    for (int i = 0; i < post_count; i++)
+        f->insts[f->n_insts++] = f->insts[ci + 1 + i];
+    f->blocks[B_post_idx].start = post_start;
+    f->blocks[B_post_idx].end = f->n_insts;
+    f->blocks[B_post_idx].succ[0] = B_orig.succ[0];
+    f->blocks[B_post_idx].succ[1] = B_orig.succ[1];
+    f->blocks[B_post_idx].n_succ = B_orig.n_succ;
+
+    /* Truncate B and overwrite the CALL slot with a jump to clone
+     * entry. The original LOAD_GLOBAL that produced the callee sits
+     * earlier in B and becomes dead -- harmless, DCE-friendly. */
+    f->blocks[B_idx].end = ci + 1;
+    f->blocks[B_idx].succ[0] = clone_base;
+    f->blocks[B_idx].succ[1] = -1;
+    f->blocks[B_idx].n_succ = 1;
+    {
+        IRInst *ji = &f->insts[ci];
+        memset(ji, 0, sizeof(IRInst));
+        ji->op = IR_JUMP;
+        ji->dst = -1; ji->src1 = -1; ji->src2 = -1;
+        ji->imm = clone_base;
+        ji->bc_offset = call.bc_offset;
+        for (int k = 0; k < IR_MAX_CALL_ARGS; k++) ji->call_args[k] = -1;
+    }
+
+    /* Clone each original block into positions [clone_base, clone_base+orig_n_blocks). */
+    for (int b = 0; b < orig_n_blocks; b++) {
+        IRBlock src_b = orig_blocks[b];
+        int dst_bi = clone_base + b;
+        f->blocks[dst_bi].start = f->n_insts;
+
+        if (b == 0) {
+            /* Prepend arg setup: IR_MOVE args into clone locals, and
+             * IR_PUSH_NULL for locals past arity. */
+            for (int i = 0; i < argc; i++) {
+                ensure_inst_cap(f, f->n_insts + 1);
+                IRInst *ni = &f->insts[f->n_insts++];
+                memset(ni, 0, sizeof(IRInst));
+                ni->op = IR_MOVE;
+                ni->dst = clone_locals[i];
+                ni->src1 = args[i];
+                ni->src2 = -1;
+                ni->bc_offset = call.bc_offset;
+                for (int k = 0; k < IR_MAX_CALL_ARGS; k++) ni->call_args[k] = -1;
+            }
+            for (int i = argc; i < orig_n_locals; i++) {
+                ensure_inst_cap(f, f->n_insts + 1);
+                IRInst *ni = &f->insts[f->n_insts++];
+                memset(ni, 0, sizeof(IRInst));
+                ni->op = IR_PUSH_NULL;
+                ni->dst = clone_locals[i];
+                ni->src1 = -1; ni->src2 = -1;
+                ni->bc_offset = call.bc_offset;
+                for (int k = 0; k < IR_MAX_CALL_ARGS; k++) ni->call_args[k] = -1;
+            }
+        }
+
+        int src_ends_on_return = 0;
+        for (int i = src_b.start; i < src_b.end; i++) {
+            IRInst src_in = orig_insts[i];  /* value-copy from snapshot */
+            ensure_inst_cap(f, f->n_insts + 2);
+            IRInst *ni = &f->insts[f->n_insts++];
+            *ni = src_in;
+
+            if (ni->dst >= 0 && ni->dst < orig_n_vregs) ni->dst = vmap[ni->dst];
+            if (ni->src1 >= 0 && ni->src1 < orig_n_vregs) ni->src1 = vmap[ni->src1];
+            if (ni->src2 >= 0 && ni->src2 < orig_n_vregs) ni->src2 = vmap[ni->src2];
+            for (int k = 0; k < IR_MAX_CALL_ARGS; k++)
+                if (ni->call_args[k] >= 0 && ni->call_args[k] < orig_n_vregs)
+                    ni->call_args[k] = vmap[ni->call_args[k]];
+
+            if (ni->op == IR_JUMP || ni->op == IR_JIF_FALSE || ni->op == IR_JIF_TRUE) {
+                if (ni->imm >= 0 && ni->imm < orig_n_blocks)
+                    ni->imm = ni->imm + clone_base;
+            } else if (ni->op == IR_RETURN) {
+                /* Rewrite into IR_MOVE + IR_JUMP. The current ni
+                 * slot becomes the MOVE; append a JUMP after it. */
+                IRVReg ret_val = ni->src1;
+                ni->op = IR_MOVE;
+                ni->dst = dst_outer;
+                ni->src1 = ret_val;
+                ni->src2 = -1;
+                IRInst *nj = &f->insts[f->n_insts++];
+                memset(nj, 0, sizeof(IRInst));
+                nj->op = IR_JUMP;
+                nj->dst = -1; nj->src1 = -1; nj->src2 = -1;
+                nj->imm = B_post_idx;
+                nj->bc_offset = src_in.bc_offset;
+                for (int k = 0; k < IR_MAX_CALL_ARGS; k++) nj->call_args[k] = -1;
+                src_ends_on_return = 1;
+            }
+        }
+        f->blocks[dst_bi].end = f->n_insts;
+
+        if (src_ends_on_return) {
+            f->blocks[dst_bi].succ[0] = B_post_idx;
+            f->blocks[dst_bi].succ[1] = -1;
+            f->blocks[dst_bi].n_succ = 1;
+        } else {
+            f->blocks[dst_bi].n_succ = src_b.n_succ;
+            for (int s = 0; s < src_b.n_succ; s++) {
+                int succ = src_b.succ[s];
+                f->blocks[dst_bi].succ[s] =
+                    (succ >= 0 && succ < orig_n_blocks) ? (succ + clone_base) : succ;
+            }
+        }
+    }
+
+    free(vmap);
+    free(clone_locals);
+}
+
+static int ir_try_inline_self(IRFunc *f) {
+    if (!f || !f->proto || !f->proto->name) return 0;
+
+    int orig_n_insts = f->n_insts;
+    int orig_n_blocks = f->n_blocks;
+    int orig_n_vregs = f->n_vregs;
+    int orig_n_locals = f->n_locals;
+
+    /* Safety: every CALL must target self. */
+    if (!ir_callees_are_all_self(f, orig_n_insts)) return 0;
+
+    /* Count CALL sites and apply a budget so we don't blow up tiny
+     * helper functions into megabytes of code. */
+    int n_calls = 0;
+    int call_positions[8];
+    for (int i = 0; i < orig_n_insts; i++) {
+        if (f->insts[i].op != IR_CALL) continue;
+        if (n_calls >= 8) return 0;
+        call_positions[n_calls++] = i;
+    }
+    if (n_calls == 0) return 0;
+    if (orig_n_insts > 80) return 0;
+    if (n_calls * orig_n_insts > 800) return 0;
+
+    /* Snapshot original IR -- the in-place rewrite mutates both
+     * blocks (we truncate B, add new succs) and insts (we overwrite
+     * the CALL, copy tail to B_post, append clone body). Cloning
+     * from the snapshot keeps subsequent sites correct. */
+    IRInst  *snap_insts = xs_malloc((size_t)orig_n_insts * sizeof(IRInst));
+    IRBlock *snap_blocks = xs_malloc((size_t)orig_n_blocks * sizeof(IRBlock));
+    memcpy(snap_insts,  f->insts,  (size_t)orig_n_insts  * sizeof(IRInst));
+    memcpy(snap_blocks, f->blocks, (size_t)orig_n_blocks * sizeof(IRBlock));
+    IRVReg *snap_locals = NULL;
+    if (orig_n_locals > 0 && f->local_vregs) {
+        snap_locals = xs_malloc((size_t)orig_n_locals * sizeof(IRVReg));
+        memcpy(snap_locals, f->local_vregs,
+               (size_t)orig_n_locals * sizeof(IRVReg));
+    }
+
+    /* Process call sites in reverse so earlier positions remain
+     * valid (later ones get rewritten first). */
+    for (int p = n_calls - 1; p >= 0; p--) {
+        ir_inline_one(f, call_positions[p],
+                      snap_insts, orig_n_insts,
+                      snap_blocks, orig_n_blocks,
+                      orig_n_vregs, orig_n_locals, snap_locals);
+    }
+
+    /* Rescan local_written for any slots that newly gained a store
+     * via the inlined copies. The inliner adds LOAD_LOCAL / STORE_LOCAL
+     * that still reference the ORIGINAL local_vregs (caller's) only
+     * when our safety check permits, which it doesn't here -- those
+     * ops end up retargeted at clone_locals through vmap -- so the
+     * caller's local_written flags don't need to change. */
+
+    free(snap_insts);
+    free(snap_blocks);
+    free(snap_locals);
+    return 1;
 }
 
 void irfunc_free(IRFunc *f) {

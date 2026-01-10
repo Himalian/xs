@@ -53,6 +53,10 @@ typedef enum {
 
     /* misc */
     IR_DUP,          /* dst = src1 (incref) */
+    IR_MOVE,         /* dst = src1 (no refcount change, ownership transfer);
+                      * used only by the self-inliner to splice caller args
+                      * into inlined-callee locals and to route inlined
+                      * RETURN values into the outer CALL's destination. */
 
     IR__MAX
 } IROp;

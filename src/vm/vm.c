@@ -5026,6 +5026,18 @@ int vm_call_closure_fast(VM *vm, int argc) {
     if (vm->frame_count >= 2) {
         vm->frames[vm->frame_count - 2].ip += 1;
     }
+    /* If the callee carries a tier-2 JIT entry, run it directly.
+     * jit_entry expects a freshly pushed frame with locals filled
+     * in -- exactly what we just set up. On success the frame has
+     * already been torn down and we return 0; the caller's JIT
+     * sees a no-op dispatch (ip already advanced above) and
+     * continues with the next instruction. On error we fall back
+     * so the caller's slow path surfaces it the usual way. */
+    if (proto->jit_entry) {
+        int (*fn)(VM *) = (int (*)(VM *))proto->jit_entry;
+        int rc = fn(vm);
+        if (rc != 0) return 1;
+    }
     return 0;
 }
 

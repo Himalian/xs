@@ -630,6 +630,16 @@ void *ralow_codegen(XSJIT *j, IRFunc *f, IRAlloc *a) {
                 break;
             }
 
+            case IR_MOVE: {
+                /* Ownership transfer -- no refcount bump. Emitted only
+                 * by the inliner to wire caller args into inlined
+                 * callee locals and to route an inlined RETURN value
+                 * into the outer CALL's destination. */
+                emit_load_vreg(&em, in->src1, a, RAX);
+                emit_store_vreg(&em, in->dst, a, RAX);
+                break;
+            }
+
             /* -------- STACK CONSUMERS -------- */
             case IR_POP: {
                 emit_load_vreg(&em, in->src1, a, RDI);
