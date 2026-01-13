@@ -428,7 +428,16 @@ static int tier2_run_until(VM *vm, int target_fc) {
         if (top->closure_val && VAL_TAG(top->closure_val) == XS_CLOSURE
             && top->closure_val->cl)
             proto = top->closure_val->cl->proto;
-        if (proto && proto->jit_entry) {
+        /* Only re-enter tier-2 native code when the frame is at its
+         * function start. Control-flow ops dispatched through
+         * IR_VM_STEP_CF (THROW to a catch, TAIL_CALL that didn't
+         * replace the proto, AWAIT / YIELD suspending etc.) can park
+         * frame->ip mid-body; the compiled code has no entry for
+         * arbitrary PCs, so we fall through to the interpreter step
+         * in those cases. Full mid-function OSR would need a prologue
+         * dispatcher that maps frame->ip to a block start and jumps
+         * there; this check is the conservative substitute. */
+        if (proto && proto->jit_entry && top->ip == proto->chunk.code) {
             int (*fn)(VM *) = (int (*)(VM *))proto->jit_entry;
             rc = fn(vm);
         } else {
