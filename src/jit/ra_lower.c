@@ -141,6 +141,20 @@ static int op_supported(Opcode op) {
         case OP_SPREAD:
         case OP_OPT_CHAIN:
         case OP_TRY_OP:
+        case OP_STORE_GLOBAL:
+        case OP_ITER_LEN:
+        case OP_ITER_GET:
+        /* Control-flow dispatch via IR_VM_STEP_CF + deopt_exit. */
+        case OP_THROW:
+        case OP_TAIL_CALL:
+        case OP_AWAIT:
+        case OP_YIELD:
+        case OP_SPAWN:
+        case OP_EFFECT_CALL:
+        case OP_EFFECT_RESUME:
+        case OP_EFFECT_HANDLE:
+        case OP_DEFER_PUSH:
+        case OP_DEFER_RUN:
             return 1;
         default:
             return 0;

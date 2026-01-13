@@ -540,11 +540,11 @@ void *ralow_codegen(XSJIT *j, IRFunc *f, IRAlloc *a) {
      *                 place our compiled block structure can no
      *                 longer follow. */
     size_t *err_exit_patches = xs_malloc(256 * sizeof(size_t));
-    int n_err = 0;
+    int n_err = 0, cap_err = 256;
     size_t *ok_exit_patches = xs_malloc(256 * sizeof(size_t));
-    int n_ok = 0;
+    int n_ok = 0, cap_ok = 256;
     size_t *deopt_exit_patches = xs_malloc(256 * sizeof(size_t));
-    int n_deopt = 0;
+    int n_deopt = 0, cap_deopt = 256;
 
     #define ADD_FIXUP(patch_off, tgt_block) do { \
         if (n_fixups == cap_fixups) { \
@@ -557,14 +557,26 @@ void *ralow_codegen(XSJIT *j, IRFunc *f, IRAlloc *a) {
     } while (0)
 
     #define ADD_ERR_EXIT(patch_off) do { \
+        if (n_err == cap_err) { \
+            cap_err *= 2; \
+            err_exit_patches = xs_realloc(err_exit_patches, (size_t)cap_err * sizeof(size_t)); \
+        } \
         err_exit_patches[n_err++] = (patch_off); \
     } while (0)
 
     #define ADD_OK_EXIT(patch_off) do { \
+        if (n_ok == cap_ok) { \
+            cap_ok *= 2; \
+            ok_exit_patches = xs_realloc(ok_exit_patches, (size_t)cap_ok * sizeof(size_t)); \
+        } \
         ok_exit_patches[n_ok++] = (patch_off); \
     } while (0)
 
     #define ADD_DEOPT_EXIT(patch_off) do { \
+        if (n_deopt == cap_deopt) { \
+            cap_deopt *= 2; \
+            deopt_exit_patches = xs_realloc(deopt_exit_patches, (size_t)cap_deopt * sizeof(size_t)); \
+        } \
         deopt_exit_patches[n_deopt++] = (patch_off); \
     } while (0)
 
