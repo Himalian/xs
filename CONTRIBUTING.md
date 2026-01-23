@@ -77,15 +77,18 @@ Grep `TODO` and `FIXME` in `src/` for 60+ starting points.
 ## Where to look
 
 - **VM and bytecode**: `src/vm/` (compiler.c, vm.c, bytecode.h).
-- **Tier-1 JIT (template)**: `src/jit/jit.c`, copy-patch dispatch over
-  the bytecode opcodes.
-- **Tier-2 JIT (register-allocating)**: `src/jit/ra_ir.h` defines the
-  small SSA-ish IR, `ra_lower.c` turns bytecode into it,
-  `ra_live.c` does per-block liveness, `ra_alloc.c` does linear-scan
-  over `rbx`/`r14`/`r15`, and `ra_codegen.c` emits x86-64 with SMI fast
-  paths and register-resident locals. Growing tier 2's opcode coverage
-  is the fastest way to make `--jit` faster; start with `op_supported`
-  in `ra_lower.c`.
+- **JIT driver**: `src/jit/jit.c` (mmap/VirtualAlloc the code buffer,
+  run the tier-2 pipeline, cache `proto->jit_entry`).
+- **JIT pipeline** (register-allocating, x86-64 and aarch64):
+  `src/jit/ra_ir.h` defines the small IR; `ra_lower.c` turns bytecode
+  into it (plus self-recursive inliner, compare/branch fusion, and
+  refcount-pair elimination peepholes); `ra_live.c` does per-block
+  liveness; `ra_alloc.c` does linear-scan over three callee-saved
+  regs; `ra_codegen.c` emits x86-64 and `ra_codegen_arm64.c` emits
+  AArch64. Widening `op_supported` in `ra_lower.c` is the fastest way
+  to bring more protos into native code. Unsupported-proto fallback
+  goes straight to the bytecode VM -- there is no template-JIT middle
+  tier.
 - **Sema / type checker**: `src/semantic/`, `src/types/`.
 - **Transpilers**: `src/transpiler/`.
 - **Plugins**: `src/plugins/`.
