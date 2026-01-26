@@ -1868,7 +1868,9 @@ void *ralow_codegen(XSJIT *j, IRFunc *f, IRAlloc *a) {
 }
 
 #endif /* JIT_HAS_MMAP */
-#else  /* !__x86_64__ */
+#elif !defined(__aarch64__) && !defined(_M_ARM64)
+/* Neither x86-64 nor arm64: ra_codegen_arm64.c also omits the symbol,
+ * so provide a stub here. */
 void *ralow_codegen(XSJIT *j, IRFunc *f, IRAlloc *a) {
     (void)j; (void)f; (void)a;
     return NULL;
