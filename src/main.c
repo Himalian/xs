@@ -2176,6 +2176,7 @@ test_again: ;
             Interp *interp = interp_new("<eval>");
             interp_run(interp, prog);
             int had_err = (interp->cf.signal == CF_ERROR || interp->cf.signal == CF_PANIC)
+                          || interp->had_unhandled_exception
                           || g_xs_runtime_error_count > 0;
             interp_free(interp);
             node_free(prog);

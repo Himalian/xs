@@ -1,8 +1,19 @@
-#define _POSIX_C_SOURCE 200809L
+/* Feature macros: we need clock_gettime(CLOCK_MONOTONIC) AND
+   ru_maxrss. On Linux both live under the POSIX 2008 / X/Open set;
+   on macOS/FreeBSD ru_maxrss is a BSD extension that disappears when
+   _POSIX_C_SOURCE is defined alone, so pull in the BSD set as well.
+   On WASI we skip rusage entirely further down. */
+#if defined(__linux__)
+#  define _POSIX_C_SOURCE 200809L
+#  define _GNU_SOURCE
+#elif defined(__APPLE__)
+#  define _DARWIN_C_SOURCE
+#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#  define _BSD_SOURCE
+#endif
 
 #include "core/limits.h"
 #include "core/ast.h"
-#include "runtime/error.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,9 +23,16 @@
 #if defined(_WIN32)
 #  include <windows.h>
 #  include <psapi.h>
+#  define LIMITS_HAVE_RUSAGE 0
+#elif defined(__wasi__) || defined(__EMSCRIPTEN__)
+/* WASI rusage emulation needs -D_WASI_EMULATED_PROCESS_CLOCKS and the
+   matching lib; we don't link it, so skip the RSS probe entirely. */
+#  include <unistd.h>
+#  define LIMITS_HAVE_RUSAGE 0
 #else
 #  include <sys/resource.h>
 #  include <unistd.h>
+#  define LIMITS_HAVE_RUSAGE 1
 #endif
 
 /* One counter set per thread. The VM / interpreter are single-threaded
@@ -54,19 +72,18 @@ static size_t process_rss_bytes(void) {
         return (size_t)pmc.WorkingSetSize;
     }
     return 0;
-#elif defined(__APPLE__)
+#elif LIMITS_HAVE_RUSAGE
     struct rusage ru;
-    if (getrusage(RUSAGE_SELF, &ru) == 0) {
-        /* ru_maxrss is in bytes on macOS. */
-        return (size_t)ru.ru_maxrss;
-    }
-    return 0;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+#  if defined(__APPLE__)
+    /* Darwin reports ru_maxrss in bytes. */
+    return (size_t)ru.ru_maxrss;
+#  else
+    /* Linux/BSD report in kilobytes. */
+    return (size_t)ru.ru_maxrss * 1024u;
+#  endif
 #else
-    struct rusage ru;
-    if (getrusage(RUSAGE_SELF, &ru) == 0) {
-        /* ru_maxrss is in kilobytes on Linux. */
-        return (size_t)ru.ru_maxrss * 1024u;
-    }
+    /* No process RSS probe available (WASI). Memory cap is a no-op. */
     return 0;
 #endif
 }
@@ -166,9 +183,7 @@ int xs_limits_tick(void) {
     return 0;
 }
 
-void xs_limits_throw_if_exceeded(void) {
-    if (!g_exceeded) return;
-    const char *name = xs_limits_exceeded_name();
-    xs_runtime_error(span_zero(), "ResourceLimit", NULL,
-                     "%s exceeded", name);
-}
+/* xs_limits_throw_if_exceeded used to live here but pulled
+   runtime/error.c into every target that linked limits.c (unit tests,
+   parser fuzzer, WASM). Callers now inline the xs_runtime_error call
+   themselves; interp/vm already depend on it. */

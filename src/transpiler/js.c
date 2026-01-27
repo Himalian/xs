@@ -964,11 +964,25 @@ static void emit_expr(SB *s, Node *n, int depth) {
         sb_add(s, "})()");
         break;
     }
-    /* declaration nodes used in expression context emit their names */
-    case NODE_FN_DECL:
-        if (n->fn_decl.name) sb_add(s, n->fn_decl.name);
-        else sb_add(s, "undefined");
+    /* declaration nodes used in expression context emit their names,
+       except for anonymous fn() {...} which must become a function
+       expression -- emitting the name "<anonymous>" produced invalid
+       JS, and falling back to "undefined" silently dropped the body. */
+    case NODE_FN_DECL: {
+        const char *fn_name = n->fn_decl.name;
+        int named = fn_name && fn_name[0] && fn_name[0] != '<';
+        if (named) { sb_add(s, fn_name); break; }
+        /* Anonymous: emit a function expression. */
+        int fn_is_gen = n->fn_decl.is_generator ||
+                        node_has_perform(n->fn_decl.body);
+        sb_add(s, fn_is_gen ? "(function*" : "(function");
+        emit_params(s, &n->fn_decl.params);
+        sb_add(s, " {\n");
+        if (n->fn_decl.body) emit_stmt(s, n->fn_decl.body, depth + 1);
+        sb_indent(s, depth);
+        sb_add(s, "})");
         break;
+    }
     case NODE_STRUCT_DECL:
         if (n->struct_decl.name) sb_add(s, n->struct_decl.name);
         else sb_add(s, "undefined");
@@ -1404,10 +1418,21 @@ static void emit_stmt(SB *s, Node *n, int depth) {
            dispatch effects at any call depth, not just inline ones. */
         int fn_is_gen = n->fn_decl.is_generator ||
                         node_has_perform(n->fn_decl.body);
+        /* An anonymous fn() reaching stmt context is almost always the
+           last expression of a block body (the interp treats
+           trailing expressions as implicit returns). JS has no such
+           rule and rejects both "<anonymous>" and nameless function
+           declarations, so emit `return (function(){...})` and let
+           the surrounding block's control flow do the right thing. */
+        const char *fn_name = n->fn_decl.name;
+        int named = fn_name && fn_name[0] && fn_name[0] != '<';
+        if (!named) sb_add(s, "return (");
         if (fn_is_gen) {
-            sb_printf(s, "function* %s", n->fn_decl.name);
+            if (named) sb_printf(s, "function* %s", fn_name);
+            else       sb_add(s, "function*");
         } else {
-            sb_printf(s, "function %s", n->fn_decl.name);
+            if (named) sb_printf(s, "function %s", fn_name);
+            else       sb_add(s, "function");
         }
         emit_params(s, &n->fn_decl.params);
         sb_add(s, " {\n");
@@ -1453,7 +1478,7 @@ static void emit_stmt(SB *s, Node *n, int depth) {
             }
         }
         sb_indent(s, depth);
-        sb_add(s, "}\n\n");
+        sb_add(s, named ? "}\n\n" : "});\n");
         break;
     }
     case NODE_RETURN:

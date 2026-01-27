@@ -18,9 +18,9 @@ fail=0
 check_fail() {
     local label="$1"; shift
     local pattern="$1"; shift
-    local out
-    out=$("$@" 2>&1 || true)
-    local rc=$?
+    local out rc
+    out=$("$@" 2>&1)
+    rc=$?
     if [ $rc -eq 0 ]; then
         echo "  FAIL $label: expected non-zero exit, got 0"
         fail=$((fail+1))

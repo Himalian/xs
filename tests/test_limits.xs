@@ -4,7 +4,7 @@
 -- in tests/run.sh under both --interp and --vm.
 
 -- Plain arithmetic under a huge budget: must succeed.
-let sum = 0
+var sum = 0
 var i = 0
 while i < 10 {
   sum = sum + i

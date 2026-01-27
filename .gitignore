@@ -6,3 +6,6 @@
 /core
 /editors/vscode/node_modules
 /editors/vscode/.xs_history
+/fuzz_parser
+/tests/unit/*_test
+!/tests/unit/*_test.c

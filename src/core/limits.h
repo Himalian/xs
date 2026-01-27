@@ -50,12 +50,11 @@ int     xs_limits_tick(void);
    hundred VM opcodes). Returns non-zero if exceeded. */
 int     xs_limits_check(void);
 
-/* Raise the tripped limit through the normal runtime-error path, so
-   it's catchable from XS with try/catch. Safe to call even when no
-   limit is tripped (no-op in that case). */
-void    xs_limits_throw_if_exceeded(void);
-
-/* Human-readable name of the tripped limit, or "none". */
+/* Human-readable name of the tripped limit, or "none". Callers that
+   want to raise a catchable runtime error should inline the
+   xs_runtime_error call themselves -- limits.c intentionally does not
+   depend on runtime/error.c so unit tests and the WASM build can link
+   it without pulling in the whole runtime. */
 const char *xs_limits_exceeded_name(void);
 
 #endif

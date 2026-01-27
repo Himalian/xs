@@ -1311,7 +1311,8 @@ static int vm_dispatch(VM *vm, int stop_frame) {
         /* Per-opcode resource-limit tick. Bails out through the same
            pending-throw path so try/catch can catch it. */
         if (xs_limits_tick()) {
-            xs_limits_throw_if_exceeded();
+            xs_runtime_error(span_zero(), "ResourceLimit", NULL,
+                             "%s exceeded", xs_limits_exceeded_name());
         }
         /* If xs_runtime_error queued a throw (e.g. from an arithmetic
            op or builtin), drain it before fetching the next opcode and

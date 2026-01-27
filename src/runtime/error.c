@@ -134,9 +134,11 @@ void xs_runtime_error(Span span, const char *label, const char *hint,
     }
     /* Install a pending throw for the VM dispatcher. The VM has no
        interp pointer to set cf.signal on, so it polls this slot at the
-       top of each instruction. The first error to install wins; later
-       errors are dropped while the throw is still pending. */
-    if (g_xs_in_try > 0 && !g_xs_pending_throw) {
+       top of each instruction. Install whenever no interp is active
+       (pure VM path) or we're already inside a try frame; the VM
+       unwinder handles the no-catch case by printing "uncaught" and
+       exiting with rc=1. */
+    if ((g_xs_in_try > 0 || !g_current_interp) && !g_xs_pending_throw) {
         g_xs_pending_throw = err_value
             ? value_incref(err_value)
             : xs_error_new(label ? label : "RuntimeError", buf, NULL);

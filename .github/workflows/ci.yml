@@ -8,114 +8,77 @@ on:
     branches: [main]
 
 jobs:
-  build:
-    if: "!startsWith(github.ref, 'refs/tags/')"
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install MinGW (Windows)
-        if: runner.os == 'Windows'
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          install: mingw-w64-x86_64-gcc make
-
-      - name: Build (Unix)
-        if: runner.os != 'Windows'
-        run: make
-
-      - name: Build (Windows)
-        if: runner.os == 'Windows'
-        shell: msys2 {0}
-        run: make
-
-      - name: Test (Unix)
-        if: runner.os != 'Windows'
-        run: make test
-
-      - name: Test (Windows)
-        if: runner.os == 'Windows'
-        shell: msys2 {0}
-        run: make test
-
-  sanitizers:
+  linux:
     if: "!startsWith(github.ref, 'refs/tags/')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build with ASan + UBSan and run tests
-        run: |
-          make debug
-          bash tests/run.sh
-      - name: Run adversarial suite under sanitizers
-        run: bash tests/adversarial/run.sh
 
-  unit-tests:
-    if: "!startsWith(github.ref, 'refs/tags/')"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build unit tests
-        run: make test-unit
-
-  layered-tests:
-    if: "!startsWith(github.ref, 'refs/tags/')"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run full 7-layer test suite
-        run: |
-          make
-          bash tests/run-all.sh
-
-  cross-backend-diff:
-    if: "!startsWith(github.ref, 'refs/tags/')"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
       - name: Build
         run: make
-      - name: Cross-backend diff
-        run: bash tests/test_transpiler_diff.sh
 
-  fuzz:
-    if: "!startsWith(github.ref, 'refs/tags/')"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install clang
-        run: sudo apt-get update && sudo apt-get install -y clang
-      - name: Build parser fuzzer
-        run: make fuzz-parser FUZZ_CC=clang
-      - name: Run short fuzz budget
+      - name: Test (layered)
+        run: bash tests/run-all.sh
+
+      - name: Unit tests
+        run: make test-unit
+
+      - name: Sanitizers
         run: |
+          make clean
+          make debug
+          bash tests/run.sh
+          bash tests/adversarial/run.sh
+
+      - name: Cross-backend diff
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: bash tests/test_transpiler_diff.sh
+
+      - name: Fuzz (short budget)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y clang
+          make fuzz-parser FUZZ_CC=clang
           mkdir -p corpus
           cp examples/*.xs corpus/ 2>/dev/null || true
           cp tests/conformance/*.xs corpus/ 2>/dev/null || true
           ./fuzz_parser -max_total_time=60 -timeout=5 corpus/
 
-  build-wasm:
+  macos:
+    if: "!startsWith(github.ref, 'refs/tags/')"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make
+      - run: make test
+
+  windows:
+    if: "!startsWith(github.ref, 'refs/tags/')"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc make
+      - name: Build
+        shell: msys2 {0}
+        run: make
+      - name: Test
+        shell: msys2 {0}
+        run: make test
+
+  wasm:
     if: "!startsWith(github.ref, 'refs/tags/')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install wasi-sdk
         run: |
-          WASI_VERSION=25
-          WASI_VERSION_FULL=${WASI_VERSION}.0
-          wget -q https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_VERSION}/wasi-sdk-${WASI_VERSION_FULL}-x86_64-linux.tar.gz
-          tar xf wasi-sdk-${WASI_VERSION_FULL}-x86_64-linux.tar.gz
+          WASI_VERSION_FULL=25.0
+          curl -sL https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-${WASI_VERSION_FULL}-x86_64-linux.tar.gz | tar xz
           sudo mv wasi-sdk-${WASI_VERSION_FULL}-x86_64-linux /opt/wasi-sdk
-
       - name: Build WASM
         run: make wasm
 
@@ -169,8 +132,7 @@ jobs:
 
       - name: Generate SHA256 checksums (Unix)
         if: runner.os != 'Windows'
-        run: |
-          shasum -a 256 ${{ matrix.name }} > ${{ matrix.name }}.sha256
+        run: shasum -a 256 ${{ matrix.name }} > ${{ matrix.name }}.sha256
 
       - name: Generate SHA256 checksums (Windows)
         if: runner.os == 'Windows'
@@ -197,35 +159,28 @@ jobs:
             xs-windows-x86_64.zip
             xs-windows-x86_64.zip.sha256
 
-  wasm:
+  release-wasm:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-
       - name: Install wasi-sdk
         run: |
-          WASI_VERSION=25
-          WASI_VERSION_FULL=${WASI_VERSION}.0
-          wget -q https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_VERSION}/wasi-sdk-${WASI_VERSION_FULL}-x86_64-linux.tar.gz
-          tar xf wasi-sdk-${WASI_VERSION_FULL}-x86_64-linux.tar.gz
+          WASI_VERSION_FULL=25.0
+          curl -sL https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-${WASI_VERSION_FULL}-x86_64-linux.tar.gz | tar xz
           sudo mv wasi-sdk-${WASI_VERSION_FULL}-x86_64-linux /opt/wasi-sdk
-
       - name: Build WASM
         run: make wasm
-
       - name: Generate SHA256 for WASM
         run: sha256sum xs.wasm > xs.wasm.sha256
-
       - name: Upload WASM to release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             xs.wasm
             xs.wasm.sha256
-
       - name: Notify static repo
         run: |
           curl -X POST \

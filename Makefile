@@ -299,11 +299,11 @@ ubsan: clean $(TARGET)
 # libFuzzer entrypoint against the parser. Needs clang with -fsanitize=fuzzer.
 # Build corpus by pointing fuzz_parser at tests/ and examples/.
 FUZZ_CC ?= clang
-fuzz-parser: tests/fuzz/fuzz_parser.c
+fuzz-parser: tests/fuzz/fuzz_parser.c tests/fuzz/stubs.c
 	$(FUZZ_CC) -g -O1 -fsanitize=fuzzer,address,undefined -std=c11 \
 	    -Isrc -Isrc/tls/bearssl \
 	    $(foreach f,VM PLUGINS SANDBOX EFFECTS TRANSPILER FMT PKG DOC,-DXSC_ENABLE_$(f)) \
-	    -o fuzz_parser tests/fuzz/fuzz_parser.c \
+	    -o fuzz_parser tests/fuzz/fuzz_parser.c tests/fuzz/stubs.c \
 	    $(CORE_SRCS) $(COMPILER_SRCS) $(DIAG_SRCS) \
 	    -lm -lpthread -ldl
 

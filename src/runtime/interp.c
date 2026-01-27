@@ -5496,11 +5496,11 @@ do_call: ;
         const char *my_label = n->while_loop.label;
         Value *result = value_incref(XS_NULL_VAL);
         while (1) {
-            fprintf(stderr, "DBG tick used=%lu budget=%lu\n", (unsigned long)xs_limits_get_instructions_used(), (unsigned long)xs_limits_get_instructions_budget());
             /* Loop-head budget tick. Statement-level ticks miss pure
                expression loops like `while true { ... }`. */
             if (xs_limits_tick()) {
-                xs_limits_throw_if_exceeded();
+                xs_runtime_error(span_zero(), "ResourceLimit", NULL,
+                                 "%s exceeded", xs_limits_exceeded_name());
                 if (i->cf.signal) break;
             }
             Value *cond = EVAL(i, n->while_loop.cond);
@@ -9041,7 +9041,8 @@ void interp_exec(Interp *i, Node *stmt) {
        per tick than the VM, so one tick per statement keeps budgets
        roughly comparable when the same program runs on both backends. */
     if (xs_limits_tick()) {
-        xs_limits_throw_if_exceeded();
+        xs_runtime_error(span_zero(), "ResourceLimit", NULL,
+                         "%s exceeded", xs_limits_exceeded_name());
         if (i->cf.signal) return;
     }
     i->current_span = stmt->span;
