@@ -42,14 +42,28 @@ run_layer() {
 run_xs_dir() {
     local dir="$1" label="$2"
     local pass=0 fail=0
+    # Run every file against every backend; a regression or conformance
+    # test has to agree across interp/vm/jit or it isn't really passing.
+    # When a backend fails, print its full output so the CI log has
+    # enough context to diagnose without re-running locally.
     for f in "$dir"/*.xs; do
         [ -f "$f" ] || continue
-        if out=$(./xs "$f" 2>&1); then
-            pass=$((pass + 1))
-        else
-            fail=$((fail + 1))
-            echo "  FAIL  $(basename "$f")"
-            echo "$out" | tail -3 | sed 's/^/        /'
+        local name base_rc=0
+        name=$(basename "$f" .xs)
+        for mode in interp vm jit; do
+            out=$(./xs --$mode "$f" 2>&1)
+            rc=$?
+            if [ $rc -ne 0 ]; then
+                fail=$((fail + 1))
+                base_rc=1
+                echo "  FAIL  $name ($mode)"
+                echo "$out" | sed 's/^/        /'
+            else
+                pass=$((pass + 1))
+            fi
+        done
+        if [ $base_rc -eq 0 ]; then
+            echo "  ok    $name (interp+vm+jit)"
         fi
     done
     if [ $fail -eq 0 ]; then

@@ -211,7 +211,7 @@ release: LDFLAGS += -flto -s
 release: clean $(TARGET)
 
 test: $(TARGET)
-	@bash tests/run.sh
+	@bash tests/run-all.sh
 
 # Unit tests: isolated C tests that exercise compiler internals (lexer,
 # parser, sema, vm) without going through the full `xs` binary. Each

@@ -17,11 +17,8 @@ jobs:
       - name: Build
         run: make
 
-      - name: Test (layered)
-        run: bash tests/run-all.sh
-
-      - name: Unit tests
-        run: make test-unit
+      - name: Test (full run-all suite)
+        run: make test
 
       - name: Sanitizers
         run: |
@@ -79,8 +76,46 @@ jobs:
           WASI_VERSION_FULL=25.0
           curl -sL https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-${WASI_VERSION_FULL}-x86_64-linux.tar.gz | tar xz
           sudo mv wasi-sdk-${WASI_VERSION_FULL}-x86_64-linux /opt/wasi-sdk
+      - name: Install wasmtime
+        run: |
+          curl -sL https://github.com/bytecodealliance/wasmtime/releases/download/v25.0.0/wasmtime-v25.0.0-x86_64-linux.tar.xz | tar xJ
+          sudo cp wasmtime-v25.0.0-x86_64-linux/wasmtime /usr/local/bin/
       - name: Build WASM
         run: make wasm
+      - name: Build native xs (needed for test orchestration helpers)
+        run: make
+      - name: Conformance suite through wasm
+        run: |
+          pass=0; fail=0
+          for f in tests/conformance/*.xs; do
+              out=$(wasmtime run --dir . xs.wasm -- --interp "$f" 2>&1); rc=$?
+              if [ $rc -eq 0 ] && echo "$out" | grep -q "CONFORMANCE OK"; then
+                  pass=$((pass + 1))
+                  echo "  ok    $(basename "$f" .xs) (wasm)"
+              else
+                  fail=$((fail + 1))
+                  echo "  FAIL  $(basename "$f" .xs) (wasm)"
+                  echo "$out" | sed 's/^/        /'
+              fi
+          done
+          echo "[wasm-conformance] $pass passed, $fail failed"
+          [ $fail -eq 0 ]
+      - name: Regression corpus through wasm
+        run: |
+          pass=0; fail=0
+          for f in tests/regression/*.xs; do
+              out=$(wasmtime run --dir . xs.wasm -- --interp "$f" 2>&1); rc=$?
+              if [ $rc -eq 0 ]; then
+                  pass=$((pass + 1))
+                  echo "  ok    $(basename "$f" .xs) (wasm)"
+              else
+                  fail=$((fail + 1))
+                  echo "  FAIL  $(basename "$f" .xs) (wasm)"
+                  echo "$out" | sed 's/^/        /'
+              fi
+          done
+          echo "[wasm-regression] $pass passed, $fail failed"
+          [ $fail -eq 0 ]
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
