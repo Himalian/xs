@@ -81,24 +81,11 @@ int pipe(int fds[2]) { (void)fds; return -1; }
 int fork(void) { return -1; }
 int waitpid(int pid, int *status, int opts) { (void)pid; (void)status; (void)opts; return -1; }
 int kill(int pid, int sig) { (void)pid; (void)sig; return -1; }
-/* sleep via host-provided import (Atomics.wait in browser, busy-wait fallback) */
-#include <time.h>
-extern void __xs_sleep_ms(int ms) __attribute__((import_module("env"), import_name("__xs_sleep_ms")));
-
-unsigned int sleep(unsigned int secs) {
-    __xs_sleep_ms((int)(secs * 1000));
-    return 0;
-}
-int usleep(unsigned int usec) {
-    __xs_sleep_ms((int)(usec / 1000));
-    return 0;
-}
-int nanosleep(const struct timespec *req, struct timespec *rem) {
-    (void)rem;
-    int ms = (int)(req->tv_sec * 1000) + (int)(req->tv_nsec / 1000000);
-    __xs_sleep_ms(ms);
-    return 0;
-}
+/* sleep / usleep / nanosleep are provided natively by wasi-libc
+   (backed by __wasi_poll_oneoff). Don't override them here: an earlier
+   version imported `env::__xs_sleep_ms`, which standalone WASI runtimes
+   like wasmtime cannot satisfy, so `xs.wasm` failed to instantiate
+   entirely. Rely on wasi-libc's implementations instead. */
 
 /* chown - not in wasi-libc (readlink, chmod are provided by wasi-libc) */
 int chown(const char *path, unsigned int uid, unsigned int gid) { (void)path; (void)uid; (void)gid; return -1; }

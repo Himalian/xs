@@ -124,7 +124,10 @@ int main(int argc, char **argv) {
     Interp *interp = interp_new(filename);
     interp_run(interp, program);
 
-    int had_error = (interp->cf.signal != 0);
+    extern int g_xs_runtime_error_count;
+    int had_error = (interp->cf.signal != 0)
+                 || interp->had_unhandled_exception
+                 || g_xs_runtime_error_count > 0;
     interp_free(interp);
     free(src);
     return had_error ? 1 : 0;

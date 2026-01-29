@@ -191,22 +191,54 @@ struct Value {
    so xs_is_smi is false and the macros behave identically to direct
    field access. This lets VAL_TAG(v) stand in for VAL_TAG(v) even when v
    isn't a Value: for a Node*, xs_is_smi returns false and we fall
-   through to (v)->tag, same as before. */
+   through to (v)->tag, same as before.
+
+   The encoding is only valid when uintptr_t is wide enough to round-trip
+   a 63-bit payload losslessly; on 32-bit targets (wasm32, 32-bit Linux)
+   the payload would be truncated during the cast and negative ints come
+   back as near-INT32_MAX garbage. Disable SMI there and fall back to the
+   heap-allocated Value path. */
 #define XS_SMI_TAG       0x1
+#if UINTPTR_MAX > 0xFFFFFFFFu
 #define XS_SMI_MAX  ((int64_t)0x3FFFFFFFFFFFFFFFLL)
 #define XS_SMI_MIN  ((int64_t)0xC000000000000000LL)
+#else
+/* 32-bit target: SMI disabled, keep a never-satisfied fits() range. */
+#define XS_SMI_MAX  ((int64_t)-1)
+#define XS_SMI_MIN  ((int64_t)0)
+#endif
 
 static inline int xs_is_smi(const void *v) {
+#if UINTPTR_MAX > 0xFFFFFFFFu
     return ((uintptr_t)v) & XS_SMI_TAG;
+#else
+    (void)v;
+    return 0;
+#endif
 }
 static inline int64_t xs_smi_to_int(const void *v) {
+#if UINTPTR_MAX > 0xFFFFFFFFu
     return ((int64_t)(uintptr_t)v) >> 1;
+#else
+    (void)v;
+    return 0;
+#endif
 }
 static inline Value *xs_int_to_smi(int64_t i) {
+#if UINTPTR_MAX > 0xFFFFFFFFu
     return (Value *)(uintptr_t)(((uint64_t)i << 1) | XS_SMI_TAG);
+#else
+    (void)i;
+    return NULL;
+#endif
 }
 static inline int xs_fits_smi(int64_t i) {
+#if UINTPTR_MAX > 0xFFFFFFFFu
     return i >= XS_SMI_MIN && i <= XS_SMI_MAX;
+#else
+    (void)i;
+    return 0;
+#endif
 }
 #define VAL_TAG(v)     (xs_is_smi(v) ? XS_INT : (v)->tag)
 #define VAL_IS_INT(v)  (xs_is_smi(v) || (v)->tag == XS_INT)
