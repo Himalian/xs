@@ -174,6 +174,12 @@ void promise_free(XSPromise *p) {
     if (!p) return;
     p->refcount--;
     if (p->refcount > 0) return;
+    /* Result and error were handed in by the resolver with their own
+       reference (native_promise_resolve / _reject incref at the
+       boundary); balance that here so the promise lifetime owns
+       exactly one. */
+    if (p->result) { value_decref(p->result); p->result = NULL; }
+    if (p->error)  { value_decref(p->error);  p->error = NULL; }
     free(p->callbacks);
     free(p);
 }
@@ -250,7 +256,8 @@ static void run_callbacks(void *ctx_ptr) {
                         promise_reject(rt, child, inner->error);
                     }
                 } else {
-                    promise_resolve(rt, child, result ? result : xs_null());
+                    Value *r = result ? result : XS_NULL_VAL;
+                    promise_resolve(rt, child, r);
                 }
             }
         } else if (child) {
@@ -266,10 +273,14 @@ static void run_callbacks(void *ctx_ptr) {
     free(ctx);
 }
 
+/* promise_resolve / promise_reject take a non-owning reference: they
+   incref the value themselves so the promise can outlive the caller's
+   stack frame without the caller worrying about ownership. promise_free
+   pairs with this by decref'ing on destruction. */
 void promise_resolve(AsyncRuntime *rt, XSPromise *p, Value *result) {
     if (!p || p->state != PROMISE_PENDING) return;
     p->state = PROMISE_RESOLVED;
-    p->result = result;
+    p->result = result ? value_incref(result) : value_incref(XS_NULL_VAL);
     rt->settled_count++;
 
     if (p->ncallbacks > 0)
@@ -279,7 +290,7 @@ void promise_resolve(AsyncRuntime *rt, XSPromise *p, Value *result) {
 void promise_reject(AsyncRuntime *rt, XSPromise *p, Value *error) {
     if (!p || p->state != PROMISE_PENDING) return;
     p->state = PROMISE_REJECTED;
-    p->error = error;
+    p->error = error ? value_incref(error) : value_incref(XS_NULL_VAL);
     rt->settled_count++;
 
     if (p->ncallbacks > 0)
@@ -376,14 +387,16 @@ static void all_on_reject(void *ctx_ptr) {
             return;
         }
     }
-    promise_reject(ctx->rt, ctx->combined, xs_null());
+    promise_reject(ctx->rt, ctx->combined, XS_NULL_VAL);
 }
 
 XSPromise *promise_all(AsyncRuntime *rt, XSPromise **promises, int count) {
     XSPromise *combined = promise_new(rt);
 
     if (count == 0) {
-        promise_resolve(rt, combined, xs_array_new());
+        Value *empty = xs_array_new();
+        promise_resolve(rt, combined, empty);
+        value_decref(empty);
         return combined;
     }
 
@@ -468,7 +481,9 @@ XSPromise *promise_any(AsyncRuntime *rt, XSPromise **promises, int count) {
     XSPromise *combined = promise_new(rt);
 
     if (count == 0) {
-        promise_reject(rt, combined, xs_str("All promises were rejected"));
+        Value *msg = xs_str("All promises were rejected");
+        promise_reject(rt, combined, msg);
+        value_decref(msg);
         return combined;
     }
 
@@ -559,7 +574,7 @@ typedef struct {
 
 static void sleep_timer_cb(void *ctx_ptr) {
     SleepCtx *ctx = ctx_ptr;
-    promise_resolve(ctx->rt, ctx->promise, xs_null());
+    promise_resolve(ctx->rt, ctx->promise, XS_NULL_VAL);
     free(ctx);
 }
 
@@ -590,7 +605,9 @@ typedef struct {
 static void timeout_timer_cb(void *ctx_ptr) {
     TimeoutCtx *ctx = ctx_ptr;
     if (ctx->wrapped->state == PROMISE_PENDING) {
-        promise_reject(ctx->rt, ctx->wrapped, xs_str("Timeout exceeded"));
+        Value *msg = xs_str("Timeout exceeded");
+        promise_reject(ctx->rt, ctx->wrapped, msg);
+        value_decref(msg);
     }
     free(ctx);
 }
@@ -695,14 +712,14 @@ static Value *native_promise_new(Interp *interp, Value **args, int argc) {
 static Value *native_promise_resolve(Interp *interp, Value **args, int argc) {
     (void)interp;
     AsyncRuntime *rt = ensure_runtime();
-    XSPromise *p = promise_resolve_value(rt, argc > 0 ? args[0] : xs_null());
+    XSPromise *p = promise_resolve_value(rt, argc > 0 ? args[0] : XS_NULL_VAL);
     return promise_to_value(p);
 }
 
 static Value *native_promise_reject(Interp *interp, Value **args, int argc) {
     (void)interp;
     AsyncRuntime *rt = ensure_runtime();
-    XSPromise *p = promise_reject_value(rt, argc > 0 ? args[0] : xs_null());
+    XSPromise *p = promise_reject_value(rt, argc > 0 ? args[0] : XS_NULL_VAL);
     return promise_to_value(p);
 }
 
@@ -869,8 +886,13 @@ static Value *native_promise_value(Interp *interp, Value **args, int argc) {
     if (argc < 1) return xs_null();
     XSPromise *p = value_to_promise(args[0]);
     if (!p) return xs_null();
-    if (p->state == PROMISE_RESOLVED) return p->result ? p->result : xs_null();
-    if (p->state == PROMISE_REJECTED) return p->error ? p->error : xs_null();
+    /* Natives return a fresh-owned reference; the caller will decref.
+       p->result / p->error belong to the promise so hand back an incref
+       rather than the raw pointer. */
+    if (p->state == PROMISE_RESOLVED)
+        return p->result ? value_incref(p->result) : xs_null();
+    if (p->state == PROMISE_REJECTED)
+        return p->error ? value_incref(p->error) : xs_null();
     return xs_null();
 }
 

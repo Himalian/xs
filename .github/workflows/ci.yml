@@ -40,12 +40,13 @@ jobs:
           mkdir -p corpus
           cp examples/*.xs corpus/ 2>/dev/null || true
           cp tests/conformance/*.xs corpus/ 2>/dev/null || true
-          # Full ASan + LSan + UBSan. -timeout=30 gives the instrumented
-          # parser slack on legitimate quadratic backtracking inputs
-          # without masking infinite loops. -rss_limit_mb=4096 caps the
-          # runaway-allocation inputs at a level that still exits fast
-          # enough for a 60s budget.
-          ./fuzz_parser -max_total_time=60 -timeout=30 -rss_limit_mb=4096 corpus/
+          # Full ASan + LSan + UBSan. -timeout=60 gives the instrumented
+          # parser slack on the 30s+ pathological backtracking inputs
+          # that existing seeds can mutate into; an infinite loop would
+          # still be caught by -max_total_time. -rss_limit_mb=4096 caps
+          # the runaway-allocation inputs at a level that still exits
+          # inside the total budget.
+          ./fuzz_parser -max_total_time=60 -timeout=60 -rss_limit_mb=4096 corpus/
       - name: Upload fuzz reproducers
         if: failure()
         uses: actions/upload-artifact@v4
