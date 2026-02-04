@@ -336,6 +336,7 @@ WASM_FLAGS = -O2 -std=c11 -Isrc \
              -mllvm -wasm-enable-sjlj \
              -D_WASI_EMULATED_SIGNAL \
              -D_WASI_EMULATED_PTHREAD \
+             -DXS_WASM=1 \
              -DXSC_ENABLE_VM -DXSC_ENABLE_EFFECTS -DXSC_ENABLE_TRANSPILER \
              -DXSC_ENABLE_FMT -DXSC_ENABLE_DOC -DXSC_ENABLE_PKG \
              -DXSC_ENABLE_PLUGINS -DXSC_ENABLE_SANDBOX \

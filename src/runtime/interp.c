@@ -1342,6 +1342,45 @@ tail_call_entry: ;
         Value *result = NULL;
         if (fn->body) {
             if (fn->is_generator) {
+#ifdef XS_WASM
+                {
+                /* WASI has no real thread support, so the thread-per-
+                   generator machinery deadlocks on pthread_cond_wait.
+                   Run the body eagerly in the calling thread, collect
+                   every yield into an array, and expose a .next()
+                   that walks it. Infinite generators will OOM rather
+                   than hang; use a hard yield cap to fail fast. */
+                Value *w_bucket = xs_array_new();
+                Value *w_prev_collect = i->yield_collect;
+                int    w_prev_limit   = i->yield_limit;
+                i->yield_collect = w_bucket;
+                i->yield_limit   = 1000000; /* 1M yields is enough */
+                int w_saved_signal = i->cf.signal;
+                Value *w_body_val = interp_eval(i, fn->body);
+                if (w_body_val) value_decref(w_body_val);
+                i->yield_collect = w_prev_collect;
+                i->yield_limit   = w_prev_limit;
+                /* CF_RETURN from the yield-limit overflow is expected;
+                   clear it here so the caller doesn't see a stale
+                   signal. A real error (throw, panic, tail call) is
+                   preserved. */
+                if (i->cf.signal == CF_RETURN) {
+                    if (i->cf.value) value_decref(i->cf.value);
+                    i->cf.signal = w_saved_signal;
+                    i->cf.value = NULL;
+                }
+                Value *w_gen = xs_map_new();
+                Value *w_type_v = xs_str("generator");
+                map_set(w_gen->map, "__type", w_type_v); value_decref(w_type_v);
+                map_set(w_gen->map, "_array", w_bucket); value_decref(w_bucket);
+                Value *w_idx_v = xs_int(0);
+                map_set(w_gen->map, "_index", w_idx_v); value_decref(w_idx_v);
+                Value *w_done_v = value_incref(XS_FALSE_VAL);
+                map_set(w_gen->map, "_done", w_done_v); value_decref(w_done_v);
+                result = w_gen;
+                goto gen_done;
+                }
+#endif
                 /* Lazy generator: spin up a worker thread that runs
                    the body. The worker blocks on a resume channel
                    between yields, so infinite generators with break
@@ -1391,6 +1430,9 @@ tail_call_entry: ;
                 value_decref(yield_chan);
                 value_decref(resume_chan);
                 result = gen;
+#ifdef XS_WASM
+            gen_done:;
+#endif
             } else {
                 Value *body_val = interp_eval(i, fn->body);
                 if (i->cf.signal == CF_TAIL_CALL) {
@@ -2906,6 +2948,31 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
             Value *gtype = map_get(m, "__type");
             Value *ych   = map_get(m, "_yield_chan");
             Value *rch   = map_get(m, "_resume_chan");
+            /* Eager WASM generator: _array + _index replace the worker
+               thread. .next() walks the pre-collected array. */
+            Value *gen_arr = map_get(m, "_array");
+            if (gtype && VAL_TAG(gtype) == XS_STR &&
+                strcmp(gtype->s, "generator") == 0 && gen_arr &&
+                VAL_TAG(gen_arr) == XS_ARRAY &&
+                strcmp(method, "next") == 0) {
+                Value *idx_v = map_get(m, "_index");
+                int idx = (idx_v && VAL_IS_INT(idx_v)) ? (int)VAL_INT(idx_v) : 0;
+                Value *result = xs_map_new();
+                if (idx >= gen_arr->arr->len) {
+                    Value *nv = value_incref(XS_NULL_VAL);
+                    map_set(result->map, "value", nv); value_decref(nv);
+                    Value *dv = value_incref(XS_TRUE_VAL);
+                    map_set(result->map, "done", dv); value_decref(dv);
+                    return result;
+                }
+                Value *v = value_incref(gen_arr->arr->items[idx]);
+                map_set(result->map, "value", v); value_decref(v);
+                Value *dv = value_incref(XS_FALSE_VAL);
+                map_set(result->map, "done", dv); value_decref(dv);
+                Value *new_idx = xs_int(idx + 1);
+                map_set(m, "_index", new_idx); value_decref(new_idx);
+                return result;
+            }
             if (gtype && VAL_TAG(gtype) == XS_STR &&
                 strcmp(gtype->s, "generator") == 0 &&
                 ych && rch) {
@@ -6391,9 +6458,25 @@ do_call: ;
         XSFunc *spawn_fn = func_new_ex("__spawn__", NULL, 0,
                                        n->spawn_.expr, i->env, NULL, NULL);
         Value *v = xs_func_new(spawn_fn);
+#ifdef XS_WASM
+        /* WASI has no usable threads; run the spawned body synchronously
+           and return a resolved-future map so `await` sees the result
+           directly via the pre-completed path. Loses real concurrency
+           but matches the observable semantics for sequential
+           await-all patterns. */
+        Value *res = call_value(i, v, NULL, 0, "spawn");
+        value_decref(v);
+        Value *fut = xs_map_new();
+        Value *status_v = xs_str("done");
+        map_set(fut->map, "_status", status_v); value_decref(status_v);
+        map_set(fut->map, "_result", res ? res : value_incref(XS_NULL_VAL));
+        if (res) value_decref(res);
+        return fut;
+#else
         Value *fut = xs_spawn_thread(i, v);
         value_decref(v);
         return fut;
+#endif
     }
 
     case NODE_SEND_EXPR: {
