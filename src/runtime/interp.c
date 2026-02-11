@@ -5361,8 +5361,8 @@ do_call: ;
         /* inline cache lookup for method dispatch */
         Value *result = NULL;
         int ic_sid = ic_site_id(n->node_id);
-        uint32_t ic_mh = ic_method_hash(n->method_call.method);
-        Value *ic_cached = ic_lookup(ic_sid, (int64_t)VAL_TAG(obj), ic_mh);
+        Value *ic_cached = ic_lookup(ic_sid, (int64_t)VAL_TAG(obj),
+                                     n->method_call.method);
         if (ic_cached && VAL_TAG(ic_cached) == XS_FUNC) {
             /* cache hit: skip the full method resolution */
             result = call_value(i, ic_cached, args, argc, n->method_call.method);

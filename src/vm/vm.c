@@ -2359,18 +2359,28 @@ static int vm_dispatch(VM *vm, int stop_frame) {
             int mc_site_id = ic_site_id(
                 (int)((uintptr_t)PROTO ^
                       (uintptr_t)(frame->ip - PROTO->chunk.code)));
-            uint32_t mc_hash = ic_method_hash(mc_name);
             Value *mc_cached_fn = NULL;
+            uint8_t mc_cached_is_module = 0;
+            uint8_t mc_cached_needs_self = 0;
+            int mc_cache_hit = 0;
 
             if (VAL_TAG(mc_obj) == XS_MAP || VAL_TAG(mc_obj) == XS_MODULE) {
-                /* hot path: the cache already has the resolved callable. */
+                /* hot path: the cache already has the resolved callable
+                   and the dispatch flags (module-vs-self, self arity)
+                   from the first miss, so we can skip every map_get
+                   probe below and drop straight into invocation. The
+                   method-name key is the const-pool pointer so hit
+                   checks are a pointer compare, not a strcmp. */
                 {
                     int64_t type_tag = (int64_t)(intptr_t)mc_obj->map;
-                    Value *cached = ic_lookup(mc_site_id, type_tag, mc_hash);
+                    Value *cached = ic_lookup_ex(mc_site_id, type_tag, mc_name,
+                                                 &mc_cached_is_module,
+                                                 &mc_cached_needs_self);
                     if (cached && (VAL_TAG(cached) == XS_CLOSURE ||
                                    VAL_TAG(cached) == XS_NATIVE ||
                                    VAL_TAG(cached) == XS_FUNC)) {
                         mc_cached_fn = cached;
+                        mc_cache_hit = 1;
                         goto map_generic_method;
                     }
                 }
@@ -2759,20 +2769,31 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                         }
                     }
                     if (fn && (VAL_TAG(fn) == XS_CLOSURE || VAL_TAG(fn) == XS_NATIVE)) {
-                        /* populate the inline cache so the next call with
-                           the same map pointer + method name hits fast. */
-                        ic_update(mc_site_id,
-                                  (int64_t)(intptr_t)mc_obj->map,
-                                  mc_hash, fn);
-                        int is_module_call = (VAL_TAG(mc_obj) == XS_MODULE) ||
-                            (VAL_TAG(mc_obj) == XS_MAP && !map_get(mc_obj->map, "__type") &&
-                             !map_get(mc_obj->map, "__methods") && !map_get(mc_obj->map, "__fields"));
-                        /* Check if first param is 'self' for struct/class methods */
-                        int needs_self = 0;
-                        if (VAL_TAG(fn) == XS_CLOSURE) {
-                            int fn_arity = fn->cl->proto->arity;
-                            if (fn_arity < 0) fn_arity = -(fn_arity + 1);
-                            needs_self = (fn_arity == mc_argc + 1);
+                        int is_module_call;
+                        int needs_self;
+                        if (mc_cache_hit) {
+                            /* flags came from the cache: no map_get probes */
+                            is_module_call = mc_cached_is_module;
+                            needs_self     = mc_cached_needs_self;
+                        } else {
+                            is_module_call = (VAL_TAG(mc_obj) == XS_MODULE) ||
+                                (VAL_TAG(mc_obj) == XS_MAP && !map_get(mc_obj->map, "__type") &&
+                                 !map_get(mc_obj->map, "__methods") && !map_get(mc_obj->map, "__fields"));
+                            /* Check if first param is 'self' for struct/class methods */
+                            needs_self = 0;
+                            if (VAL_TAG(fn) == XS_CLOSURE) {
+                                int fn_arity = fn->cl->proto->arity;
+                                if (fn_arity < 0) fn_arity = -(fn_arity + 1);
+                                needs_self = (fn_arity == mc_argc + 1);
+                            }
+                            /* Populate the inline cache so the next call with
+                               the same receiver + method name hits fast and
+                               can skip the probes above. */
+                            ic_update_ex(mc_site_id,
+                                         (int64_t)(intptr_t)mc_obj->map,
+                                         mc_name, fn,
+                                         (uint8_t)is_module_call,
+                                         (uint8_t)needs_self);
                         }
                         if (VAL_TAG(fn) == XS_CLOSURE && needs_self && !is_module_call) {
                             /* super proxy: replace self with __self */
