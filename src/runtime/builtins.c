@@ -2380,10 +2380,10 @@ static Value *native_process_spawn(Interp *ig, Value **a, int n) {
 }
 
 /* process.on_signal(sig_name, callback) */
+#if !defined(__MINGW32__) && !defined(__wasi__)
 static Interp *g_signal_interp = NULL;
 static Value  *g_signal_handlers[32] = {0};
 
-#if !defined(__MINGW32__) && !defined(__wasi__)
 static void xs_signal_handler(int sig) {
     if (sig >= 0 && sig < 32 && g_signal_handlers[sig] && g_signal_interp) {
         Value *sv = xs_int(sig);
