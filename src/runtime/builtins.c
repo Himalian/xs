@@ -2136,7 +2136,11 @@ Value *make_collections_module(void) {
 /* process module */
 static Value *native_process_pid(Interp *i, Value **a, int n) {
     (void)i;(void)a;(void)n;
+#ifdef __wasi__
+    return xs_int(0); /* WASI has no process identity */
+#else
     return xs_int((int64_t)getpid());
+#endif
 }
 static Value *native_process_run(Interp *i, Value **a, int n) {
     (void)i;
@@ -2188,12 +2192,12 @@ static Value *native_process_spawn_stdin_write(Interp *ig, Value **a, int n) {
 #endif
 }
 
+#if !defined(__MINGW32__) && !defined(__wasi__)
 static Value *native_process_spawn_stdout_read(Interp *ig, Value **a, int n) {
     (void)ig;
     if (n < 1 || (VAL_TAG(a[0]) != XS_MAP && VAL_TAG(a[0]) != XS_MODULE)) return value_incref(XS_NULL_VAL);
     Value *fdv = map_get(a[0]->map, "_stdout_fd");
     if (!fdv || VAL_TAG(fdv) != XS_INT || VAL_INT(fdv) <= 0) return value_incref(XS_NULL_VAL);
-#if !defined(__MINGW32__) && !defined(__wasi__)
     int maxn = 4096;
     if (n >= 2 && VAL_TAG(a[1]) == XS_INT) maxn = (int)VAL_INT(a[1]);
     char *buf = xs_malloc(maxn + 1);
@@ -2201,9 +2205,6 @@ static Value *native_process_spawn_stdout_read(Interp *ig, Value **a, int n) {
     if (nr <= 0) { free(buf); return value_incref(XS_NULL_VAL); }
     buf[nr] = '\0';
     Value *v = xs_str_n(buf, nr); free(buf); return v;
-#else
-    return value_incref(XS_NULL_VAL);
-#endif
 }
 
 static Value *native_process_spawn_stderr_read(Interp *ig, Value **a, int n) {
@@ -2211,7 +2212,6 @@ static Value *native_process_spawn_stderr_read(Interp *ig, Value **a, int n) {
     if (n < 1 || (VAL_TAG(a[0]) != XS_MAP && VAL_TAG(a[0]) != XS_MODULE)) return value_incref(XS_NULL_VAL);
     Value *fdv = map_get(a[0]->map, "_stderr_fd");
     if (!fdv || VAL_TAG(fdv) != XS_INT || VAL_INT(fdv) <= 0) return value_incref(XS_NULL_VAL);
-#if !defined(__MINGW32__) && !defined(__wasi__)
     int maxn = 4096;
     if (n >= 2 && VAL_TAG(a[1]) == XS_INT) maxn = (int)VAL_INT(a[1]);
     char *buf = xs_malloc(maxn + 1);
@@ -2219,9 +2219,6 @@ static Value *native_process_spawn_stderr_read(Interp *ig, Value **a, int n) {
     if (nr <= 0) { free(buf); return value_incref(XS_NULL_VAL); }
     buf[nr] = '\0';
     Value *v = xs_str_n(buf, nr); free(buf); return v;
-#else
-    return value_incref(XS_NULL_VAL);
-#endif
 }
 
 static Value *native_process_spawn_wait(Interp *ig, Value **a, int n) {
@@ -2229,7 +2226,6 @@ static Value *native_process_spawn_wait(Interp *ig, Value **a, int n) {
     if (n < 1 || (VAL_TAG(a[0]) != XS_MAP && VAL_TAG(a[0]) != XS_MODULE)) return xs_int(-1);
     Value *pidv = map_get(a[0]->map, "pid");
     if (!pidv || VAL_TAG(pidv) != XS_INT) return xs_int(-1);
-#if !defined(__MINGW32__) && !defined(__wasi__)
     int status = 0;
     waitpid((pid_t)VAL_INT(pidv), &status, 0);
     /* close remaining fds */
@@ -2241,10 +2237,8 @@ static Value *native_process_spawn_wait(Interp *ig, Value **a, int n) {
     if (se && VAL_TAG(se) == XS_INT && VAL_INT(se) > 0) { close((int)VAL_INT(se)); map_take(a[0]->map, "_stderr_fd", xs_int(0)); }
     if (WIFEXITED(status)) return xs_int(WEXITSTATUS(status));
     return xs_int(-1);
-#else
-    return xs_int(-1);
-#endif
 }
+#endif
 
 static Value *native_process_spawn_kill(Interp *ig, Value **a, int n) {
     (void)ig;
@@ -2389,6 +2383,7 @@ static Value *native_process_spawn(Interp *ig, Value **a, int n) {
 static Interp *g_signal_interp = NULL;
 static Value  *g_signal_handlers[32] = {0};
 
+#if !defined(__MINGW32__) && !defined(__wasi__)
 static void xs_signal_handler(int sig) {
     if (sig >= 0 && sig < 32 && g_signal_handlers[sig] && g_signal_interp) {
         Value *sv = xs_int(sig);
@@ -2398,6 +2393,7 @@ static void xs_signal_handler(int sig) {
         value_decref(sv);
     }
 }
+#endif
 
 static Value *native_process_on_signal(Interp *ig, Value **a, int n) {
 #if !defined(__MINGW32__) && !defined(__wasi__)
@@ -2996,11 +2992,19 @@ static Value *native_os_cpu_count(Interp *ig, Value **a, int n) {
 }
 static Value *native_os_pid(Interp *ig, Value **a, int n) {
     (void)ig;(void)a;(void)n;
+#ifdef __wasi__
+    return xs_int(0);
+#else
     return xs_int((int64_t)getpid());
+#endif
 }
 static Value *native_os_ppid(Interp *ig, Value **a, int n) {
     (void)ig;(void)a;(void)n;
+#ifdef __wasi__
+    return xs_int(0);
+#else
     return xs_int((int64_t)getppid());
+#endif
 }
 static Value *native_os_exit(Interp *ig, Value **a, int n) {
     (void)ig;

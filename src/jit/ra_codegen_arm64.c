@@ -229,58 +229,9 @@ static void a_add_reg(Emitter *e, int rd, int rn, int rm) {
     emit_u32(e, 0x8B000000u | ((uint32_t)(rm & 31) << 16) |
                  ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
 }
-/* SUB xd, xn, xm. */
-static void a_sub_reg(Emitter *e, int rd, int rn, int rm) {
-    emit_u32(e, 0xCB000000u | ((uint32_t)(rm & 31) << 16) |
-                 ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
-}
 /* MUL xd, xn, xm  (MADD xd, xn, xm, xzr). */
 static void a_mul_reg(Emitter *e, int rd, int rn, int rm) {
     emit_u32(e, 0x9B007C00u | ((uint32_t)(rm & 31) << 16) |
-                 ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
-}
-/* SDIV xd, xn, xm. */
-static void a_sdiv_reg(Emitter *e, int rd, int rn, int rm) {
-    emit_u32(e, 0x9AC00C00u | ((uint32_t)(rm & 31) << 16) |
-                 ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
-}
-/* MSUB xd, xn, xm, xa  (used to synthesise modulo: xd = xa - xn*xm). */
-static void a_msub_reg(Emitter *e, int rd, int rn, int rm, int ra) {
-    emit_u32(e, 0x9B008000u | ((uint32_t)(rm & 31) << 16) |
-                 ((uint32_t)(ra & 31) << 10) |
-                 ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
-}
-/* AND xd, xn, xm. */
-static void a_and_reg(Emitter *e, int rd, int rn, int rm) {
-    emit_u32(e, 0x8A000000u | ((uint32_t)(rm & 31) << 16) |
-                 ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
-}
-/* ORR xd, xn, xm. */
-static void a_orr_reg(Emitter *e, int rd, int rn, int rm) {
-    emit_u32(e, 0xAA000000u | ((uint32_t)(rm & 31) << 16) |
-                 ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
-}
-/* EOR xd, xn, xm. */
-static void a_eor_reg(Emitter *e, int rd, int rn, int rm) {
-    emit_u32(e, 0xCA000000u | ((uint32_t)(rm & 31) << 16) |
-                 ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
-}
-/* MVN xd, xm   (ORN xd, xzr, xm). */
-static void a_mvn_reg(Emitter *e, int rd, int rm) {
-    emit_u32(e, 0xAA2003E0u | ((uint32_t)(rm & 31) << 16) | (uint32_t)(rd & 31));
-}
-/* NEG xd, xm   (SUB xd, xzr, xm). */
-static void a_neg_reg(Emitter *e, int rd, int rm) {
-    emit_u32(e, 0xCB0003E0u | ((uint32_t)(rm & 31) << 16) | (uint32_t)(rd & 31));
-}
-/* LSL xd, xn, xm (UDF via LSLV). */
-static void a_lsl_reg(Emitter *e, int rd, int rn, int rm) {
-    emit_u32(e, 0x9AC02000u | ((uint32_t)(rm & 31) << 16) |
-                 ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
-}
-/* ASR xd, xn, xm. */
-static void a_asr_reg(Emitter *e, int rd, int rn, int rm) {
-    emit_u32(e, 0x9AC02800u | ((uint32_t)(rm & 31) << 16) |
                  ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31));
 }
 /* CMP xn, xm  (SUBS xzr, xn, xm). */

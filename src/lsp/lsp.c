@@ -974,7 +974,7 @@ static void build_hover_text(Node *decl, const char *name, char *out, size_t out
         return;
     }
 
-    const char *kind = node_tag_name(VAL_TAG(decl));
+    const char *kind = node_tag_name((NodeTag)VAL_TAG(decl));
 
     switch (VAL_TAG(decl)) {
     case NODE_FN_DECL: {

@@ -120,9 +120,9 @@ static void check_literal_type(SemaCtx *ctx, TypeExpr *te, Node *val) {
     if (g_tc_ran) return; /* full type checker already handled this */
     if (!te || !val) return;
     if (te->kind != TEXPR_NAMED || !te->name) return;
-    const char *lit = literal_type_name(VAL_TAG(val));
+    const char *lit = literal_type_name((NodeTag)VAL_TAG(val));
     if (!lit) return;
-    if (!ann_matches_literal(te->name, VAL_TAG(val))) {
+    if (!ann_matches_literal(te->name, (NodeTag)VAL_TAG(val))) {
         Diagnostic *d = diag_new(DIAG_ERROR, DIAG_PHASE_SEMANTIC, "T0010",
             "type mismatch: expected '%s', got %s literal", te->name, lit);
         diag_annotate(d, val->span, 1, "expected '%s'", te->name);

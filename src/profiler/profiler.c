@@ -31,6 +31,7 @@ struct XSProfiler {
 
 static XSProfiler *g_profiler = NULL;
 
+#if !defined(_WIN32) && !defined(__wasi__)
 static unsigned int xorshift_state = 1;
 static unsigned int xorshift32(void) {
     unsigned int x = xorshift_state;
@@ -39,7 +40,6 @@ static unsigned int xorshift32(void) {
     return x;
 }
 
-#if !defined(_WIN32) && !defined(__wasi__)
 static void sigprof_handler(int sig) {
     (void)sig;
     if (g_profiler && g_profiler->running) {

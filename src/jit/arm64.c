@@ -1305,86 +1305,8 @@ static void compile_call_indirect(ARM64Code *c) {
  * Executable memory management
  * ---------------------------------------------------------------- */
 
-#if JIT_ARM64
-
-#if defined(__linux__) || defined(__FreeBSD__)
-#include <sys/mman.h>
-#include <unistd.h>
-#endif
-
-#if defined(__APPLE__)
-#include <sys/mman.h>
-#include <unistd.h>
-#include <pthread.h>
-#endif
-
-typedef struct ARM64JIT {
-    uint8_t *code_buf;
-    size_t   code_size;
-    size_t   code_used;
-    int      available;
-} ARM64JIT;
-
-static ARM64JIT *arm64_jit_new(size_t size) {
-    ARM64JIT *jit = xs_calloc(1, sizeof(ARM64JIT));
-    jit->code_size = size;
-    jit->code_used = 0;
-
-#if defined(__APPLE__)
-    /* macOS ARM64: use MAP_JIT */
-    jit->code_buf = mmap(NULL, size,
-                         PROT_READ | PROT_WRITE | PROT_EXEC,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
-#else
-    /* Linux: mmap RWX */
-    jit->code_buf = mmap(NULL, size,
-                         PROT_READ | PROT_WRITE | PROT_EXEC,
-                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-#endif
-
-    if (jit->code_buf == MAP_FAILED) {
-        jit->code_buf = NULL;
-        jit->available = 0;
-    } else {
-        jit->available = 1;
-    }
-
-    return jit;
-}
-
-static void arm64_jit_free(ARM64JIT *jit) {
-    if (jit->code_buf)
-        munmap(jit->code_buf, jit->code_size);
-    free(jit);
-}
-
-/* copy generated code into executable memory and flush caches */
-static void *arm64_jit_install(ARM64JIT *jit, ARM64Code *code) {
-    if (!jit->available || !code->code) return NULL;
-    if (jit->code_used + code->len > jit->code_size) return NULL;
-
-    void *dest = jit->code_buf + jit->code_used;
-
-#if defined(__APPLE__)
-    /* macOS: toggle write protection for MAP_JIT pages */
-    pthread_jit_write_protect_np(0);
-    memcpy(dest, code->code, code->len);
-    pthread_jit_write_protect_np(1);
-#else
-    memcpy(dest, code->code, code->len);
-#endif
-
-    jit->code_used += code->len;
-    /* pad to 16-byte alignment */
-    jit->code_used = (jit->code_used + 15) & ~(size_t)15;
-
-    /* flush instruction cache */
-    __builtin___clear_cache((char *)dest, (char *)dest + code->len);
-
-    return dest;
-}
-
-#endif /* JIT_ARM64 */
+/* Executable-memory management lives in jit.c / ra_codegen_arm64.c;
+   the arm64 encoder here just emits instruction words into a buffer. */
 
 /* ----------------------------------------------------------------
  * Platform detection and dispatch

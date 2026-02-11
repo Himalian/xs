@@ -6023,7 +6023,7 @@ do_call: ;
         if (has_decls == -1) {
             has_decls = 0;
             for (int j = 0; j < n->block.stmts.len; j++) {
-                NodeTag t = VAL_TAG(n->block.stmts.items[j]);
+                NodeTag t = (NodeTag)VAL_TAG(n->block.stmts.items[j]);
                 if (t==NODE_LET||t==NODE_VAR||t==NODE_CONST||
                     t==NODE_FN_DECL||t==NODE_CLASS_DECL||
                     t==NODE_STRUCT_DECL||t==NODE_ENUM_DECL) {
@@ -6647,7 +6647,7 @@ do_call: ;
         /* check for RT_HOOK_EXEC runtime hooks matching this node type */
         PluginPipeline *exec_pp = (PluginPipeline *)i->pipeline;
         if (exec_pp && exec_pp->nruntime_hooks > 0) {
-            const char *tag_name = node_tag_to_string(VAL_TAG(n));
+            const char *tag_name = node_tag_to_string((NodeTag)VAL_TAG(n));
             for (int rh = 0; rh < exec_pp->nruntime_hooks; rh++) {
                 RuntimePluginHook *hook = &exec_pp->runtime_hooks[rh];
                 if (hook->kind != RT_HOOK_EXEC || !hook->callback) continue;
@@ -7217,7 +7217,7 @@ static int node_tag_from_string(const char *s) {
 static Value *node_to_xs_map(Node *n) {
     if (!n) return value_incref(XS_NULL_VAL);
     Value *m = xs_map_new();
-    map_set(m->map, "tag", xs_str(node_tag_to_string(VAL_TAG(n))));
+    map_set(m->map, "tag", xs_str(node_tag_to_string((NodeTag)VAL_TAG(n))));
     if (n->span.line > 0) map_take(m->map, "line", xs_int(n->span.line));
 
     switch (VAL_TAG(n)) {
@@ -8854,7 +8854,7 @@ static Node *walk_node_for_passes(Interp *interp, Node *n, CustomPass *pass) {
         if (!tag_match && pass->visitor_tags[v] == -1) {
             /* name-based matching for custom/unresolved tag names */
             if (pass->visitor_names && pass->visitor_names[v]) {
-                const char *cur_tag = node_tag_to_string(VAL_TAG(n));
+                const char *cur_tag = node_tag_to_string((NodeTag)VAL_TAG(n));
                 tag_match = (strcmp(pass->visitor_names[v], cur_tag) == 0);
             } else {
                 tag_match = 1; /* wildcard: no name, match all */

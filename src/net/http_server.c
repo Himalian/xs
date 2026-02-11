@@ -31,7 +31,9 @@
 #define ssize_t int
 #define read(fd, buf, len)  recv(fd, buf, len, 0)
 #define write(fd, buf, len) send(fd, buf, len, 0)
+#ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
+#endif
 #else
 #include <unistd.h>
 #include <fcntl.h>
@@ -1352,12 +1354,14 @@ void http_server_static(HTTPServer *s, const char *prefix,
     router_add_static(s->router, prefix, dir);
 }
 
+#ifndef _WIN32
 static void on_sigint(int fd, EventType ev, void *ctx) {
     (void)fd; (void)ev;
     HTTPServer *s = (HTTPServer *)ctx;
     fprintf(stderr, "\nShutting down...\n");
     http_server_stop(s);
 }
+#endif
 
 int http_server_start(HTTPServer *s) {
     if (!s) return -1;

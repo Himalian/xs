@@ -12,6 +12,7 @@ XSC_ENABLE_LSP     ?= 1
 XSC_ENABLE_DAP     ?= 1
 
 # Platform detection
+STRIP_FLAG = -s
 ifeq ($(OS),Windows_NT)
   CFLAGS  += -D__USE_MINGW_ANSI_STDIO=1 -D_WIN32
   LDFLAGS += -lws2_32 -lpsapi -static
@@ -34,8 +35,9 @@ else
     LDFLAGS += -ldl
   endif
   ifeq ($(UNAME),Darwin)
-    # macOS: no -ldl needed (dlopen is in libc)
+    # macOS: no -ldl needed (dlopen is in libc); Apple ld rejects -s
     CFLAGS += -Wno-unused-command-line-argument
+    STRIP_FLAG =
   endif
   TARGET = xs
 endif
@@ -218,7 +220,7 @@ release: CFLAGS = -O3 -Wall -Wextra -Wno-unused-parameter -std=c11 -Isrc -Isrc/t
 # AES path trips a false positive once the interleave helpers get
 # inlined. The compile-time suppression is in the per-file rule above;
 # mirror it at link time so LTO stays quiet too.
-release: LDFLAGS += -flto -s -Wno-maybe-uninitialized
+release: LDFLAGS += -flto $(STRIP_FLAG) -Wno-maybe-uninitialized
 release: clean $(TARGET)
 
 test: $(TARGET)

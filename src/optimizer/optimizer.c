@@ -698,7 +698,7 @@ Node *opt_strength_reduce(Node *node, int *count) {
             Node *mul = node_new(NODE_BINOP, span);
             strcpy(mul->binop.op, "*");
             mul->binop.left = left;
-            Node *dup = node_new(VAL_TAG(left), left->span);
+            Node *dup = node_new((NodeTag)VAL_TAG(left), left->span);
             *dup = *left;
             if (VAL_TAG(left) == NODE_IDENT && left->ident.name)
                 dup->ident.name = xs_strdup(left->ident.name);
@@ -852,7 +852,7 @@ static Node *substitute_idents(Node *node,
 
 static Node *node_dup(const Node *n) {
     if (!n) return NULL;
-    Node *d = node_new(VAL_TAG(n), n->span);
+    Node *d = node_new((NodeTag)VAL_TAG(n), n->span);
     switch (VAL_TAG(n)) {
     case NODE_LIT_INT:
         d->lit_int.ival = n->lit_int.ival;
