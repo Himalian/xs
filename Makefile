@@ -58,6 +58,7 @@ COMPILER_SRCS = src/compiler/match_compiler.c
 
 RUNTIME_SRCS = src/runtime/interp.c \
                src/runtime/builtins.c \
+               src/runtime/builtins_math.c \
                src/runtime/error.c \
                src/runtime/stdlib.c \
                src/runtime/scheduler.c \
