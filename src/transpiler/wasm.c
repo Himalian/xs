@@ -4544,7 +4544,9 @@ static void emit_rt_val_index_set(WasmBuf *body) {
 }
 
 /* $val_field(obj, name_str) -> i32
-   Get field by name - delegates to map_get for map-based objects. */
+   Field access over the map-backed object model. Structs / classes
+   share that layout, so this resolves fields, method lookups, and
+   free-form object access via one path. */
 static void emit_rt_val_field(WasmBuf *body) {
     /* local 0 = obj, local 1 = name_str */
     emit_local_get(body, 0);
@@ -4559,6 +4561,83 @@ static void emit_rt_val_field_set(WasmBuf *body) {
     emit_local_get(body, 1);
     emit_local_get(body, 2);
     emit_call(body, RT_MAP_SET);
+}
+
+/* $val_pow(a, b) -> i32
+   Integer exponentiation by squaring. Negative exponents collapse to 0
+   (same as the interpreter's integer pow path); callers that need
+   fractional powers must upcast to float first. */
+static void emit_rt_val_pow(WasmBuf *body) {
+    /* locals 0,1 = a,b (params); 2 = base, 3 = exp, 4 = result */
+    /* extract int payloads */
+    emit_local_get(body, 0);
+    emit_call(body, RT_VAL_I32);
+    emit_local_set(body, 2);        /* base = a.i */
+    emit_local_get(body, 1);
+    emit_call(body, RT_VAL_I32);
+    emit_local_set(body, 3);        /* exp = b.i */
+
+    /* result = 1 */
+    emit_i32(body, 1);
+    emit_local_set(body, 4);
+
+    /* if exp < 0 -> result = 0, skip loop */
+    emit_local_get(body, 3);
+    emit_i32(body, 0);
+    buf_byte(body, OP_I32_LT_S);
+    buf_byte(body, OP_IF);
+    buf_byte(body, WASM_TYPE_VOID);
+      emit_i32(body, 0);
+      emit_local_set(body, 4);
+      emit_i32(body, 0);
+      emit_local_set(body, 3);
+    buf_byte(body, OP_END);
+
+    /* loop: while (exp > 0) { if (exp&1) result *= base; base *= base; exp >>= 1; } */
+    buf_byte(body, OP_BLOCK);
+    buf_byte(body, WASM_TYPE_VOID);
+      buf_byte(body, OP_LOOP);
+      buf_byte(body, WASM_TYPE_VOID);
+        /* exit when exp == 0 */
+        emit_local_get(body, 3);
+        buf_byte(body, OP_I32_EQZ);
+        buf_byte(body, OP_BR_IF);
+        buf_leb128_u(body, 1);  /* branch out of block */
+
+        /* if (exp & 1) result *= base */
+        emit_local_get(body, 3);
+        emit_i32(body, 1);
+        buf_byte(body, OP_I32_AND);
+        buf_byte(body, OP_IF);
+        buf_byte(body, WASM_TYPE_VOID);
+          emit_local_get(body, 4);
+          emit_local_get(body, 2);
+          buf_byte(body, OP_I32_MUL);
+          emit_local_set(body, 4);
+        buf_byte(body, OP_END);
+
+        /* base *= base */
+        emit_local_get(body, 2);
+        emit_local_get(body, 2);
+        buf_byte(body, OP_I32_MUL);
+        emit_local_set(body, 2);
+
+        /* exp >>= 1 */
+        emit_local_get(body, 3);
+        emit_i32(body, 1);
+        buf_byte(body, OP_I32_SHR_S);
+        emit_local_set(body, 3);
+
+        /* continue loop */
+        buf_byte(body, OP_BR);
+        buf_leb128_u(body, 0);
+      buf_byte(body, OP_END);   /* loop */
+    buf_byte(body, OP_END);     /* block */
+
+    /* return val_new(TAG_INT, result) */
+    emit_i32(body, TAG_INT);
+    emit_local_get(body, 4);
+    emit_call(body, RT_VAL_NEW);
 }
 
 /* $struct_new(name_str, n_fields) -> i32 (struct value)
@@ -5998,8 +6077,8 @@ int transpile_wasm(Node *program, const char *filename, const char *out_path) {
         build_rt_arith_func(&sec, 2, 1, OP_I32_XOR);
         build_rt_arith_func(&sec, 2, 1, OP_I32_SHL);
         build_rt_arith_func(&sec, 2, 1, OP_I32_SHR_S);
-        /* 42: $val_pow (simplified: use mul as placeholder) */
-        build_rt_arith_func(&sec, 2, 1, OP_I32_MUL);
+        /* 42: $val_pow (integer exponentiation by squaring) */
+        build_rt_func(&sec, 2, 3, emit_rt_val_pow);
         /* 43: $range_new */
         build_rt_func(&sec, 3, 2, emit_rt_range_new);
         /* 44: $val_ne */
