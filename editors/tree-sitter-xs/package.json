@@ -1,0 +1,33 @@
+{
+  "name": "tree-sitter-xs",
+  "version": "0.1.0",
+  "description": "tree-sitter grammar for the XS language",
+  "main": "bindings/node",
+  "keywords": ["parser", "tree-sitter", "xs"],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xs-lang0/xs.git",
+    "directory": "editors/tree-sitter-xs"
+  },
+  "tree-sitter": [
+    {
+      "scope": "source.xs",
+      "file-types": ["xs"],
+      "highlights": "queries/highlights.scm",
+      "injection-regex": "^xs$"
+    }
+  ],
+  "dependencies": {
+    "node-addon-api": "^7.0.0",
+    "node-gyp-build": "^4.8.0"
+  },
+  "devDependencies": {
+    "tree-sitter-cli": "^0.22.0"
+  },
+  "scripts": {
+    "build": "tree-sitter build",
+    "test": "tree-sitter test",
+    "parse": "tree-sitter parse"
+  }
+}
