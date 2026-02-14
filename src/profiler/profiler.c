@@ -4,9 +4,11 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#if !defined(__wasi__)
-#include <signal.h>
-#include <sys/time.h>
+#if defined(_WIN32)
+#  include <windows.h>
+#elif !defined(__wasi__)
+#  include <signal.h>
+#  include <sys/time.h>
 #endif
 #include <time.h>
 
@@ -31,7 +33,7 @@ struct XSProfiler {
 
 static XSProfiler *g_profiler = NULL;
 
-#if !defined(_WIN32) && !defined(__wasi__)
+#if !defined(__wasi__)
 static unsigned int xorshift_state = 1;
 static unsigned int xorshift32(void) {
     unsigned int x = xorshift_state;
@@ -40,8 +42,7 @@ static unsigned int xorshift32(void) {
     return x;
 }
 
-static void sigprof_handler(int sig) {
-    (void)sig;
+static void profiler_tick(void) {
     if (g_profiler && g_profiler->running) {
         if (g_profiler->sample_rate > 0.0 && g_profiler->sample_rate < 1.0) {
             double r = (double)(xorshift32() & 0xFFFF) / 65535.0;
@@ -49,6 +50,20 @@ static void sigprof_handler(int sig) {
         }
         profiler_sample(g_profiler, g_profiler->current_fn, g_profiler->current_line);
     }
+}
+#endif
+
+#if defined(_WIN32)
+static HANDLE g_timer_queue = NULL;
+static HANDLE g_timer_handle = NULL;
+static VOID CALLBACK profiler_win32_cb(PVOID ctx, BOOLEAN fired) {
+    (void)ctx; (void)fired;
+    profiler_tick();
+}
+#elif !defined(__wasi__)
+static void sigprof_handler(int sig) {
+    (void)sig;
+    profiler_tick();
 }
 #endif
 
@@ -81,7 +96,14 @@ void profiler_start(XSProfiler *p) {
     clock_gettime(CLOCK_MONOTONIC, &p->start_time);
 
     g_profiler = p;
-#if !defined(_WIN32) && !defined(__wasi__)
+#if defined(_WIN32)
+    if (!g_timer_queue) g_timer_queue = CreateTimerQueue();
+    if (g_timer_queue) {
+        CreateTimerQueueTimer(&g_timer_handle, g_timer_queue,
+            profiler_win32_cb, NULL, 1 /* due */, 1 /* period ms */,
+            WT_EXECUTEINTIMERTHREAD);
+    }
+#elif !defined(__wasi__)
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigprof_handler;
@@ -101,7 +123,12 @@ void profiler_start(XSProfiler *p) {
 void profiler_stop(XSProfiler *p) {
     if (!p) return;
 
-#if !defined(_WIN32) && !defined(__wasi__)
+#if defined(_WIN32)
+    if (g_timer_handle && g_timer_queue) {
+        DeleteTimerQueueTimer(g_timer_queue, g_timer_handle, NULL);
+        g_timer_handle = NULL;
+    }
+#elif !defined(__wasi__)
     struct itimerval timer;
     memset(&timer, 0, sizeof(timer));
     setitimer(ITIMER_PROF, &timer, NULL);
