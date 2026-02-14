@@ -45,12 +45,19 @@ void xs_set_argv(int argc, char **argv) {
 #  include <sys/stat.h>
 #  include <dirent.h>
 #  include <glob.h>
+#  include <fcntl.h>
 #  if defined(__linux__)
 #    include <sys/inotify.h>
+#  endif
+#  if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
+      defined(__OpenBSD__) || defined(__DragonFly__)
+#    include <sys/event.h>
 #  endif
 #  include <sys/wait.h>
 #  include <signal.h>
 #  include <netinet/tcp.h>
+#elif defined(_WIN32) && !defined(__wasi__)
+#  include <windows.h>
 #elif !defined(__MINGW32__)
 #  include <sys/stat.h>
 #  include <errno.h>
@@ -7689,16 +7696,21 @@ static Value *native_fs_realpath(Interp *ig, Value **a, int n) {
     return value_incref(XS_NULL_VAL);
 }
 
-/* fs.watch(path, callback) - inotify-based file watcher (Linux only, stub elsewhere) */
+/* fs.watch(path, callback) - single-shot watcher that blocks until the
+   first filesystem event, calls callback({type, name}), then returns.
+   Linux uses inotify, macOS/BSD use kqueue/EVFILT_VNODE, Windows uses
+   ReadDirectoryChangesW. Other platforms return false. */
 static Value *native_fs_watch(Interp *ig, Value **a, int n) {
     (void)ig;
-#if defined(__linux__) && !defined(__wasi__)
-    if (n < 2 || VAL_TAG(a[0]) != XS_STR || (VAL_TAG(a[1]) != XS_FUNC && VAL_TAG(a[1]) != XS_NATIVE))
+    if (n < 2 || VAL_TAG(a[0]) != XS_STR ||
+        (VAL_TAG(a[1]) != XS_FUNC && VAL_TAG(a[1]) != XS_NATIVE))
         return value_incref(XS_FALSE_VAL);
-    /* single-shot watch: block until one event, call callback, return */
+
+#if defined(__linux__) && !defined(__wasi__)
     int ifd = inotify_init();
     if (ifd < 0) return value_incref(XS_FALSE_VAL);
-    int wd = inotify_add_watch(ifd, a[0]->s, IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVE);
+    int wd = inotify_add_watch(ifd, a[0]->s,
+        IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVE);
     if (wd < 0) { close(ifd); return value_incref(XS_FALSE_VAL); }
     char evbuf[4096];
     ssize_t len = read(ifd, evbuf, sizeof(evbuf));
@@ -7712,7 +7724,8 @@ static Value *native_fs_watch(Interp *ig, Value **a, int n) {
         else if (ev->mask & IN_MOVE) etype = "move";
         Value *tv = xs_str(etype); map_set(info->map, "type", tv); value_decref(tv);
         if (ev->len > 0) {
-            Value *nv = xs_str(ev->name); map_set(info->map, "name", nv); value_decref(nv);
+            Value *nv = xs_str(ev->name);
+            map_set(info->map, "name", nv); value_decref(nv);
         }
         Value *cb_args[1] = { info };
         Value *r = call_value(ig, a[1], cb_args, 1, "fs.watch");
@@ -7722,6 +7735,83 @@ static Value *native_fs_watch(Interp *ig, Value **a, int n) {
     inotify_rm_watch(ifd, wd);
     close(ifd);
     return value_incref(XS_TRUE_VAL);
+
+#elif (defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
+       defined(__OpenBSD__) || defined(__DragonFly__)) && !defined(__wasi__)
+    int kq = kqueue();
+    if (kq < 0) return value_incref(XS_FALSE_VAL);
+    int fd = open(a[0]->s, O_EVTONLY);
+    if (fd < 0) { close(kq); return value_incref(XS_FALSE_VAL); }
+    struct kevent reg, out;
+    EV_SET(&reg, fd, EVFILT_VNODE, EV_ADD | EV_CLEAR,
+           NOTE_WRITE | NOTE_DELETE | NOTE_EXTEND | NOTE_RENAME | NOTE_ATTRIB,
+           0, NULL);
+    if (kevent(kq, &reg, 1, NULL, 0, NULL) < 0) {
+        close(fd); close(kq); return value_incref(XS_FALSE_VAL);
+    }
+    if (kevent(kq, NULL, 0, &out, 1, NULL) > 0) {
+        const char *etype = "unknown";
+        if (out.fflags & NOTE_DELETE) etype = "delete";
+        else if (out.fflags & NOTE_RENAME) etype = "move";
+        else if (out.fflags & (NOTE_WRITE | NOTE_EXTEND)) etype = "modify";
+        else if (out.fflags & NOTE_ATTRIB) etype = "modify";
+        Value *info = xs_map_new();
+        Value *tv = xs_str(etype); map_set(info->map, "type", tv); value_decref(tv);
+        /* kqueue doesn't report filenames inside a watched directory */
+        Value *cb_args[1] = { info };
+        Value *r = call_value(ig, a[1], cb_args, 1, "fs.watch");
+        if (r) value_decref(r);
+        value_decref(info);
+    }
+    close(fd); close(kq);
+    return value_incref(XS_TRUE_VAL);
+
+#elif defined(_WIN32) && !defined(__wasi__)
+    HANDLE dir = CreateFileA(a[0]->s, FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (dir == INVALID_HANDLE_VALUE) return value_incref(XS_FALSE_VAL);
+    /* align on DWORD per ReadDirectoryChangesW requirements */
+    unsigned char buf[4096] __attribute__((aligned(sizeof(DWORD))));
+    DWORD bytes = 0;
+    BOOL ok = ReadDirectoryChangesW(dir, buf, sizeof(buf), FALSE,
+        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+        FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+        &bytes, NULL, NULL);
+    if (ok && bytes > 0) {
+        FILE_NOTIFY_INFORMATION *fni = (FILE_NOTIFY_INFORMATION *)buf;
+        const char *etype = "unknown";
+        switch (fni->Action) {
+            case FILE_ACTION_ADDED:
+            case FILE_ACTION_RENAMED_NEW_NAME: etype = "create"; break;
+            case FILE_ACTION_REMOVED:
+            case FILE_ACTION_RENAMED_OLD_NAME: etype = "delete"; break;
+            case FILE_ACTION_MODIFIED:         etype = "modify"; break;
+        }
+        /* convert UTF-16 filename to UTF-8 */
+        int wlen = (int)(fni->FileNameLength / sizeof(WCHAR));
+        int need = WideCharToMultiByte(CP_UTF8, 0, fni->FileName, wlen,
+                                       NULL, 0, NULL, NULL);
+        char *name = (char *)malloc((size_t)need + 1);
+        if (name) {
+            WideCharToMultiByte(CP_UTF8, 0, fni->FileName, wlen,
+                                name, need, NULL, NULL);
+            name[need] = '\0';
+        }
+        Value *info = xs_map_new();
+        Value *tv = xs_str(etype); map_set(info->map, "type", tv); value_decref(tv);
+        if (name) {
+            Value *nv = xs_str(name); map_set(info->map, "name", nv); value_decref(nv);
+            free(name);
+        }
+        Value *cb_args[1] = { info };
+        Value *r = call_value(ig, a[1], cb_args, 1, "fs.watch");
+        if (r) value_decref(r);
+        value_decref(info);
+    }
+    CloseHandle(dir);
+    return value_incref(XS_TRUE_VAL);
+
 #else
     (void)a; (void)n;
     return value_incref(XS_FALSE_VAL);
