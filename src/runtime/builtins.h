@@ -28,6 +28,12 @@ Value *make_url_module(void);
 Value *make_re_module(void);
 Value *make_process_module(void);
 Value *make_io_module(void);
+Value *make_os_module(struct Interp *ig);
+
+/* shared stdlib helpers exposed across the split builtins files */
+int   xs_io_mkdirs(const char *path);
+extern int    g_xs_argc;
+extern char **g_xs_argv;
 Value *make_async_module(void);
 Value *make_net_module(void);
 Value *make_crypto_module(void);
