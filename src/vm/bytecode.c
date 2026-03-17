@@ -99,19 +99,43 @@ static void write_str(FILE *f, const char *s) {
     if (len) fwrite(s, 1, len, f);
 }
 
-/* Short reads leave v at zero; corrupt bytecode surfaces as a null/0 slot
-   rather than a crash. Callers that care (proto_read_file) also verify
-   the magic header before trusting anything. */
-static uint8_t  read_u8(FILE *f)  { uint8_t v = 0;  (void)!fread(&v, 1, 1, f); return v; }
-static uint16_t read_u16(FILE *f) { uint16_t v = 0; (void)!fread(&v, 2, 1, f); return v; }
-static uint32_t read_u32(FILE *f) { uint32_t v = 0; (void)!fread(&v, 4, 1, f); return v; }
-static int64_t  read_i64(FILE *f) { int64_t v = 0;  (void)!fread(&v, 8, 1, f); return v; }
-static double   read_f64(FILE *f) { double v = 0;   (void)!fread(&v, 8, 1, f); return v; }
-static char *read_str(FILE *f) {
-    uint16_t len = read_u16(f);
+/* Two backing readers: one wraps a FILE*, one walks a memory buffer
+   (used by xs_run_bytecode on platforms without a filesystem). Short
+   reads leave the destination at zero; corrupt bytecode surfaces as a
+   null/0 slot rather than a crash. Callers that care also check the
+   magic header before trusting anything past it. */
+typedef struct {
+    FILE          *file;
+    const uint8_t *buf;
+    size_t         size;
+    size_t         pos;
+} Reader;
+
+static void rd_init_file(Reader *r, FILE *f) {
+    r->file = f; r->buf = NULL; r->size = 0; r->pos = 0;
+}
+static void rd_init_buf(Reader *r, const uint8_t *buf, size_t size) {
+    r->file = NULL; r->buf = buf; r->size = size; r->pos = 0;
+}
+static size_t rd_read(Reader *r, void *dst, size_t n) {
+    if (r->file) return fread(dst, 1, n, r->file);
+    size_t avail = r->pos < r->size ? r->size - r->pos : 0;
+    if (n > avail) n = avail;
+    if (n) memcpy(dst, r->buf + r->pos, n);
+    r->pos += n;
+    return n;
+}
+
+static uint8_t  read_u8(Reader *r)  { uint8_t v = 0;  rd_read(r, &v, 1); return v; }
+static uint16_t read_u16(Reader *r) { uint16_t v = 0; rd_read(r, &v, 2); return v; }
+static uint32_t read_u32(Reader *r) { uint32_t v = 0; rd_read(r, &v, 4); return v; }
+static int64_t  read_i64(Reader *r) { int64_t v = 0;  rd_read(r, &v, 8); return v; }
+static double   read_f64(Reader *r) { double v = 0;   rd_read(r, &v, 8); return v; }
+static char *read_str(Reader *r) {
+    uint16_t len = read_u16(r);
     if (!len) return NULL;
     char *s = xs_malloc(len + 1);
-    (void)!fread(s, 1, len, f);
+    rd_read(r, s, len);
     s[len] = 0;
     return s;
 }
@@ -158,46 +182,46 @@ int proto_write_file(XSProto *p, const char *path) {
     return 0;
 }
 
-static XSProto *proto_read(FILE *f) {
-    char *name = read_str(f);
-    int arity = read_u16(f);
+static XSProto *proto_read(Reader *r) {
+    char *name = read_str(r);
+    int arity = read_u16(r);
     XSProto *p = proto_new(name, arity);
     free(name);
-    p->nlocals = read_u16(f);
-    p->n_upvalues = read_u16(f);
+    p->nlocals = read_u16(r);
+    p->n_upvalues = read_u16(r);
     /* code */
-    int ncode = (int)read_u32(f);
+    int ncode = (int)read_u32(r);
     for (int i = 0; i < ncode; i++)
-        chunk_write(&p->chunk, read_u32(f));
+        chunk_write(&p->chunk, read_u32(r));
     /* constants */
-    int nconsts = read_u16(f);
+    int nconsts = read_u16(r);
     for (int i = 0; i < nconsts; i++) {
-        uint8_t tag = read_u8(f);
+        uint8_t tag = read_u8(r);
         Value *v = NULL;
         switch (tag) {
             case 0: v = xs_null(); break;
-            case 1: v = xs_int(read_i64(f)); break;
-            case 2: v = xs_float(read_f64(f)); break;
-            case 3: { char *s = read_str(f); v = xs_str(s ? s : ""); free(s); break; }
-            case 4: v = read_u8(f) ? xs_bool(1) : xs_bool(0); break;
+            case 1: v = xs_int(read_i64(r)); break;
+            case 2: v = xs_float(read_f64(r)); break;
+            case 3: { char *s = read_str(r); v = xs_str(s ? s : ""); free(s); break; }
+            case 4: v = read_u8(r) ? xs_bool(1) : xs_bool(0); break;
             default: v = xs_null(); break;
         }
         chunk_add_const(&p->chunk, v);
         value_decref(v);
     }
     /* upvalue descriptors */
-    int nuv = read_u16(f);
+    int nuv = read_u16(r);
     if (nuv > 0) {
         p->uv_descs = xs_malloc(nuv * sizeof(UVDesc));
         for (int i = 0; i < nuv; i++) {
-            p->uv_descs[i].is_local = read_u8(f);
-            p->uv_descs[i].index = read_u16(f);
+            p->uv_descs[i].is_local = read_u8(r);
+            p->uv_descs[i].index = read_u16(r);
         }
     }
     /* inner protos */
-    int ninner = read_u16(f);
+    int ninner = read_u16(r);
     for (int i = 0; i < ninner; i++) {
-        XSProto *inner = proto_read(f);
+        XSProto *inner = proto_read(r);
         if (p->n_inner >= p->cap_inner) {
             p->cap_inner = p->cap_inner ? p->cap_inner * 2 : 4;
             p->inner = xs_realloc(p->inner, p->cap_inner * sizeof(XSProto*));
@@ -207,18 +231,28 @@ static XSProto *proto_read(FILE *f) {
     return p;
 }
 
+static int read_header(Reader *r) {
+    char magic[4] = {0};
+    if (rd_read(r, magic, 4) != 4 || memcmp(magic, "XSC", 4) != 0) return -1;
+    uint16_t ver = read_u16(r);
+    return ver == 1 ? 0 : -1;
+}
+
 XSProto *proto_read_file(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
-    char magic[4] = {0};
-    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "XSC", 4) != 0) {
-        fclose(f); return NULL;
-    }
-    uint16_t ver = read_u16(f);
-    if (ver != 1) { fclose(f); return NULL; }
-    XSProto *p = proto_read(f);
+    Reader r; rd_init_file(&r, f);
+    if (read_header(&r) < 0) { fclose(f); return NULL; }
+    XSProto *p = proto_read(&r);
     fclose(f);
     return p;
+}
+
+XSProto *proto_read_buf(const uint8_t *data, size_t size) {
+    if (!data || size < 6) return NULL;
+    Reader r; rd_init_buf(&r, data, size);
+    if (read_header(&r) < 0) return NULL;
+    return proto_read(&r);
 }
 
 void proto_dump(XSProto *p) {

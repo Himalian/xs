@@ -7,6 +7,7 @@
 #ifndef XS_EMBED_H
 #define XS_EMBED_H
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -104,6 +105,19 @@ const char *xs_result_error(XSResult r);
 /* ---- cleanup ---- */
 
 void xs_value_release(XSValue *v);
+
+/* ---- convenience wrappers (mobile / embedded) ---- */
+
+/* Evaluate a source string, return a heap-allocated repr of the result
+ * (or "error: ..." on failure). Caller must free() the returned pointer.
+ * Used by the iOS Swift bridge in book/src/mobile.md. */
+char *xs_eval_cstr(const char *src);
+
+/* Run a precompiled .xsc bytecode blob held in memory. Returns 0 on
+ * success, non-zero on load failure. The intended use case is ESP32 /
+ * embedded systems where the .xsc is linked into the firmware as a
+ * binary blob. ctx may be NULL; a private VM is used regardless. */
+int xs_run_bytecode(XSContext *ctx, const uint8_t *buf, size_t size);
 
 /* ---- resource limits ----
  *

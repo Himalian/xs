@@ -449,6 +449,60 @@ void xs_value_release(XSValue *v) {
     }
 }
 
+/* ================================================================
+ *  Convenience wrappers used by mobile + embedded hosts.
+ *  Single function that accepts a C string and returns a heap copy
+ *  of the result (or stringified error). Caller frees with free().
+ *  The Swift / Kotlin bridges in the book examples are small enough
+ *  that taking a raw cstring is the natural shape.
+ * ================================================================ */
+
+char *xs_eval_cstr(const char *src) {
+    if (!src) return NULL;
+    XSContext *ctx = xs_context_new();
+    if (!ctx) return NULL;
+    XSResult r = xs_eval(ctx, src);
+    char *out = NULL;
+    if (!r.ok) {
+        const char *msg = r.error ? r.error : "error";
+        size_t n = strlen(msg) + 8;
+        out = (char *)malloc(n);
+        if (out) snprintf(out, n, "error: %s", msg);
+    } else {
+        Value *v = (Value *)r.value._internal;
+        char *repr = v ? value_repr(v) : NULL;
+        if (!repr) {
+            repr = (char *)malloc(1);
+            if (repr) repr[0] = '\0';
+        }
+        out = repr;
+        xs_value_release(&r.value);
+    }
+    xs_context_free(ctx);
+    return out;
+}
+
+#ifdef XSC_ENABLE_VM
+#include "vm/bytecode.h"
+#include "vm/vm.h"
+
+int xs_run_bytecode(XSContext *ctx, const uint8_t *buf, size_t size) {
+    (void)ctx;
+    XSProto *p = proto_read_buf(buf, size);
+    if (!p) return -1;
+    VM *vm = vm_new();
+    vm_run(vm, p);
+    vm_free(vm);
+    proto_free(p);
+    return 0;
+}
+#else
+int xs_run_bytecode(XSContext *ctx, const uint8_t *buf, size_t size) {
+    (void)ctx; (void)buf; (void)size;
+    return -1;
+}
+#endif
+
 
 /* ================================================================
  *  Legacy API (XSState + stack-based)

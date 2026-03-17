@@ -8255,17 +8255,25 @@ static Value *native_tracer_active(Interp *interp, Value **args, int argc) {
 }
 
 void interp_setup_tracer_suppress(Interp *i) {
+#ifdef XSC_ENABLE_TRACER
     if (i && i->tracer)
         tracer_set_suppress_flag((XSTracer*)i->tracer, &g_in_eval_hook);
+#else
+    (void)i;
+#endif
 }
 
 /* native __tracer_write_prov(var_name, json_string) - write rich provenance to trace */
 static Value *native_tracer_write_prov(Interp *interp, Value **args, int argc) {
+#ifdef XSC_ENABLE_TRACER
     if (!interp->tracer || argc < 2) return xs_null();
     const char *var = (args[0] && VAL_TAG(args[0]) == XS_STR) ? args[0]->s : "?";
     const char *json = (args[1] && VAL_TAG(args[1]) == XS_STR) ? args[1]->s : "{}";
     /* force-write bypasses suppression so explicit plugin provenance goes through */
     tracer_record_provenance_force((XSTracer*)interp->tracer, var, "plugin", json, 0);
+#else
+    (void)interp; (void)args; (void)argc;
+#endif
     return xs_null();
 }
 

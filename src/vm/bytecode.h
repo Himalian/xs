@@ -181,5 +181,6 @@ void     proto_dump(XSProto *p);
 /* bytecode serialization (.xsc format) */
 int      proto_write_file(XSProto *p, const char *path);
 XSProto *proto_read_file(const char *path);
+XSProto *proto_read_buf(const uint8_t *data, size_t size);
 
 #endif /* BYTECODE_H */

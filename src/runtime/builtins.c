@@ -10,7 +10,7 @@
 #include "core/msgpack.h"
 #include "runtime/async.h"
 #include "runtime/concurrent.h"
-#ifndef __wasi__
+#if !defined(__wasi__) && !defined(XS_NO_BEARSSL)
 #include "bearssl_hash.h"
 #include "bearssl_hmac.h"
 #include "bearssl_kdf.h"
