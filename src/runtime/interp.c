@@ -7,6 +7,7 @@
 #include "core/parser.h"
 #include "core/xs_bigint.h"
 #include "core/xs_utils.h"
+#include "core/gc.h"
 #include "core/limits.h"
 #include "plugins/pipeline.h"
 #ifdef XSC_ENABLE_TRACER
@@ -8095,6 +8096,10 @@ void interp_exec(Interp *i, Node *stmt) {
             }
         }
         int mutable = (VAL_TAG(stmt) == NODE_VAR) || stmt->let.mutable;
+        /* @scoped values opt out of cycle detection: sema has already
+         * verified they don't escape, so refcount alone suffices and
+         * env_decref at block exit will free them deterministically. */
+        if (stmt->let.is_scoped && val) gc_untrack(val);
         if (stmt->let.name) {
             env_define(i->env, stmt->let.name, val, mutable);
             TRACE_STORE(i, stmt->let.name, val);

@@ -149,6 +149,7 @@ SEMA_SRCS = src/types/types.c \
             src/semantic/resolve.c \
             src/semantic/typecheck.c \
             src/semantic/cache.c \
+            src/semantic/scoped_check.c \
             src/semantic/sema.c
 
 TLS_SRCS = $(wildcard src/tls/*.c) $(wildcard src/tls/bearssl/**/*.c) $(wildcard src/tls/bearssl/*.c)

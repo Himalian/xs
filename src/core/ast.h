@@ -373,6 +373,8 @@ struct Node {
             char        *name;
             Node        *value;
             int          mutable;
+            int          is_scoped;  /* @scoped: bound value is forbidden
+                                        to escape its enclosing block */
             TypeExpr    *type_ann;
             Node        *contract;   /* where clause, may be NULL */
         } let;

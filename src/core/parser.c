@@ -3897,8 +3897,9 @@ static Node *parse_stmt(Parser *p) {
         pp_expect(p, TK_RBRACKET, "expected ']' after #[attribute]");
     }
 
-    /* skip @ attributes, detect @pure and @deprecated */
+    /* skip @ attributes, detect @pure, @deprecated, @scoped */
     int fn_is_pure = 0;
+    int decl_is_scoped = 0;
     while (pp_check(p, TK_AT)) {
         pp_advance(p); /* consume @ */
         Token *attr = pp_peek(p, 0);
@@ -3907,6 +3908,8 @@ static Node *parse_stmt(Parser *p) {
             fn_is_pure = 1;
         if (attr->kind == TK_IDENT && attr->sval && strcmp(attr->sval, "deprecated") == 0)
             is_deprecated = 1;
+        if (attr->kind == TK_IDENT && attr->sval && strcmp(attr->sval, "scoped") == 0)
+            decl_is_scoped = 1;
         pp_advance(p); /* consume attribute name */
         if (pp_check(p, TK_LPAREN)) {
             int d=1; pp_advance(p);
@@ -4275,6 +4278,7 @@ static Node *parse_stmt(Parser *p) {
                            xs_strdup(pat->pat_ident.name) : NULL;
         n->let.value    = val;
         n->let.mutable  = mutable;
+        n->let.is_scoped = decl_is_scoped;
         n->let.type_ann = ann;
         n->let.contract = contract;
         return n;
@@ -4305,6 +4309,7 @@ static Node *parse_stmt(Parser *p) {
                            xs_strdup(pat->pat_ident.name) : NULL;
         n->let.value    = val;
         n->let.mutable  = 1;
+        n->let.is_scoped = decl_is_scoped;
         n->let.type_ann = ann;
         n->let.contract = contract;
         return n;
