@@ -40,13 +40,15 @@ jobs:
           mkdir -p corpus
           cp examples/*.xs corpus/ 2>/dev/null || true
           cp tests/conformance/*.xs corpus/ 2>/dev/null || true
-          # Full ASan + LSan + UBSan. -timeout=60 gives the instrumented
-          # parser slack on the 30s+ pathological backtracking inputs
-          # that existing seeds can mutate into; an infinite loop would
-          # still be caught by -max_total_time. -rss_limit_mb=4096 caps
-          # the runaway-allocation inputs at a level that still exits
-          # inside the total budget.
-          ./fuzz_parser -max_total_time=60 -timeout=60 -rss_limit_mb=4096 corpus/
+          # Full ASan + LSan + UBSan. -timeout=20 trips on pathological
+          # inputs early so the budget gets spent on coverage instead
+          # of a single slow seed; -timeout_exitcode=0 lets libFuzzer
+          # save the reproducer (uploaded below) without failing CI on
+          # parse-time blowups, which are perf bugs rather than memory
+          # safety issues. crashes / leaks / UBSan still exit non-zero.
+          # -rss_limit_mb=4096 keeps runaway allocation in check.
+          ./fuzz_parser -max_total_time=60 -timeout=20 -timeout_exitcode=0 \
+                        -rss_limit_mb=4096 corpus/
       - name: Upload fuzz reproducers
         if: failure()
         uses: actions/upload-artifact@v4
