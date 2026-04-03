@@ -7,6 +7,12 @@
 #include "core/value.h"
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <strings.h>          /* strcasecmp / strncasecmp */
+#else
+#define strcasecmp  _stricmp
+#define strncasecmp _strnicmp
+#endif
 #include <stdio.h>
 #include <stdint.h>
 #include <ctype.h>

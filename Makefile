@@ -307,7 +307,8 @@ tests/unit/%_test: tests/unit/%_test.c $(UNIT_LINK_SRCS)
 # bytecode_buf_test exercises just the .xsc reader, using the host xs
 # binary as a fixture generator. Only needs core value + gc + utf8 +
 # bytecode itself, no compiler / runtime / vm deps.
-BYTECODE_BUF_TEST_SRCS = src/core/value.c src/core/gc.c src/core/utf8.c \
+BYTECODE_BUF_TEST_SRCS = src/core/value.c src/core/gc.c \
+                         src/core/gc_concurrent.c src/core/utf8.c \
                          src/core/strbuf.c src/core/limits.c \
                          src/core/xs_bigint.c src/core/msgpack.c \
                          src/core/env.c src/vm/bytecode.c

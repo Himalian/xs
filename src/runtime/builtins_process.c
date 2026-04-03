@@ -8,9 +8,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#ifndef _WIN32
+#include <strings.h>          /* strcasecmp */
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
+#define strcasecmp _stricmp
 #elif defined(__wasi__)
 #include <unistd.h>
 #include <signal.h>
