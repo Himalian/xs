@@ -580,6 +580,12 @@ static Value *native_fs_watch(Interp *ig, Value **a, int n) {
 
 #elif (defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
        defined(__OpenBSD__) || defined(__DragonFly__)) && !defined(__wasi__)
+    /* O_EVTONLY is darwin-only and gated behind _DARWIN_C_SOURCE; on
+     * the BSDs (and on darwin without that feature macro) plain
+     * O_RDONLY does the right thing for kqueue's EVFILT_VNODE. */
+    #ifndef O_EVTONLY
+    #define O_EVTONLY O_RDONLY
+    #endif
     int kq = kqueue();
     if (kq < 0) return value_incref(XS_FALSE_VAL);
     int fd = open(a[0]->s, O_EVTONLY);

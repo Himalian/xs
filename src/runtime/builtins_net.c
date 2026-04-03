@@ -271,14 +271,6 @@ static void httpbuf_append(HttpBuf *b, const char *src, size_t n) {
 
 static void httpbuf_free(HttpBuf *b) { free(b->data); b->data = NULL; b->len = b->cap = 0; }
 
-/* Read entire response from fd into buf */
-static void http_read_all(int fd, HttpBuf *buf) {
-    char tmp[4096];
-    ssize_t nr;
-    while ((nr = read(fd, tmp, sizeof tmp)) > 0)
-        httpbuf_append(buf, tmp, (size_t)nr);
-}
-
 /* Parse HTTP response and return XS map: #{ status, headers, body } */
 static Value *http_parse_response(HttpBuf *buf) {
     Value *result = xs_map_new();

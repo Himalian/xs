@@ -317,9 +317,9 @@ tests/unit/bytecode_buf_test: tests/unit/bytecode_buf_test.c $(BYTECODE_BUF_TEST
 	$(CC) $(UNIT_CFLAGS) -DXSC_ENABLE_VM -o $@ $< \
 	    $(BYTECODE_BUF_TEST_SRCS) $(UNIT_LDFLAGS)
 
-test-unit: $(UNIT_TESTS)
+test-unit: $(TARGET) $(UNIT_TESTS)
 	@failed=0; for t in $(UNIT_TESTS); do \
-	    ./$$t || failed=1; \
+	    XS=$$(pwd)/$(TARGET) ./$$t || failed=1; \
 	done; \
 	if [ $$failed -ne 0 ]; then echo "[unit] FAILED"; exit 1; fi
 

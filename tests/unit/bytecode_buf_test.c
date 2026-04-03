@@ -52,10 +52,24 @@ TEST(read_buf_round_trip) {
     fprintf(f, "let x = 1 + 1\n");
     fclose(f);
 
-    /* Locate the xs binary: tests/run-all.sh exports XS, otherwise
-     * fall back to the conventional repo-root location. */
-    const char *xs_bin = getenv("XS");
-    if (!xs_bin) xs_bin = "./xs";
+    /* Locate the xs binary. tests/run-all.sh exports XS; the unit-
+     * test rule does not, so fall through several conventional
+     * locations. .exe suffix on Windows. */
+    const char *candidates[] = {
+        getenv("XS"),
+        "./xs", "./xs.exe",
+        "../xs", "../xs.exe",
+        NULL
+    };
+    const char *xs_bin = NULL;
+    for (int j = 0; candidates[j]; j++) {
+        FILE *probe = fopen(candidates[j], "rb");
+        if (probe) { fclose(probe); xs_bin = candidates[j]; break; }
+    }
+    if (!xs_bin) {
+        unlink(src_path); unlink(xsc_path);
+        FAIL("could not find an xs binary (set XS=path/to/xs)");
+    }
     char cmd[1024];
     snprintf(cmd, sizeof cmd, "\"%s\" build \"%s\" -o \"%s\" >/dev/null 2>&1",
              xs_bin, src_path, xsc_path);
