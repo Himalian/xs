@@ -2,7 +2,13 @@
 #define _DEFAULT_SOURCE
 #endif
 
-#define XS_VERSION "0.6.0"
+/* The Makefile injects XS_VERSION via -D from the contents of
+ * ./VERSION. The fallback below keeps the TU buildable in isolation
+ * (IDE indexers, ad-hoc compiles); release builds always carry the
+ * real version. */
+#ifndef XS_VERSION
+#define XS_VERSION "dev"
+#endif
 #define XS_VERSION_TAG "xs " XS_VERSION
 
 #include "core/xs_compat.h"

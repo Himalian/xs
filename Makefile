@@ -1,5 +1,14 @@
 CC      = gcc
-CFLAGS  = -O2 -Wall -Wextra -Wno-unused-parameter -std=c11 -Isrc -Isrc/tls/bearssl
+
+# Single source of truth for the XS version: ./VERSION (one line).
+# Bump it, then run `make sync-version` to propagate the new number
+# into xs.toml. The C build picks XS_VERSION up via -D below; main.c
+# falls back to "dev" if the macro isn't defined so the file still
+# compiles outside the makefile (IDE indexers, isolated unit tests).
+XS_VERSION := $(shell cat VERSION 2>/dev/null || echo dev)
+
+CFLAGS  = -O2 -Wall -Wextra -Wno-unused-parameter -std=c11 -Isrc -Isrc/tls/bearssl \
+          -DXS_VERSION='"$(XS_VERSION)"'
 LDFLAGS = -lm -lpthread
 
 # Feature flags (all enabled by default)
@@ -232,9 +241,17 @@ endif
 OBJS = $(SRCS:.c=.o)
 
 # Targets
-.PHONY: all clean debug release test test-unit test-e2e test-negative test-property test-golden test-regression test-conformance test-all install wasm wasm-browser bench bench-compare ios ios-device ios-sim ios-sim-arm64 android android-clean android-print-triple esp32 esp32-component
+.PHONY: all clean debug release test test-unit test-e2e test-negative test-property test-golden test-regression test-conformance test-all install wasm wasm-browser bench bench-compare ios ios-device ios-sim ios-sim-arm64 android android-clean android-print-triple esp32 esp32-component sync-version
 
 all: $(TARGET)
+
+# Propagate the contents of ./VERSION into xs.toml. portable-ish:
+# avoid sed -i (not GNU/BSD-compatible), do a copy + redirect.
+sync-version:
+	@v="$(XS_VERSION)"; \
+	awk -v v="$$v" '/^version *= *"/{print "version = \"" v "\""; next} {print}' xs.toml > xs.toml.tmp && \
+	mv xs.toml.tmp xs.toml && \
+	echo "synced xs.toml to $$v"
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
