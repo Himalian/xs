@@ -246,10 +246,13 @@ Startup time is the flagship number: on this box `xs file.xs` runs in
 about **2.3 ms** median vs **51 ms** for `node -e 'console.log(1)'`
 and **14 ms** for `python3 -c 'print(1)'`, so roughly **~22x faster
 than Node** and **~6x faster than Python** on a hello-world. That's
-what makes it practical for small CLI tools. For compute, the VM
-backend is roughly on par with CPython; the tree-walk interpreter is
-~10x slower on hot recursion and should not be used for compute-heavy
-work.
+what makes it practical for small CLI tools. For compute the picture
+is mixed: the bytecode VM is in the same ballpark as CPython on simple
+loops (and ahead on small bodies thanks to inline caches) but a few
+times slower on hot recursion. `--jit` closes that gap and pulls
+ahead. Use `--vm` for everyday work, `--jit` when you actually
+profile a hotspot, and treat the tree-walk interpreter as a
+debugging tool, not a backend.
 
 Reproduce with `benchmarks/bench_fibonacci.xs`, `benchmarks/bench_sort.xs`,
 `benchmarks/bench_strings.xs` and `xs bench` (runs each 10 times and

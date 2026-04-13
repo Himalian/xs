@@ -97,7 +97,7 @@ Add `where` after a type annotation to enforce a condition on the value. The con
 
 ```xs
 let age: int where age > 0 and age < 150 = 25
-let name: str where name.len > 0 = "xs"
+let name: str where name.len() > 0 = "xs"
 let score: int where score >= 0 and score <= 100 = 85
 ```
 
@@ -2016,7 +2016,7 @@ adapt fn fast_hash(data: str) -> int {
         return h
     }
     when js {
-        return data.len * 37
+        return data.len() * 37
     }
 }
 ```

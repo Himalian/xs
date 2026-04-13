@@ -1414,7 +1414,10 @@ test_again: ;
 
                     char err_buf[512] = {0};
                     Value *fn_val = env_get(interp->globals, fname);
-                    if (!fn_val || VAL_TAG(fn_val) != XS_FUNC) {
+                    if (!fn_val || (VAL_TAG(fn_val) != XS_FUNC &&
+                                    VAL_TAG(fn_val) != XS_NATIVE &&
+                                    VAL_TAG(fn_val) != XS_CLOSURE &&
+                                    VAL_TAG(fn_val) != XS_OVERLOAD)) {
                         test_failed = 1;
                         err_msg = "function not found";
                     } else {
