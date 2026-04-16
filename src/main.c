@@ -2202,6 +2202,14 @@ test_again: ;
             cache_free(g_sema_cache);
             return diag_explain(argv[++i]);
         }
+        /* once the filename is locked in, anything that follows is the
+         * script's own argv (handled at line 2567); refuse unknown flags
+         * before the filename so typos like 'xs --test foo.xs' fail loudly
+         * instead of silently doing nothing. */
+        else if (argv[i][0] == '-' && argv[i][1] != '\0' && !filename) {
+            fprintf(stderr, "xs: unknown flag '%s' (run 'xs --help' for usage)\n", argv[i]);
+            return 1;
+        }
         else if (argv[i][0] != '-' && !filename) { filename = argv[i]; file_arg = i; }
     }
 
