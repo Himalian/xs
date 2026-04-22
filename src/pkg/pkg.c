@@ -1,5 +1,8 @@
+#define _POSIX_C_SOURCE 200809L
 #include "pkg/pkg.h"
 #include "core/xs_compat.h"
+#include "core/xs.h"
+#include "core/value.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +10,85 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <errno.h>
+#include <unistd.h>
+
+#ifndef PKG_REGISTRY_URL
+#define PKG_REGISTRY_URL "https://reg.xslang.org"
+#endif
+
+extern Value *http_do_request(const char *method, const char *url,
+                              XSMap *extra_headers, const char *body,
+                              size_t body_len);
+
+/* tiny JSON-ish field grabber for known-shape registry responses. The
+ * registry returns
+ *   {"package":{...}, "version":{"version":"0.2.1","tarball_url":"https://...", ...}}
+ * so we walk char-by-char looking for "key":"value" with rudimentary
+ * escape handling. avoids dragging the full json builtin into pkg.c. */
+static char *json_field(const char *body, const char *key) {
+    if (!body || !key) return NULL;
+    size_t klen = strlen(key);
+    const char *p = body;
+    while (*p) {
+        if (*p == '"' && strncmp(p + 1, key, klen) == 0 &&
+            p[1 + klen] == '"') {
+            const char *q = p + 1 + klen + 1;
+            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+            if (*q != ':') { p++; continue; }
+            q++;
+            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+            if (*q != '"') { p++; continue; }
+            q++;
+            const char *start = q;
+            char *out = malloc(strlen(q) + 1);
+            if (!out) return NULL;
+            char *w = out;
+            while (*q && *q != '"') {
+                if (*q == '\\' && q[1]) {
+                    char c = q[1];
+                    switch (c) {
+                        case '"': *w++ = '"'; break;
+                        case '\\': *w++ = '\\'; break;
+                        case '/': *w++ = '/'; break;
+                        case 'n': *w++ = '\n'; break;
+                        case 't': *w++ = '\t'; break;
+                        case 'r': *w++ = '\r'; break;
+                        default: *w++ = c; break;
+                    }
+                    q += 2;
+                } else {
+                    *w++ = *q++;
+                }
+            }
+            *w = '\0';
+            (void)start;
+            return out;
+        }
+        p++;
+    }
+    return NULL;
+}
+
+/* Pull body / status out of an http_do_request response map. */
+static int registry_get(const char *url, char **body_out, int *status_out) {
+    *body_out = NULL;
+    if (status_out) *status_out = 0;
+    Value *resp = http_do_request("GET", url, NULL, NULL, 0);
+    if (!resp) return -1;
+    if (VAL_TAG(resp) != XS_MAP || !resp->map) {
+        value_decref(resp);
+        return -1;
+    }
+    Value *st = map_get(resp->map, "status");
+    Value *bd = map_get(resp->map, "body");
+    int status = (st && VAL_TAG(st) == XS_INT) ? (int)VAL_INT(st) : 0;
+    if (status_out) *status_out = status;
+    if (bd && VAL_TAG(bd) == XS_STR && bd->s) {
+        *body_out = strdup(bd->s);
+    }
+    value_decref(resp);
+    return 0;
+}
 
 static int write_file(const char *path, const char *content) {
     FILE *f = fopen(path, "w");
@@ -393,38 +475,192 @@ int pkg_install(const char *package_name) {
         }
         printf("installed %s from %s\n", pkg_name, package_name);
     } else {
-        if (mkdir(dirpath, 0755) != 0 && errno != EEXIST) {
-            fprintf(stderr, "xs install: cannot create '%s'\n", dirpath);
+        /* Plain "name" -> hosted registry at reg.xslang.org. Hit
+         * /api/pkg/{name}/latest, fish the tarball URL out of the JSON
+         * envelope, download, unpack into .xs_lib/{name}. */
+        char meta_url[1024];
+        snprintf(meta_url, sizeof(meta_url),
+                 "%s/api/pkg/%s/latest", PKG_REGISTRY_URL, package_name);
+
+        char *body = NULL;
+        int status = 0;
+        if (registry_get(meta_url, &body, &status) != 0 || !body) {
+            fprintf(stderr,
+                "xs install: could not reach registry at %s\n",
+                PKG_REGISTRY_URL);
+            free(body);
             return 1;
         }
-        char srcdir[2048];
-        snprintf(srcdir, sizeof(srcdir), "%s/src", dirpath);
-        mkdir(srcdir, 0755);
+        if (status != 200) {
+            fprintf(stderr,
+                "xs install: %s: registry returned %d\n",
+                package_name, status);
+            free(body);
+            return 1;
+        }
+        char *tarball = json_field(body, "tarball_url");
+        char *version = json_field(body, "version");
+        free(body);
+        if (!tarball || !*tarball) {
+            fprintf(stderr,
+                "xs install: %s: registry response missing tarball_url\n",
+                package_name);
+            free(tarball); free(version);
+            return 1;
+        }
 
+        if (mkdir(dirpath, 0755) != 0 && errno != EEXIST) {
+            fprintf(stderr, "xs install: cannot create '%s'\n", dirpath);
+            free(tarball); free(version);
+            return 1;
+        }
+
+        /* download tarball: registry uploads land in supabase storage,
+         * which ships an https url that http_do_request can fetch the
+         * same way the metadata endpoint did. */
+        Value *tar_resp = http_do_request("GET", tarball, NULL, NULL, 0);
+        if (!tar_resp || VAL_TAG(tar_resp) != XS_MAP || !tar_resp->map) {
+            fprintf(stderr, "xs install: tarball download failed for %s\n",
+                    package_name);
+            if (tar_resp) value_decref(tar_resp);
+            free(tarball); free(version);
+            return 1;
+        }
+        Value *tst = map_get(tar_resp->map, "status");
+        Value *tbd = map_get(tar_resp->map, "body");
+        int tstatus = (tst && VAL_TAG(tst) == XS_INT) ? (int)VAL_INT(tst) : 0;
+        if (tstatus != 200 || !tbd || VAL_TAG(tbd) != XS_STR || !tbd->s) {
+            fprintf(stderr,
+                "xs install: tarball fetch returned %d for %s\n",
+                tstatus, package_name);
+            value_decref(tar_resp);
+            free(tarball); free(version);
+            return 1;
+        }
+        char tarpath[2048];
+        snprintf(tarpath, sizeof(tarpath), "%s/.tarball.tgz", dirpath);
+        FILE *tf = fopen(tarpath, "wb");
+        if (!tf) {
+            fprintf(stderr, "xs install: cannot write %s\n", tarpath);
+            value_decref(tar_resp);
+            free(tarball); free(version);
+            return 1;
+        }
+        size_t blen = strlen(tbd->s);
+        fwrite(tbd->s, 1, blen, tf);
+        fclose(tf);
+        value_decref(tar_resp);
+
+        /* unpack with the system tar; bsd / gnu tar both accept these
+         * args. strip-components=1 collapses the package-version
+         * top-level dir. */
+        char cmd[4096];
+        snprintf(cmd, sizeof(cmd),
+                 "tar xzf %s -C %s --strip-components=1 2>&1", tarpath, dirpath);
+        if (system(cmd) != 0) {
+            fprintf(stderr, "xs install: tar extraction failed for %s\n",
+                    package_name);
+            free(tarball); free(version);
+            return 1;
+        }
+        unlink(tarpath);
+
+        /* If the package didn't include an xs.toml, leave one behind
+         * pointing at the registry source. */
         char tomlpath[2048];
         snprintf(tomlpath, sizeof(tomlpath), "%s/xs.toml", dirpath);
-        FILE *f = fopen(tomlpath, "w");
-        if (f) {
-            fprintf(f,
-                "[package]\n"
-                "name = \"%s\"\n"
-                "version = \"0.1.0\"\n"
-                "source = \"registry\"\n"
-                "\n"
-                "[dependencies]\n",
-                package_name);
-            fclose(f);
-        }
-        char mainpath[2048];
-        snprintf(mainpath, sizeof(mainpath), "%s/src/lib.xs", dirpath);
-        if (!file_exists(mainpath)) {
-            FILE *mf = fopen(mainpath, "w");
-            if (mf) {
-                fprintf(mf, "-- %s package stub\n", package_name);
-                fclose(mf);
+        if (!file_exists(tomlpath)) {
+            FILE *f = fopen(tomlpath, "w");
+            if (f) {
+                fprintf(f,
+                    "[package]\n"
+                    "name = \"%s\"\n"
+                    "version = \"%s\"\n"
+                    "source = \"registry\"\n"
+                    "\n"
+                    "[dependencies]\n",
+                    package_name, version ? version : "0.0.0");
+                fclose(f);
             }
         }
-        printf("installed %s\n", package_name);
+
+        printf("installed %s%s%s from %s\n",
+               package_name,
+               version ? "@" : "",
+               version ? version : "",
+               PKG_REGISTRY_URL);
+        free(tarball); free(version);
+    }
+    return 0;
+}
+
+/* xs search <query>: hits /api/search?q=... and prints names + descriptions. */
+int pkg_search(const char *query) {
+    if (!query || !*query) {
+        fprintf(stderr, "xs search: missing query\n");
+        return 1;
+    }
+    /* very small URL-escape: replace spaces with '+' and stop on quote
+     * / backslash since the registry rejects those anyway. */
+    char esc[512];
+    size_t qi = 0;
+    for (const char *p = query; *p && qi + 1 < sizeof(esc); p++) {
+        if (*p == ' ') esc[qi++] = '+';
+        else if (*p == '"' || *p == '\\') break;
+        else esc[qi++] = *p;
+    }
+    esc[qi] = '\0';
+
+    char url[1024];
+    snprintf(url, sizeof(url),
+             "%s/api/search?q=%s&limit=20", PKG_REGISTRY_URL, esc);
+
+    char *body = NULL;
+    int status = 0;
+    if (registry_get(url, &body, &status) != 0 || !body) {
+        fprintf(stderr, "xs search: could not reach %s\n", PKG_REGISTRY_URL);
+        free(body);
+        return 1;
+    }
+    if (status != 200) {
+        fprintf(stderr, "xs search: registry returned %d\n", status);
+        free(body);
+        return 1;
+    }
+
+    /* Walk the body, picking out each results[].{name,description}.
+     * The full-blown json builtin would be cleaner, but pkg.c is part
+     * of the bootstrap and we'd rather not pull more of the runtime
+     * surface in. */
+    int found = 0;
+    const char *p = body;
+    while ((p = strstr(p, "\"name\""))) {
+        const char *name_end;
+        const char *name = NULL;
+        const char *q = p + 6;
+        while (*q == ' ' || *q == ':' || *q == '\t') q++;
+        if (*q == '"') {
+            name = ++q;
+            while (*q && *q != '"') q++;
+            name_end = q;
+            int nlen = (int)(name_end - name);
+            const char *desc_pos = strstr(q, "\"description\"");
+            char *desc = json_field(p, "description");
+            printf("  %.*s%s%s\n",
+                   nlen, name,
+                   desc && *desc ? " - " : "",
+                   desc && *desc ? desc : "");
+            free(desc);
+            (void)desc_pos;
+            found++;
+        }
+        p = q + 1;
+    }
+    free(body);
+    if (!found) {
+        printf("no packages match '%s'\n", query);
+    } else {
+        printf("(%d results from %s)\n", found, PKG_REGISTRY_URL);
     }
     return 0;
 }
@@ -740,7 +976,114 @@ int pkg_publish(const char *path) {
     printf("  version: %s\n", version);
     printf("  files:   %d\n", file_count);
     printf("  tarball: %s\n", tarball);
-    printf("\nNo registry configured: package created locally as '%s'\n", tarball);
-    printf("To publish, upload this tarball to your package registry.\n");
-    return 0;
+
+    /* If a publish token is in the environment, hand the tarball off to
+     * the registry. Token is expected to be a Supabase JWT scoped to the
+     * caller's account; the registry validates it server-side and rejects
+     * publishes that don't own the package name. Without a token we keep
+     * the legacy "tarball lives next to xs.toml" behaviour so the local
+     * step is still useful for testing or third-party hosting. */
+    const char *token = getenv("XS_REGISTRY_TOKEN");
+    if (!token || !*token) {
+        printf("\nXS_REGISTRY_TOKEN not set: tarball '%s' kept locally.\n",
+               tarball);
+        printf("  export XS_REGISTRY_TOKEN=<jwt>  # then xs publish to send.\n");
+        return 0;
+    }
+
+    /* Read the tarball back into memory and base64-encode it so it
+     * fits the registry's JSON envelope. The registry server decodes
+     * the base64 in route-helpers.ts (the existing publish handler
+     * already accepts {tarball: <b64>} or {tarball_url: <https>}). */
+    FILE *tf = fopen(tarball, "rb");
+    if (!tf) {
+        fprintf(stderr, "xs publish: cannot reopen '%s'\n", tarball);
+        return 1;
+    }
+    fseek(tf, 0, SEEK_END);
+    long tlen = ftell(tf);
+    fseek(tf, 0, SEEK_SET);
+    if (tlen <= 0) {
+        fclose(tf);
+        fprintf(stderr, "xs publish: empty tarball\n");
+        return 1;
+    }
+    unsigned char *raw = malloc((size_t)tlen);
+    if (!raw) { fclose(tf); fprintf(stderr, "xs publish: oom\n"); return 1; }
+    size_t got = fread(raw, 1, (size_t)tlen, tf);
+    fclose(tf);
+    if ((long)got != tlen) {
+        fprintf(stderr, "xs publish: short read on '%s'\n", tarball);
+        free(raw);
+        return 1;
+    }
+
+    static const char b64chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                                   "abcdefghijklmnopqrstuvwxyz"
+                                   "0123456789+/";
+    size_t b64len = 4 * ((size_t)tlen + 2) / 3;
+    char *b64 = malloc(b64len + 1);
+    if (!b64) { free(raw); fprintf(stderr, "xs publish: oom\n"); return 1; }
+    size_t bi = 0;
+    for (size_t i = 0; i < (size_t)tlen; i += 3) {
+        unsigned int n = (unsigned int)raw[i] << 16;
+        if (i + 1 < (size_t)tlen) n |= (unsigned int)raw[i + 1] << 8;
+        if (i + 2 < (size_t)tlen) n |= (unsigned int)raw[i + 2];
+        b64[bi++] = b64chars[(n >> 18) & 0x3F];
+        b64[bi++] = b64chars[(n >> 12) & 0x3F];
+        b64[bi++] = (i + 1 < (size_t)tlen) ? b64chars[(n >> 6) & 0x3F] : '=';
+        b64[bi++] = (i + 2 < (size_t)tlen) ? b64chars[n & 0x3F]        : '=';
+    }
+    b64[bi] = '\0';
+    free(raw);
+
+    /* Build {"version":"...","tarball":"<b64>"}. Description / readme /
+     * keywords come from xs.toml in a future pass; for now we ship the
+     * minimum the registry accepts. */
+    size_t json_cap = bi + 256;
+    char *json = malloc(json_cap);
+    if (!json) { free(b64); fprintf(stderr, "xs publish: oom\n"); return 1; }
+    int json_len = snprintf(json, json_cap,
+        "{\"version\":\"%s\",\"tarball\":\"%s\"}", version, b64);
+    free(b64);
+
+    char publish_url[1024];
+    snprintf(publish_url, sizeof(publish_url),
+             "%s/api/pkg/%s/publish", PKG_REGISTRY_URL, name);
+
+    char auth_header[2048];
+    snprintf(auth_header, sizeof(auth_header), "Bearer %s", token);
+
+    XSMap *headers = map_new();
+    Value *auth_v = xs_str(auth_header);
+    map_set(headers, "Authorization", auth_v);
+    value_decref(auth_v);
+    Value *ct_v = xs_str("application/json");
+    map_set(headers, "Content-Type", ct_v);
+    value_decref(ct_v);
+
+    Value *resp = http_do_request("POST", publish_url, headers, json, (size_t)json_len);
+    map_free(headers);
+    free(json);
+
+    if (!resp || VAL_TAG(resp) != XS_MAP || !resp->map) {
+        fprintf(stderr, "xs publish: could not reach %s\n", PKG_REGISTRY_URL);
+        if (resp) value_decref(resp);
+        return 1;
+    }
+    Value *st = map_get(resp->map, "status");
+    Value *bd = map_get(resp->map, "body");
+    int status = (st && VAL_TAG(st) == XS_INT) ? (int)VAL_INT(st) : 0;
+    if (status >= 200 && status < 300) {
+        printf("\npublished %s@%s -> %s\n", name, version, PKG_REGISTRY_URL);
+        unlink(tarball);
+        value_decref(resp);
+        return 0;
+    }
+    fprintf(stderr, "\nxs publish: registry returned %d\n", status);
+    if (bd && VAL_TAG(bd) == XS_STR && bd->s) {
+        fprintf(stderr, "  %s\n", bd->s);
+    }
+    value_decref(resp);
+    return 1;
 }

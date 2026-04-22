@@ -1913,12 +1913,21 @@ test_again: ;
 #endif
 
         } else if (strcmp(sub, "publish") == 0) {
-            fprintf(stderr, "xs publish: no registry configured (set [registry] in xs.toml)\n");
+#ifdef XSC_ENABLE_PKG
+            return pkg_publish(sub_argc >= 1 ? sub_arg(0) : ".");
+#else
+            fprintf(stderr, "xs publish: not enabled in this build (rebuild with XSC_ENABLE_PKG=1)\n");
             return 1;
+#endif
 
         } else if (strcmp(sub, "search") == 0) {
-            fprintf(stderr, "xs search: no registry configured (set [registry] in xs.toml)\n");
+#ifdef XSC_ENABLE_PKG
+            if (sub_argc < 1) { fprintf(stderr, "xs search: missing query\n"); return 1; }
+            return pkg_search(sub_arg(0));
+#else
+            fprintf(stderr, "xs search: not enabled in this build (rebuild with XSC_ENABLE_PKG=1)\n");
             return 1;
+#endif
 
         } else if (strcmp(sub, "pkg") == 0) {
 #ifdef XSC_ENABLE_PKG
@@ -1928,6 +1937,8 @@ test_again: ;
             else if (strcmp(sub_arg(0), "remove")  == 0) { if (sub_argc < 2) { fprintf(stderr, "xs pkg remove: missing package\n"); return 1; } return pkg_remove(sub_arg(1)); }
             else if (strcmp(sub_arg(0), "update")  == 0) return sub_argc >= 2 ? pkg_update(sub_arg(1)) : pkg_update(NULL);
             else if (strcmp(sub_arg(0), "add")     == 0) { if (sub_argc < 2) { fprintf(stderr, "xs pkg add: missing package\n"); return 1; } return pkg_add(sub_arg(1)); }
+            else if (strcmp(sub_arg(0), "search")  == 0) { if (sub_argc < 2) { fprintf(stderr, "xs pkg search: missing query\n"); return 1; } return pkg_search(sub_arg(1)); }
+            else if (strcmp(sub_arg(0), "publish") == 0) return pkg_publish(sub_argc >= 2 ? sub_arg(1) : ".");
             else { fprintf(stderr, "xs pkg: unknown subcommand '%s'\n", sub_arg(0)); return 1; }
 #else
             fprintf(stderr, "xs pkg: not enabled in this build (rebuild with XSC_ENABLE_PKG=1)\n");

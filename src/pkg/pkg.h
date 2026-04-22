@@ -8,5 +8,6 @@ int pkg_remove(const char *package_name);
 int pkg_update(const char *package_name);
 int pkg_list(void);
 int pkg_publish(const char *path);
+int pkg_search(const char *query);
 
 #endif
