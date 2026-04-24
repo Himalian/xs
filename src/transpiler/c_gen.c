@@ -795,19 +795,40 @@ static void emit_expr(SB *s, Node *n, int depth) {
     }
     case NODE_CALL: {
         if (is_callee_name(n->call.callee, "println")) {
-            sb_add(s, "xs_println(");
-            if (n->call.args.len > 0)
-                emit_expr(s, n->call.args.items[0], depth);
-            else
-                sb_add(s, "XS_NULL");
-            sb_addc(s, ')');
+            int an = n->call.args.len;
+            if (an <= 1) {
+                sb_add(s, "xs_println(");
+                if (an == 1) emit_expr(s, n->call.args.items[0], depth);
+                else sb_add(s, "XS_NULL");
+                sb_addc(s, ')');
+            } else {
+                sb_addc(s, '(');
+                for (int i = 0; i < an - 1; i++) {
+                    sb_add(s, "xs_print(");
+                    emit_expr(s, n->call.args.items[i], depth);
+                    sb_add(s, "), xs_print(XS_STR(\" \")), ");
+                }
+                sb_add(s, "xs_println(");
+                emit_expr(s, n->call.args.items[an - 1], depth);
+                sb_add(s, "))");
+            }
         } else if (is_callee_name(n->call.callee, "print")) {
-            sb_add(s, "xs_print(");
-            if (n->call.args.len > 0)
-                emit_expr(s, n->call.args.items[0], depth);
-            else
-                sb_add(s, "XS_NULL");
-            sb_addc(s, ')');
+            int an = n->call.args.len;
+            if (an <= 1) {
+                sb_add(s, "xs_print(");
+                if (an == 1) emit_expr(s, n->call.args.items[0], depth);
+                else sb_add(s, "XS_NULL");
+                sb_addc(s, ')');
+            } else {
+                sb_addc(s, '(');
+                for (int i = 0; i < an; i++) {
+                    if (i) sb_add(s, ", xs_print(XS_STR(\" \")), ");
+                    sb_add(s, "xs_print(");
+                    emit_expr(s, n->call.args.items[i], depth);
+                    sb_addc(s, ')');
+                }
+                sb_addc(s, ')');
+            }
         } else if (n->call.callee && VAL_TAG(n->call.callee) == NODE_SCOPE &&
                    n->call.callee->scope.nparts == 2) {
             /* enum constructor call: Shape::Circle(5) -> map */

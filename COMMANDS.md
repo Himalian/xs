@@ -523,25 +523,38 @@ xs update http-client   # update specific package
 
 ### `xs publish`
 
-Publish the current package to the XS registry. The hosted endpoint at
-`reg.xslang.org` is live, but the CLI doesn't yet POST tarballs to it;
-in v0.7.x `xs publish` builds the tarball locally and prints the path.
-Set `[registry] url = "https://reg.xslang.org"` in `xs.toml` once the
-client wiring lands.
+Publish the current package to the XS registry. Reads the API token
+from `$XS_REGISTRY_TOKEN`, falling back to `~/.xs/credentials` (set
+via `xs login`). Without a token the tarball is built locally and the
+path is printed so you can sideload it.
 
 ```bash
-xs publish
+xs login           # one-time, stores ~/.xs/credentials
+xs publish         # builds tarball, POSTs to reg.xslang.org
 ```
 
 ### `xs search <query>`
 
-Search the package registry. The hosted endpoint at `reg.xslang.org` is
-live, but the CLI client is still a stub in v0.7.x and prints
-`xs search: no registry configured` until HTTP wiring lands.
+Search the package registry. Hits `reg.xslang.org/api/search`, prints
+the top 20 results.
 
 ```bash
 xs search json
 ```
+
+### `xs login`
+
+Store a registry token at `~/.xs/credentials` (chmod 600). Reads
+`$XS_REGISTRY_TOKEN` if set, otherwise prompts on stdin. Get the token
+from the registry account page.
+
+### `xs logout`
+
+Delete `~/.xs/credentials`.
+
+### `xs whoami`
+
+Print the username and email associated with the stored token.
 
 ### `xs list`
 

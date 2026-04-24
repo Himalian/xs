@@ -311,46 +311,82 @@ burns. Fix one, and this list gets shorter.
   pulls the tarball off Supabase storage, and unpacks into `.xs_lib/`.
   `xs search <query>` queries `/api/search`. `xs publish` builds the
   package tarball, base64-encodes it, and POSTs to
-  `/api/pkg/<name>/publish` with `Authorization: Bearer
-  $XS_REGISTRY_TOKEN`; without the env var it keeps the legacy
-  "tarball next to xs.toml" behaviour for testing or third-party
-  hosting. GitHub shorthand (`user/repo`) and `https://...git` keep
-  working as before. Override the registry with
-  `-DPKG_REGISTRY_URL=...` at build time.
+  `/api/pkg/<name>/publish` with `Authorization: Bearer <token>`,
+  picking the token up from `$XS_REGISTRY_TOKEN` first and then
+  `~/.xs/credentials` (chmod 600). Run `xs login` once to store the
+  token, `xs whoami` to confirm, `xs logout` to forget it. GitHub
+  shorthand (`user/repo`) and `https://...git` keep working as
+  before. Override the registry with `-DPKG_REGISTRY_URL=...` at
+  build time.
 - **JIT covers most of the bytecode.** The register-allocating
-  pipeline now lowers generators (`fn*`/`yield`) and shadowed-local
-  cases through `IR_VM_STEP_CF`. Anything genuinely unsupported
-  (e.g. actor methods that close over outer locals - bug026 still
-  needs the call-emission rework) bails to the bytecode VM for that
-  proto. Tight arithmetic/branch loops get 5-8x over VM; call-heavy
-  workloads sit closer to VM parity until call-site fast paths land.
-  Both x86-64 and aarch64 are supported.
+  pipeline lowers generators (`fn*`/`yield`) and shadowed-local
+  cases through `IR_VM_STEP_CF`. Actor methods - whose dispatcher
+  passes an implicit `self` and state-field locals the JIT prologue
+  doesn't model - now bail at lower time, including any outer proto
+  that builds an actor downstream, so an actor-with-closure works
+  uniformly on both backends. Tight arithmetic/branch loops get 5-8x
+  over VM; call-heavy workloads sit closer to VM parity until
+  call-site fast paths land. Both x86-64 and aarch64 are supported.
+- **JIT method-call dispatch on stdlib-module receivers can confuse
+  the operand-stack flush** when the result of `fs.read(x)` (or any
+  other module method call) is consumed inline as an argument to a
+  surrounding call (`println(fs.read(x))`). Storing the intermediate
+  to a `let` first works (`let r = fs.read(x); println(r)`). The
+  VM and interpreter handle both forms identically; pass `--vm` if
+  you hit it. test_fs / test_gc / test_record_prov / test_stdlib_*
+  still trip over this on `--jit` and are documented as a v1.0
+  carryover for the call-site fast-path rewrite.
 
 ## Known Limitations
 
-- JIT lowers a fixed opcode subset; generators + shadowed locals now
-  pass through, but actor methods that close over outer locals still
-  bail to the bytecode VM (bug026's `skip-backend: jit` marker).
-- `xs --emit wasm` is parked: arithmetic + direct calls work, the rest doesn't. Use `--emit c` for AOT and `xs-browser.wasm` (the runtime build) for browsers
-- VM effects: nested perform/handle pairs route correctly because each
-  perform pushes a snapshot, but a continuation is still single-shot.
-  Calling `resume` more than once needs the VM to deep-snapshot mutable
-  heap state and is on the v1.0 list.
-- Regex uses POSIX extended syntax only (no `\d`, `\w` shorthand, use `[0-9]`, `[a-zA-Z_]`)
-- Interpreter call-depth cap is 500 frames (raise with `XS_MAX_DEPTH=N`). Hitting it throws a catchable `StackOverflow` rather than segfaulting; the VM has its own growable stack.
-- JS transpiler effect handlers wrap the handled expression in a generator and use `yield*` delegation, so a `perform` lowers to `yield` cleanly when the handle body itself yields. Direct top-level `perform` outside a `handle` still has no surrounding generator and will be a parse error under Node, mirroring the language rule that `perform` only makes sense in a handled context.
-- `http` module exposes client methods (`get`, `post`, ...) on a
-  shared keep-alive pool, plus `http.serve(port, handler)` for a
-  small request loop. The richer async router in
-  `src/net/http_server.c` (idle / slow-request culling, graceful
-  shutdown, per-server limits) is reachable from C hosts but is
-  not yet exposed through the XS-side `http` module surface; that
-  rewire is pending.
+- JIT lowers a fixed opcode subset; generators + shadowed locals pass
+  through. Actor methods (and any proto whose descendants build one)
+  bail to the bytecode VM at lower time, so an `actor { ... }` that
+  also captures an outer `let` works on both backends without the
+  caller doing anything.
+- `xs --emit wasm` is parked: arithmetic + direct calls work, the
+  rest doesn't. Use `--emit c` for AOT and `xs-browser.wasm` (the
+  runtime build) for browsers.
+- VM effects: nested perform/handle pairs each push their own
+  continuation onto a LIFO stack and `resume` may now fire more than
+  once. Each perform captures the live stack `[0..sp_off)` so a
+  second resume sees the original locals rather than the mutations
+  the first resume left behind. Mutable heap state (arrays, maps,
+  closures) is shallow-snapshotted: the array reference replays, but
+  pushes the resumed body did still appear on the second resume.
+  That matches the documented "values capture, references share"
+  rule in `LANGUAGE.md`; deep-cloning heap state on every perform is
+  out of scope for 1.0.
+- Regex uses POSIX extended syntax only (no `\d`, `\w` shorthand,
+  use `[0-9]`, `[a-zA-Z_]`).
+- Interpreter call-depth cap is 500 frames (raise with
+  `XS_MAX_DEPTH=N`). Hitting it throws a catchable `StackOverflow`
+  rather than segfaulting; the VM has its own growable stack.
+- JS transpiler effect handlers wrap the handled expression in a
+  generator and use `yield*` delegation, so a `perform` lowers to
+  `yield` cleanly when the handle body itself yields. Direct
+  top-level `perform` outside a `handle` still has no surrounding
+  generator and will be a parse error under Node, mirroring the
+  language rule that `perform` only makes sense in a handled
+  context.
+- `http.serve(port, router)` accepts either a single handler
+  function (the original loop) or a router map with `routes`,
+  `middleware`, and `not_found`. Patterns support `:name` captures
+  (populating `req.params`) and a trailing `*` wildcard. The richer
+  async router in `src/net/http_server.c` (idle / slow-request
+  culling, graceful shutdown, per-server limits) remains C-only
+  for cases where you embed xs into a larger server.
 - TLS server termination uses BearSSL via
   `http_server_use_tls(server, cert_pem, key_pem)`, and SSE +
   WebSocket helpers (`sse_send_event`, `ws_send_frame`,
   `ws_send_text`, `ws_send_close`, `ws_send_ping`, `ws_send_pong`)
-  now go through the per-connection bridge so streaming endpoints
+  go through the per-connection bridge so streaming endpoints
   encrypt over HTTPS without each call site doing TLS plumbing. The
   fd-based variants (`sse_send_event_fd`, `sse_send_retry_fd`)
   remain for callers that genuinely run on plain sockets.
+- Registry CLI (`xs install`, `xs publish`, `xs search`,
+  `xs whoami`, `xs login`, `xs logout`) talks to
+  `https://reg.xslang.org` on Linux, macOS, and Windows. The
+  Windows path goes through a small raw-socket + BearSSL client
+  in `src/pkg/pkg_http.c` so MinGW builds don't need to pull in
+  the full async client. wasi targets keep the registry stub.

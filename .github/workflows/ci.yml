@@ -33,6 +33,14 @@ jobs:
           node-version: 20
       - run: bash tests/test_transpiler_diff.sh
 
+      - name: Performance baseline guard
+        run: |
+          # Re-run benches against benchmarks/baseline.json. Fails if any
+          # xs backend regresses by more than the configured tolerance.
+          # Tolerance is generous on CI (50%) because runner variance is
+          # high; the local default in benchmarks/README.md is tighter.
+          make bench-compare TOLERANCE=0.5
+
       - name: Fuzz (short budget)
         run: |
           sudo apt-get update -qq && sudo apt-get install -y clang
