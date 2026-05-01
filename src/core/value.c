@@ -485,8 +485,11 @@ char *value_repr(Value *v) {
             out[pos++] = '{';
             if (v->map) {
                 int first = 1;
-                for (int i = 0; i < v->map->cap; i++) {
-                    if (!v->map->keys[i]) continue;
+                /* Walk in insertion order so str/repr matches what
+                   keys()/values()/iteration produce. */
+                for (int oi = 0; oi < v->map->len; oi++) {
+                    int i = v->map->order[oi];
+                    if (i < 0 || i >= v->map->cap || !v->map->keys[i]) continue;
                     char *val_s = value_repr(v->map->vals[i]);
                     size_t needed = strlen(v->map->keys[i]) + strlen(val_s) + 8;
                     while (pos + needed >= sz) { sz *= 2; out = xs_realloc(out, sz); }

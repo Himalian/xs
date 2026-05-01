@@ -1742,10 +1742,12 @@ static Node *parse_prefix(Parser *p) {
         return parse_handle(p);
     }
 
-    /* await expr */
+    /* await expr  (unary prefix; binds tighter than binary operators
+       so `await a + 1` reads as `(await a) + 1` like every other
+       async language). */
     if (tok->kind == TK_AWAIT) {
         pp_advance(p);
-        Node *expr = parse_expr(p, 0);
+        Node *expr = parse_expr(p, 14);
         Node *n = node_new(NODE_AWAIT, span);
         n->await_.expr = expr;
         return n;

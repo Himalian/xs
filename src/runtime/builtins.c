@@ -118,7 +118,7 @@ static char *inst_to_str(Interp *interp, Value *v, int repr_mode) {
     return repr_mode ? value_repr(v) : value_str(v);
 }
 
-static Value *builtin_print(Interp *i, Value **args, int argc) {
+static Value *builtin_print_impl(Interp *i, Value **args, int argc, int with_newline) {
     if (argc >= 1 && VAL_TAG(args[0]) == XS_STR && args[0]->s) {
         const char *fmt = args[0]->s;
         int has_placeholder = 0;
@@ -142,7 +142,7 @@ static Value *builtin_print(Interp *i, Value **args, int argc) {
                 printf(" ");
                 char *s = inst_to_str(i, args[j], 0); printf("%s", s); free(s);
             }
-            printf("\n");
+            if (with_newline) printf("\n");
             return value_incref(XS_NULL_VAL);
         }
     }
@@ -152,8 +152,16 @@ static Value *builtin_print(Interp *i, Value **args, int argc) {
         printf("%s", s);
         free(s);
     }
-    printf("\n");
+    if (with_newline) printf("\n");
     return value_incref(XS_NULL_VAL);
+}
+
+static Value *builtin_print(Interp *i, Value **args, int argc) {
+    return builtin_print_impl(i, args, argc, 0);
+}
+
+static Value *builtin_println(Interp *i, Value **args, int argc) {
+    return builtin_print_impl(i, args, argc, 1);
 }
 
 static Value *builtin_print_no_nl(Interp *i, Value **args, int argc) {
@@ -168,7 +176,7 @@ static Value *builtin_print_no_nl(Interp *i, Value **args, int argc) {
     return value_incref(XS_NULL_VAL);
 }
 
-static Value *builtin_eprint(Interp *i, Value **args, int argc) {
+static Value *builtin_eprint_impl(Interp *i, Value **args, int argc, int with_newline) {
     (void)i;
     if (argc >= 1 && VAL_TAG(args[0]) == XS_STR && args[0]->s) {
         const char *fmt = args[0]->s;
@@ -191,7 +199,7 @@ static Value *builtin_eprint(Interp *i, Value **args, int argc) {
                 fprintf(stderr," ");
                 char *s = value_str(args[j]); fprintf(stderr,"%s",s); free(s);
             }
-            fprintf(stderr,"\n");
+            if (with_newline) fprintf(stderr,"\n");
             return value_incref(XS_NULL_VAL);
         }
     }
@@ -200,8 +208,16 @@ static Value *builtin_eprint(Interp *i, Value **args, int argc) {
         char *s = value_str(args[j]);
         fprintf(stderr,"%s",s); free(s);
     }
-    fprintf(stderr,"\n");
+    if (with_newline) fprintf(stderr,"\n");
     return value_incref(XS_NULL_VAL);
+}
+
+static Value *builtin_eprint(Interp *i, Value **args, int argc) {
+    return builtin_eprint_impl(i, args, argc, 0);
+}
+
+static Value *builtin_eprintln(Interp *i, Value **args, int argc) {
+    return builtin_eprint_impl(i, args, argc, 1);
 }
 
 /* type predicates */
@@ -1224,9 +1240,9 @@ Value *make_fs_module(void);
 void stdlib_register(Interp *i) {
     /* Core */
     interp_define_native(i, "print",     builtin_print);
-    interp_define_native(i, "println",   builtin_print);
+    interp_define_native(i, "println",   builtin_println);
     interp_define_native(i, "eprint",    builtin_eprint);
-    interp_define_native(i, "eprintln",  builtin_eprint);
+    interp_define_native(i, "eprintln",  builtin_eprintln);
     interp_define_native(i, "print_no_nl", builtin_print_no_nl);
     interp_define_native(i, "type",      builtin_type);
     interp_define_native(i, "typeof",    builtin_typeof);
