@@ -3827,6 +3827,14 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
             return value_incref(in ? XS_TRUE_VAL : XS_FALSE_VAL);
         }
         if (strcmp(method, "step") == 0) {
+            /* No-arg form is a getter; one-arg form returns a fresh
+               range with that step so `(1..10).step(2)` actually
+               iterates by 2 instead of returning the integer 1. */
+            if (argc >= 1 && VAL_TAG(args[0]) == XS_INT) {
+                Value *r = xs_range(obj->range->start, obj->range->end, obj->range->inclusive);
+                if (r->range) r->range->step = VAL_INT(args[0]);
+                return r;
+            }
             return xs_int(obj->range->step ? obj->range->step : 1);
         }
         if (strcmp(method, "to_array") == 0) {
