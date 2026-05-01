@@ -630,6 +630,20 @@ static void lint_node(XSLint *l, Node *n) {
         scope_pop(l);
         break;
     case NODE_EXPR_STMT:
+        /* The expression may itself be a control-flow node (for/while/
+           if/match/...). Route those back through lint_node so their
+           subexpressions get marked used; otherwise `for k in xs {...}`
+           wrapped in an EXPR_STMT bypasses the iter and body entirely
+           and the lint mistakenly flags `xs` as unused. */
+        if (n->expr_stmt.expr) {
+            NodeTag tag = VAL_TAG(n->expr_stmt.expr);
+            if (tag == NODE_FOR || tag == NODE_WHILE || tag == NODE_LOOP
+                || tag == NODE_IF  || tag == NODE_MATCH
+                || tag == NODE_TRY || tag == NODE_BLOCK) {
+                lint_node(l, n->expr_stmt.expr);
+                break;
+            }
+        }
         lint_expr(l, n->expr_stmt.expr);
         break;
     case NODE_WHILE:
