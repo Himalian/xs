@@ -1173,6 +1173,13 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
         emit(c, MAKE_A(OP_LT, 0, 0));
         int j_exit = emit_jump(c, OP_JUMP_IF_FALSE);
 
+        /* Push a fresh scope for the iteration variable so any closure
+           that captures it gets a per-iteration slot via the
+           OP_CLOSE_UPVALUES emitted by scope_end. Without this,
+           `for i in 0..3 { fns.push(|| i) }` ends up with every
+           closure pointing at the same final-iteration slot. */
+        scope_begin(c);
+
         emit_a(c, OP_LOAD_LOCAL, iter_slot);
         emit_a(c, OP_LOAD_LOCAL, idx_slot);
         Node *pat = n->for_loop.pattern;
@@ -1210,6 +1217,10 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
         }
 
         compile_node(c, n->for_loop.body, 0);
+
+        /* End the iteration scope (closes captured upvalues so the next
+           iteration sees fresh slots). */
+        scope_end(c);
 
         /* patch continue target to here (the increment) */
         {
@@ -2008,8 +2019,22 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
         emit(c, MAKE_A(OP_THROW, 0, 0));
         return;
 
-    // --- try/catch
+    // --- try/catch/finally
     case NODE_TRY: {
+        /* If there's a finally block, register it as a defer first so
+           any path out of the body (return/throw/break/continue/normal
+           fall-through) runs the finally. The deferred code lives at
+           defer_finally; OP_DEFER_PUSH skips over it on the regular
+           forward path. After the try body + catch, we explicitly
+           OP_DEFER_RUN it so the finally fires on the success path too. */
+        int defer_jmp = -1;
+        if (n->try_.finally_block) {
+            defer_jmp = emit_jump(c, OP_DEFER_PUSH);
+            compile_node(c, n->try_.finally_block, 0);
+            emit(c, MAKE_A(OP_PUSH_NULL, 0, 0));
+            emit(c, MAKE_A(OP_RETURN, 0, 0));
+            patch_jump(c, defer_jmp);
+        }
         int try_start = emit_jump(c, OP_TRY_BEGIN);
         compile_node(c, n->try_.body, want_value);
         emit(c, MAKE_A(OP_TRY_END, 0, 0));
@@ -2033,13 +2058,19 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
                 compile_node(c, arm->body, want_value);
             else if (want_value)
                 emit(c, MAKE_A(OP_PUSH_NULL, 0, 0));
+        } else if (n->try_.finally_block) {
+            /* Bare try/finally with no catch: re-throw whatever the
+               body raised so an outer handler still sees it. The
+               finally runs first because it's already deferred. */
+            emit(c, MAKE_A(OP_THROW, 0, 0));
         } else {
             emit(c, MAKE_A(OP_POP, 0, 0));
             if (want_value) emit(c, MAKE_A(OP_PUSH_NULL, 0, 0));
         }
         patch_jump(c, over_catch);
-        if (n->try_.finally_block)
-            compile_node(c, n->try_.finally_block, 0);
+        if (n->try_.finally_block) {
+            emit(c, MAKE_A(OP_DEFER_RUN, 0, 0));
+        }
         return;
     }
 

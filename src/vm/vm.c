@@ -1218,7 +1218,10 @@ VM *vm_new_child(VM *parent) {
     vm->frames_cap = VM_FRAMES_INIT;
     vm->frames     = xs_malloc(vm->frames_cap * sizeof(CallFrame));
     memset(vm->frames, 0, vm->frames_cap * sizeof(CallFrame));
-    vm->globals    = parent ? parent->globals : map_new();
+    /* parent==NULL means the caller will set globals manually (used by
+       the spawn worker so it can borrow the root VM's globals even when
+       the immediate spawner is itself a worker that's about to exit). */
+    vm->globals    = parent ? parent->globals : NULL;
     vm->n_tasks    = 0;
     vm->pending_throw_frame = -1;
     return vm;

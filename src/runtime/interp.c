@@ -5685,8 +5685,8 @@ do_call: ;
             value_decref(result);
             result = value_incref(XS_NULL_VAL);
             Value *exc = i->cf.value;
-            if (exc) value_incref(exc);
-            CF_CLEAR(i);
+            i->cf.value = NULL;  /* take ownership; CF_CLEAR would decref */
+            i->cf.signal = 0;
             /* Find matching catch arm */
             int caught = 0;
             for (int j = 0; j < n->try_.catch_arms.len; j++) {
@@ -5705,16 +5705,37 @@ do_call: ;
                 }
                 env_decref(arm_env);
             }
-            if (exc) value_decref(exc);
             if (!caught && exc) {
-                /* re-throw */
+                /* No catch arm matched: park the throw so finally still
+                   runs and the throw propagates out to the next handler. */
                 if (i->cf.value) value_decref(i->cf.value);
                 i->cf.signal = CF_THROW;
-                i->cf.value  = value_incref(exc);
+                i->cf.value  = exc;
+                exc = NULL;
+            }
+            if (exc) value_decref(exc);
+        }
+        /* Finally always runs, even on return/throw/break/continue.
+           Save the pending signal+value, clear them while running the
+           finally body, then restore unless finally itself throws. */
+        if (n->try_.finally_block) {
+            int saved_signal = i->cf.signal;
+            Value *saved_value = i->cf.value;
+            char *saved_label = i->cf.label;
+            i->cf.signal = 0;
+            i->cf.value = NULL;
+            i->cf.label = NULL;
+            interp_exec(i, n->try_.finally_block);
+            if (i->cf.signal) {
+                /* finally raised something; that wins over the original. */
+                if (saved_value) value_decref(saved_value);
+                if (saved_label) free(saved_label);
+            } else {
+                i->cf.signal = saved_signal;
+                i->cf.value = saved_value;
+                i->cf.label = saved_label;
             }
         }
-        if (n->try_.finally_block && !i->cf.signal)
-            interp_exec(i, n->try_.finally_block);
         return result;
     }
 

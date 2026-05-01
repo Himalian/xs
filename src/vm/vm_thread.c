@@ -63,21 +63,26 @@ static VMThreadTask *vm_tasks_find(int id) {
 
 typedef struct {
     VMThreadTask *task;
-    VM           *parent;
+    /* Snapshot the globals map up-front instead of stashing the parent
+       VM pointer: a nested spawn's parent is the OUTER worker VM, which
+       gets freed when the outer body completes. The globals XSMap
+       itself is owned by the root VM and survives. */
+    XSMap        *globals;
 } VMThreadArg;
 
 static void *vm_thread_entry(void *arg_) {
     VMThreadArg *arg = (VMThreadArg *)arg_;
     VMThreadTask *t  = arg->task;
-    VM           *parent = arg->parent;
+    XSMap        *globals = arg->globals;
     free(arg);
 
     xs_gil_acquire();
 
     /* Each spawn gets a private VM so its stack/frames/eff_stack don't
        race against whoever else is running under the GIL between yields.
-       Globals and stdlib closures stay shared via the parent. */
-    VM *worker = vm_new_child(parent);
+       Globals stay shared via the cached XSMap pointer (root VM owns it). */
+    VM *worker = vm_new_child(NULL);
+    worker->globals = globals;
     worker->is_thread_worker = 1;
 
     Value *r = vm_invoke_public(worker, t->closure, NULL, 0);
@@ -125,8 +130,8 @@ Value *vm_spawn_real(VM *parent, Value *closure) {
     xs_cond_init(&t->cv);
 
     VMThreadArg *arg = xs_malloc(sizeof(*arg));
-    arg->task   = t;
-    arg->parent = parent;
+    arg->task    = t;
+    arg->globals = parent ? parent->globals : NULL;
 
     xs_thread_t th;
     if (xs_thread_create(&th, vm_thread_entry, arg) != 0) {

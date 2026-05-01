@@ -24,14 +24,16 @@ extern int g_xs_runtime_error_count;
 /* Number of live try frames across both backends. Bumped by the
    interpreter on NODE_TRY entry and by the VM on OP_TRY_BEGIN. When > 0
    xs_runtime_error knows the throw it raises will be caught and skips
-   inline rendering + the exit-code bump. */
-extern int g_xs_in_try;
+   inline rendering + the exit-code bump. Thread-local so spawn workers
+   don't see each other's try state. */
+extern __thread int g_xs_in_try;
 
 /* Pending throwable installed by xs_runtime_error when called from
    contexts that do not own an interp (currently the VM). The VM's
    dispatch loop checks this at the top of each iteration and unwinds
    like OP_THROW would. The interpreter ignores it (it has its own
-   cf.signal/cf.value path). Owned; cleared when consumed. */
-extern Value *g_xs_pending_throw;
+   cf.signal/cf.value path). Owned; cleared when consumed. Thread-local
+   so workers don't trample each other. */
+extern __thread Value *g_xs_pending_throw;
 
 #endif

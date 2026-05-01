@@ -252,7 +252,11 @@ Value *xs_chan_recv(Value *ch, Interp *interp) {
     while (bf->len == 0) {
         xs_cond_wait(&cs->cv, &cs->mu);
     }
-    Value *val = value_incref(bf->items[0]);
+    /* Take ownership of the existing slot's refcount instead of
+       incref-ing under the channel mutex (refcount mutation needs the
+       GIL). The sender already incref'd when it pushed; we just steal
+       that reference and shift the buffer. */
+    Value *val = bf->items[0];
     for (int i = 0; i < bf->len - 1; i++) bf->items[i] = bf->items[i + 1];
     bf->len--;
     xs_mutex_unlock(&cs->mu);

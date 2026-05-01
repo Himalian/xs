@@ -48,8 +48,11 @@ Value *xs_error_cause(Value *err) {
 /* runtime error reporting */
 
 int g_xs_runtime_error_count = 0;
-int g_xs_in_try              = 0;
-Value *g_xs_pending_throw    = NULL;
+/* Thread-local because each spawn worker has its own try-frame stack
+   and pending throw — sharing them across threads (the original layout)
+   would let a worker park its exception on top of a sibling's. */
+__thread int g_xs_in_try         = 0;
+__thread Value *g_xs_pending_throw = NULL;
 
 void xs_runtime_error(Span span, const char *label, const char *hint,
                       const char *fmt, ...) {
