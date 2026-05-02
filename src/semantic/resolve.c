@@ -217,9 +217,14 @@ static void resolve_node(Node *n, SymTab *st, SemaCtx *ctx) {
                 sym_define(st, pm->name, SYM_PARAM, NULL, NULL, 0);
         }
         int saved_gen = ctx->in_generator;
+        int saved_loop = ctx->in_loop;
         if (n->fn_decl.is_generator) ctx->in_generator++;
         else                         ctx->in_generator = 0;
+        ctx->in_loop = 0;
+        ctx->in_function++;
         if (n->fn_decl.body) resolve_node(n->fn_decl.body, st, ctx);
+        ctx->in_function--;
+        ctx->in_loop = saved_loop;
         ctx->in_generator = saved_gen;
         scope_pop(st);
         break;
@@ -234,8 +239,13 @@ static void resolve_node(Node *n, SymTab *st, SemaCtx *ctx) {
         }
         sym_define(st, "__block", SYM_PARAM, NULL, NULL, 0);
         int saved_gen = ctx->in_generator;
+        int saved_loop = ctx->in_loop;
         ctx->in_generator++;  /* tag bodies use yield to run the caller block */
+        ctx->in_loop = 0;
+        ctx->in_function++;
         if (n->tag_decl.body) resolve_node(n->tag_decl.body, st, ctx);
+        ctx->in_function--;
+        ctx->in_loop = saved_loop;
         ctx->in_generator = saved_gen;
         scope_pop(st);
         break;
@@ -393,7 +403,9 @@ static void resolve_node(Node *n, SymTab *st, SemaCtx *ctx) {
 
     case NODE_WHILE:
         resolve_node(n->while_loop.cond, st, ctx);
+        ctx->in_loop++;
         resolve_node(n->while_loop.body, st, ctx);
+        ctx->in_loop--;
         break;
 
     case NODE_FOR:
@@ -401,15 +413,26 @@ static void resolve_node(Node *n, SymTab *st, SemaCtx *ctx) {
         scope_push(st);
         if (n->for_loop.pattern)
             define_pattern_bindings(n->for_loop.pattern, st);
+        ctx->in_loop++;
         resolve_node(n->for_loop.body, st, ctx);
+        ctx->in_loop--;
         scope_pop(st);
         break;
 
     case NODE_LOOP:
+        ctx->in_loop++;
         resolve_node(n->loop.body, st, ctx);
+        ctx->in_loop--;
         break;
 
     case NODE_RETURN:
+        if (ctx->in_function == 0) {
+            Diagnostic *d = diag_new(DIAG_ERROR, DIAG_PHASE_SEMANTIC, "S0041",
+                                     "return outside function");
+            diag_annotate(d, n->span, 1, "return is only valid inside a fn body");
+            diag_emit(ctx->diag, d);
+            ctx->n_errors++;
+        }
         if (n->ret.value) resolve_node(n->ret.value, st, ctx);
         break;
 
@@ -501,9 +524,14 @@ static void resolve_node(Node *n, SymTab *st, SemaCtx *ctx) {
                 sym_define(st, pm->name, SYM_PARAM, NULL, NULL, 0);
         }
         int saved_gen = ctx->in_generator;
+        int saved_loop = ctx->in_loop;
         if (n->lambda.is_generator) ctx->in_generator++;
         else                        ctx->in_generator = 0;
+        ctx->in_loop = 0;
+        ctx->in_function++;
         if (n->lambda.body) resolve_node(n->lambda.body, st, ctx);
+        ctx->in_function--;
+        ctx->in_loop = saved_loop;
         ctx->in_generator = saved_gen;
         scope_pop(st);
         break;
@@ -596,7 +624,24 @@ static void resolve_node(Node *n, SymTab *st, SemaCtx *ctx) {
         break;
 
     case NODE_BREAK:
+        if (ctx->in_loop == 0) {
+            Diagnostic *d = diag_new(DIAG_ERROR, DIAG_PHASE_SEMANTIC, "S0042",
+                                     "break outside loop");
+            diag_annotate(d, n->span, 1, "break is only valid inside while / for / loop");
+            diag_emit(ctx->diag, d);
+            ctx->n_errors++;
+        }
         if (n->brk.value) resolve_node(n->brk.value, st, ctx);
+        break;
+
+    case NODE_CONTINUE:
+        if (ctx->in_loop == 0) {
+            Diagnostic *d = diag_new(DIAG_ERROR, DIAG_PHASE_SEMANTIC, "S0042",
+                                     "continue outside loop");
+            diag_annotate(d, n->span, 1, "continue is only valid inside while / for / loop");
+            diag_emit(ctx->diag, d);
+            ctx->n_errors++;
+        }
         break;
 
     case NODE_PROGRAM:
@@ -610,7 +655,6 @@ static void resolve_node(Node *n, SymTab *st, SemaCtx *ctx) {
     case NODE_LIT_BOOL:
     case NODE_LIT_NULL:
     case NODE_LIT_CHAR:
-    case NODE_CONTINUE:
     case NODE_PAT_WILD:
     case NODE_PAT_LIT:
     case NODE_PAT_IDENT:

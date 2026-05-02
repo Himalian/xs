@@ -18,6 +18,13 @@ typedef struct {
     /* Nesting depth of fn* generator functions currently being resolved.
        `yield` is only valid when this is > 0. */
     int       in_generator;
+    /* Nesting depth of loops currently being resolved. break / continue
+       are only valid when this is > 0. */
+    int       in_loop;
+    /* Nesting depth of functions currently being resolved. `return` at
+       the top level is a sema error (you'd be returning from main, but
+       its value goes nowhere). */
+    int       in_function;
 } SemaCtx;
 
 void sema_init(SemaCtx *ctx, int lenient, int strict);

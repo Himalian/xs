@@ -1981,7 +1981,22 @@ static int vm_dispatch(VM *vm, int stop_frame) {
         }
         case OP_INDEX_SET: {
             Value *val = POP(), *idx = POP(), *col = POP();
-            if ((VAL_TAG(col)==XS_ARRAY||VAL_TAG(col)==XS_TUPLE) && VAL_TAG(idx)==XS_INT) {
+            if (VAL_TAG(col) == XS_STR) {
+                /* Strings are immutable; silent no-op was masking the
+                   error for users coming from languages with mutable
+                   string buffers. */
+                value_decref(val); value_decref(idx); value_decref(col);
+                xs_runtime_error(span_zero(), "TypeError", NULL,
+                                 "strings are immutable; cannot assign by index");
+                break;
+            }
+            if (VAL_TAG(col) == XS_TUPLE) {
+                value_decref(val); value_decref(idx); value_decref(col);
+                xs_runtime_error(span_zero(), "TypeError", NULL,
+                                 "tuples are immutable; cannot assign by index");
+                break;
+            }
+            if ((VAL_TAG(col)==XS_ARRAY) && VAL_TAG(idx)==XS_INT) {
                 int64_t i = VAL_INT(idx);
                 int64_t n = col->arr->len;
                 /* allow Python-style negative indexing on assign too */
@@ -2062,7 +2077,14 @@ static int vm_dispatch(VM *vm, int stop_frame) {
         case OP_STORE_FIELD: {
             const char *name = PROTO->chunk.consts[INSTR_Bx(instr)]->s;
             Value *val = POP(), *obj = POP();
-            if (VAL_TAG(obj) == XS_MAP || VAL_TAG(obj) == XS_MODULE) map_set(obj->map, name, val);
+            if (VAL_TAG(obj) == XS_MAP || VAL_TAG(obj) == XS_MODULE) {
+                map_set(obj->map, name, val);
+            } else if (VAL_TAG(obj) == XS_TUPLE) {
+                value_decref(val); value_decref(obj);
+                xs_runtime_error(span_zero(), "TypeError", NULL,
+                                 "tuples are immutable; cannot assign field '%s'", name);
+                break;
+            }
             value_decref(val); value_decref(obj); break;
         }
         case OP_MAKE_MAP: {
