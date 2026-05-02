@@ -49,8 +49,11 @@ typedef struct ThreadTask {
     int                 id;
     int                 done;
     int                 errored;
+    int                 cancelled;     /* nursery cancellation flag */
+    int                 nursery_id;    /* 0 = standalone; else nursery instance id */
     Value              *closure;       /* incref'd while running */
     Value              *result;        /* set under task_mu when done */
+    Value              *error;         /* captured cf.value on errored exit */
     xs_mutex_t          mu;
     xs_cond_t           cv;
     struct ThreadTask  *next;
@@ -65,6 +68,46 @@ static void tasks_mu_init_once(void) {
     if (g_tasks_mu_init) return;
     xs_mutex_init(&g_tasks_mu);
     g_tasks_mu_init = 1;
+}
+
+static _Thread_local int  tls_nursery_id = 0;
+static _Thread_local ThreadTask *tls_current_task = NULL;
+static _Thread_local int *tls_self_cancel_ptr = NULL;
+static int g_next_nursery_id = 1;
+
+void xs_task_set_self_cancel_ptr(int *flag) { tls_self_cancel_ptr = flag; }
+
+int xs_nursery_alloc_id(void) {
+    tasks_mu_init_once();
+    xs_mutex_lock(&g_tasks_mu);
+    int id = g_next_nursery_id++;
+    xs_mutex_unlock(&g_tasks_mu);
+    return id;
+}
+
+int  xs_nursery_current_id(void)        { return tls_nursery_id; }
+void xs_nursery_set_current_id(int id)  { tls_nursery_id = id; }
+
+int xs_task_is_cancelled(void) {
+    if (tls_self_cancel_ptr) return *tls_self_cancel_ptr;
+    return tls_current_task ? tls_current_task->cancelled : 0;
+}
+
+/* Mark every still-running task that shares this nursery_id (other
+   than the throwing task itself) as cancelled, and wake any pending
+   condvars so they re-check the flag. Caller must hold g_tasks_mu. */
+static void mark_siblings_cancelled_locked(int nursery_id, int self_id) {
+    if (nursery_id == 0) return;
+    for (ThreadTask *t = g_tasks_head; t; t = t->next) {
+        if (t->id == self_id) continue;
+        if (t->nursery_id != nursery_id) continue;
+        xs_mutex_lock(&t->mu);
+        if (!t->done) {
+            t->cancelled = 1;
+            xs_cond_broadcast(&t->cv);
+        }
+        xs_mutex_unlock(&t->mu);
+    }
 }
 
 static ThreadTask *tasks_find(int id) {
@@ -85,6 +128,9 @@ static void *thread_entry(void *arg_) {
     free(arg);
 
     xs_gil_acquire();
+    tls_current_task = t;
+    tls_self_cancel_ptr = &t->cancelled;
+    tls_nursery_id   = t->nursery_id;
     /* Save and clear control-flow signals so the spawned task starts
        clean and any throw it does is captured here, not propagated to
        the parent. */
@@ -96,6 +142,13 @@ static void *thread_entry(void *arg_) {
     Value *r = call_value(ig, t->closure, NULL, 0, "spawn");
     int errored = (ig->cf.signal == CF_THROW || ig->cf.signal == CF_ERROR
                    || ig->cf.signal == CF_PANIC);
+    /* Hand the captured throw value off to the task record so a
+       later xs_await_task_ex can re-raise it on the awaiter. */
+    Value *captured_err = NULL;
+    if (errored && ig->cf.value) {
+        captured_err = ig->cf.value;
+        ig->cf.value = NULL;
+    }
 
     /* Restore parent signals; the spawned task must not poison them. */
     if (ig->cf.value) value_decref(ig->cf.value);
@@ -104,11 +157,23 @@ static void *thread_entry(void *arg_) {
 
     xs_mutex_lock(&t->mu);
     t->result  = r ? r : value_incref(XS_NULL_VAL);
+    t->error   = captured_err;
     t->errored = errored;
     t->done    = 1;
     xs_cond_broadcast(&t->cv);
     xs_mutex_unlock(&t->mu);
 
+    /* If we errored inside a nursery, propagate cancel to siblings so
+       any blocked sleep / recv wakes up and bails before its body
+       prints or sends. */
+    if (errored && t->nursery_id != 0) {
+        xs_mutex_lock(&g_tasks_mu);
+        mark_siblings_cancelled_locked(t->nursery_id, t->id);
+        xs_mutex_unlock(&g_tasks_mu);
+    }
+
+    tls_current_task = NULL;
+    tls_self_cancel_ptr = NULL;
     xs_gil_release();
     return NULL;
 }
@@ -126,6 +191,9 @@ Value *xs_spawn_thread(Interp *parent, Value *closure) {
     g_tasks_head = t;
     xs_mutex_unlock(&g_tasks_mu);
 
+    /* Stamp the spawning thread's nursery id onto the new task so a
+       sibling failure can find and cancel us. */
+    t->nursery_id = tls_nursery_id;
     t->closure = value_incref(closure);
     xs_mutex_init(&t->mu);
     xs_cond_init(&t->cv);
@@ -153,6 +221,12 @@ Value *xs_spawn_thread(Interp *parent, Value *closure) {
 }
 
 Value *xs_await_task(int task_id) {
+    return xs_await_task_ex(task_id, NULL, NULL);
+}
+
+Value *xs_await_task_ex(int task_id, int *errored_out, Value **err_out) {
+    if (errored_out) *errored_out = 0;
+    if (err_out)     *err_out = NULL;
     if (task_id <= 0) return value_incref(XS_NULL_VAL);
     tasks_mu_init_once();
 
@@ -166,6 +240,12 @@ Value *xs_await_task(int task_id) {
     xs_mutex_lock(&t->mu);
     while (!t->done) xs_cond_wait(&t->cv, &t->mu);
     Value *r = t->result ? value_incref(t->result) : value_incref(XS_NULL_VAL);
+    if (errored_out) *errored_out = t->errored;
+    if (err_out && t->error) {
+        *err_out  = t->error;
+        t->error  = NULL;
+        t->errored = 0;
+    }
     xs_mutex_unlock(&t->mu);
     xs_gil_acquire();
     return r;
@@ -206,6 +286,8 @@ void xs_drain_interp_tasks(void) {
 typedef struct ChanState {
     xs_mutex_t mu;
     xs_cond_t  cv;
+    int        cap;     /* 0 = unbounded */
+    int        closed;
     /* The buffer is owned by the XS_MAP slot "_buf"; the ChanState only
        provides synchronization. We still cache an XSArray* here for
        speed but it shares ownership with the map slot. */
@@ -223,7 +305,7 @@ static void chans_mu_init_once(void) {
     g_chans_mu_init = 1;
 }
 
-int xs_chan_alloc(void) {
+int xs_chan_alloc(int cap) {
     chans_mu_init_once();
     xs_mutex_lock(&g_chans_mu);
     if (g_n_chans >= MAX_CHANS) {
@@ -233,6 +315,8 @@ int xs_chan_alloc(void) {
     int id = g_n_chans++;
     xs_mutex_init(&g_chans[id].mu);
     xs_cond_init(&g_chans[id].cv);
+    g_chans[id].cap    = cap > 0 ? cap : 0;
+    g_chans[id].closed = 0;
     xs_mutex_unlock(&g_chans_mu);
     return id;
 }
@@ -253,16 +337,40 @@ static XSArray *chan_buf(Value *ch) {
     return b->arr;
 }
 
-Value *xs_chan_send(Value *ch, Value *v) {
+int xs_chan_send(Value *ch, Value *v) {
     ChanState *cs = chan_state(ch);
     XSArray   *bf = chan_buf(ch);
-    if (!cs || !bf) return value_incref(XS_NULL_VAL);
+    if (!cs || !bf) return 1;
+
+    /* If bounded, wait for a free slot. Drop the GIL so a peer recv
+       can actually run and make space. */
+    if (cs->cap > 0) {
+        xs_gil_release();
+        xs_mutex_lock(&cs->mu);
+        while (!cs->closed && bf->len >= cs->cap) {
+            xs_cond_wait(&cs->cv, &cs->mu);
+        }
+        if (cs->closed) {
+            xs_mutex_unlock(&cs->mu);
+            xs_gil_acquire();
+            return 0;
+        }
+        array_push(bf, v);
+        xs_cond_broadcast(&cs->cv);
+        xs_mutex_unlock(&cs->mu);
+        xs_gil_acquire();
+        return 1;
+    }
 
     xs_mutex_lock(&cs->mu);
+    if (cs->closed) {
+        xs_mutex_unlock(&cs->mu);
+        return 0;
+    }
     array_push(bf, v);
     xs_cond_broadcast(&cs->cv);
     xs_mutex_unlock(&cs->mu);
-    return value_incref(XS_NULL_VAL);
+    return 1;
 }
 
 Value *xs_chan_recv(Value *ch, Interp *interp) {
@@ -275,8 +383,26 @@ Value *xs_chan_recv(Value *ch, Interp *interp) {
        (and the sender we are waiting on) can actually run. */
     xs_gil_release();
     xs_mutex_lock(&cs->mu);
-    while (bf->len == 0) {
-        xs_cond_wait(&cs->cv, &cs->mu);
+    int cancelled = 0;
+    while (bf->len == 0 && !cs->closed) {
+        /* Time-bounded wait so a sibling cancellation flipped on this
+           task is observed even when no sender ever broadcasts. */
+        xs_cond_timedwait_ms(&cs->cv, &cs->mu, 25);
+        if (tls_current_task && tls_current_task->cancelled) {
+            cancelled = 1;
+            break;
+        }
+    }
+    if (cancelled) {
+        xs_mutex_unlock(&cs->mu);
+        xs_gil_acquire();
+        return value_incref(XS_NULL_VAL);
+    }
+    if (bf->len == 0) {
+        /* closed and drained: stop blocking, return null */
+        xs_mutex_unlock(&cs->mu);
+        xs_gil_acquire();
+        return value_incref(XS_NULL_VAL);
     }
     /* Take ownership of the existing slot's refcount instead of
        incref-ing under the channel mutex (refcount mutation needs the
@@ -285,6 +411,8 @@ Value *xs_chan_recv(Value *ch, Interp *interp) {
     Value *val = bf->items[0];
     for (int i = 0; i < bf->len - 1; i++) bf->items[i] = bf->items[i + 1];
     bf->len--;
+    /* A bounded sender may be waiting for buffer space; wake them. */
+    xs_cond_broadcast(&cs->cv);
     xs_mutex_unlock(&cs->mu);
     xs_gil_acquire();
     return val;
@@ -301,6 +429,7 @@ Value *xs_chan_try_recv(Value *ch) {
         val = value_incref(bf->items[0]);
         for (int i = 0; i < bf->len - 1; i++) bf->items[i] = bf->items[i + 1];
         bf->len--;
+        xs_cond_broadcast(&cs->cv);
     }
     xs_mutex_unlock(&cs->mu);
     return val ? val : value_incref(XS_NULL_VAL);
@@ -316,10 +445,84 @@ int xs_chan_len(Value *ch) {
     return n;
 }
 
+int xs_chan_cap(Value *ch) {
+    ChanState *cs = chan_state(ch);
+    if (!cs) return 0;
+    return cs->cap;
+}
+
+int xs_chan_is_full(Value *ch) {
+    ChanState *cs = chan_state(ch);
+    XSArray   *bf = chan_buf(ch);
+    if (!cs || !bf) return 0;
+    if (cs->cap <= 0) return 0;
+    xs_mutex_lock(&cs->mu);
+    int full = bf->len >= cs->cap;
+    xs_mutex_unlock(&cs->mu);
+    return full;
+}
+
+int xs_chan_is_closed(Value *ch) {
+    ChanState *cs = chan_state(ch);
+    if (!cs) return 0;
+    xs_mutex_lock(&cs->mu);
+    int c = cs->closed;
+    xs_mutex_unlock(&cs->mu);
+    return c;
+}
+
+void xs_chan_close(Value *ch) {
+    ChanState *cs = chan_state(ch);
+    if (!cs) return;
+    xs_mutex_lock(&cs->mu);
+    cs->closed = 1;
+    /* Wake every waiter: pending recvs return null, pending bounded
+       sends bail out with the closed-channel error. */
+    xs_cond_broadcast(&cs->cv);
+    xs_mutex_unlock(&cs->mu);
+}
+
+int xs_chan_select(Value **chs, int n, Value **out) {
+    /* Walk the channel array once; first one with a buffered value
+       wins. Acquire each channel's mutex in turn so the read/dequeue is
+       atomic with respect to that channel. We don't lock all of them
+       up front: the GIL is already held, so concurrent senders only
+       advance once we release it (e.g. via blocking ops). */
+    if (out) *out = NULL;
+    for (int i = 0; i < n; i++) {
+        ChanState *cs = chan_state(chs[i]);
+        XSArray   *bf = chan_buf(chs[i]);
+        if (!cs || !bf) continue;
+        xs_mutex_lock(&cs->mu);
+        if (bf->len > 0) {
+            Value *v = bf->items[0];
+            for (int j = 0; j < bf->len - 1; j++) bf->items[j] = bf->items[j + 1];
+            bf->len--;
+            xs_cond_broadcast(&cs->cv);
+            xs_mutex_unlock(&cs->mu);
+            if (out) *out = v;
+            else value_decref(v);
+            return i;
+        }
+        xs_mutex_unlock(&cs->mu);
+    }
+    return -1;
+}
+
 void xs_sleep_seconds(double secs) {
     if (secs <= 0) return;
+    /* Sleep in 25ms chunks so a cancellation flipped on this task by a
+       sibling's throw is observed within bounded latency, not after
+       the full requested duration. */
+    const double chunk = 0.025;
+    double remaining = secs;
     xs_gil_release();
-    xs_thread_sleep_ns(secs);
+    while (remaining > 0) {
+        double s = remaining > chunk ? chunk : remaining;
+        xs_thread_sleep_ns(s);
+        remaining -= s;
+        if (xs_task_is_cancelled()) break;
+    }
     xs_gil_acquire();
 }
 

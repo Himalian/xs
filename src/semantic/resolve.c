@@ -50,7 +50,7 @@ static int is_builtin_name(const char *name) {
         "is_str","is_bool","is_array","is_fn",
         "int","float","str","bool","char","repr","ord","chr",
         "dbg","pprint","clear","sprintf",
-        "channel","spawn","nursery","signal","derived",
+        "channel","select","spawn","nursery","signal","derived",
         "math","time","io","string","path","base64","hash","uuid",
         "collections","random","json","log","fmt","test","csv","url",
         "re","process","os","async","net","crypto","thread","buf",

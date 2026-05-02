@@ -5,6 +5,7 @@
 #include "runtime/builtins.h"
 #include "runtime/async.h"
 #include "runtime/concurrent.h"
+#include "runtime/error.h"
 #include "core/value.h"
 #include <stdlib.h>
 #include <string.h>
@@ -51,9 +52,20 @@ static Value *native_async_sleep(Interp *ig, Value **a, int n) {
 }
 
 Value *native_channel_send(Interp *ig, Value **a, int n) {
-    (void)ig;
     if (n < 2) return value_incref(XS_NULL_VAL);
-    return xs_chan_send(a[0], a[1]);
+    if (!xs_chan_send(a[0], a[1])) {
+        Value *err = xs_error_new("ChannelClosed",
+            "send on closed channel", NULL);
+        if (ig) {
+            if (ig->cf.value) value_decref(ig->cf.value);
+            ig->cf.signal = CF_THROW;
+            ig->cf.value  = err;
+        } else {
+            value_decref(err);
+        }
+        return value_incref(XS_NULL_VAL);
+    }
+    return value_incref(XS_NULL_VAL);
 }
 
 Value *native_channel_recv(Interp *ig, Value **a, int n) {
@@ -67,10 +79,29 @@ Value *native_channel_try_recv(Interp *ig, Value **a, int n) {
     return xs_chan_try_recv(a[0]);
 }
 
+Value *native_channel_close(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1) return value_incref(XS_NULL_VAL);
+    xs_chan_close(a[0]);
+    return value_incref(XS_NULL_VAL);
+}
+
+Value *native_channel_is_closed(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1) return value_incref(XS_FALSE_VAL);
+    return xs_chan_is_closed(a[0]) ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL);
+}
+
 Value *native_channel_len(Interp *ig, Value **a, int n) {
     (void)ig;
     if (n < 1) return xs_int(0);
     return xs_int(xs_chan_len(a[0]));
+}
+
+Value *native_channel_cap(Interp *ig, Value **a, int n) {
+    (void)ig;
+    if (n < 1) return xs_int(0);
+    return xs_int(xs_chan_cap(a[0]));
 }
 
 Value *native_channel_is_empty(Interp *ig, Value **a, int n) {
@@ -80,19 +111,24 @@ Value *native_channel_is_empty(Interp *ig, Value **a, int n) {
 }
 
 Value *native_channel_is_full(Interp *ig, Value **a, int n) {
-    /* The current channel implementation is unbounded, so a channel is
-       never full. Kept for API compatibility with the previous version. */
-    (void)ig; (void)a; (void)n;
-    return value_incref(XS_FALSE_VAL);
+    (void)ig;
+    if (n < 1) return value_incref(XS_FALSE_VAL);
+    return xs_chan_is_full(a[0]) ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL);
 }
 
 static Value *native_async_channel(Interp *ig, Value **a, int n) {
-    (void)ig; (void)a; (void)n;
+    (void)ig;
     /* Concurrent channel: FIFO buffer + mutex/condvar slot allocated
        in a global table so the sync state survives across send/recv
        calls. recv blocks until data is available; sends wake all
-       waiters. */
-    int chid = xs_chan_alloc();
+       waiters. With a positive cap arg, send blocks while the buffer
+       is full. */
+    int cap = 0;
+    if (n > 0 && a[0]) {
+        if (VAL_TAG(a[0]) == XS_INT) cap = (int)VAL_INT(a[0]);
+        else if (VAL_TAG(a[0]) == XS_FLOAT) cap = (int)a[0]->f;
+    }
+    int chid = xs_chan_alloc(cap);
     XSMap *ch = map_new();
     Value *buf = xs_array_new();
     map_set(ch, "_buf", buf);
@@ -100,55 +136,57 @@ static Value *native_async_channel(Interp *ig, Value **a, int n) {
     Value *idv = xs_int(chid);
     map_set(ch, "_chan_id", idv);
     value_decref(idv);
+    Value *capv = xs_int(cap);
+    map_set(ch, "_cap", capv);
+    value_decref(capv);
     map_take(ch, "send", xs_native(native_channel_send));
     map_take(ch, "recv", xs_native(native_channel_recv));
     map_take(ch, "try_recv", xs_native(native_channel_try_recv));
+    map_take(ch, "close", xs_native(native_channel_close));
+    map_take(ch, "is_closed", xs_native(native_channel_is_closed));
     map_take(ch, "len", xs_native(native_channel_len));
+    map_take(ch, "cap", xs_native(native_channel_cap));
     map_take(ch, "is_empty", xs_native(native_channel_is_empty));
     map_take(ch, "is_full", xs_native(native_channel_is_full));
     return xs_module(ch);
 }
 
-static Value *native_async_select(Interp *ig, Value **a, int n) {
+Value *native_async_select(Interp *ig, Value **a, int n) {
     (void)ig;
     /* select(channels_or_tasks): poll an array of channel/task-like
        values and return a map { index: <idx>, value: <result> } for the
-       first one that has a ready result.
-       A channel is ready when its "_buf" array is non-empty.
-       A task/promise is ready when it has a "_result" key.
-       If nothing is ready, return null. */
+       first one that has a ready result. Channel readiness goes through
+       the channel mutex (so no lost wake-ups racing with a sender);
+       task readiness still keys on the "_result" map field used by
+       cooperative spawn/await. Returns null if nothing is ready. */
     if (n < 1 || VAL_TAG(a[0]) != XS_ARRAY) return value_incref(XS_NULL_VAL);
     XSArray *arr = a[0]->arr;
     for (int i = 0; i < arr->len; i++) {
         Value *item = arr->items[i];
-        if ((VAL_TAG(item) == XS_MAP || VAL_TAG(item) == XS_MODULE) && item->map) {
-            /* Check for channel readiness: "_buf" array with len > 0 */
-            Value *buf = map_get(item->map, "_buf");
-            if (buf && VAL_TAG(buf) == XS_ARRAY && buf->arr->len > 0) {
-                /* Consume the first buffered value */
-                Value *val = value_incref(buf->arr->items[0]);
-                /* Shift the buffer: remove first element */
-                for (int j = 0; j < buf->arr->len - 1; j++)
-                    buf->arr->items[j] = buf->arr->items[j + 1];
-                buf->arr->len--;
-                XSMap *result = map_new();
-                map_take(result, "index", xs_int(i));
-                map_set(result, "value", val);
-                value_decref(val);
-                return xs_module(result);
+        if (!item || (VAL_TAG(item) != XS_MAP && VAL_TAG(item) != XS_MODULE) || !item->map)
+            continue;
+        Value *cid = map_get(item->map, "_chan_id");
+        if (cid && VAL_TAG(cid) == XS_INT) {
+            Value *got = NULL;
+            int idx = xs_chan_select(&item, 1, &got);
+            if (idx >= 0 && got) {
+                Value *result = xs_map_new();
+                Value *iv = xs_int(i);
+                map_set(result->map, "index", iv); value_decref(iv);
+                map_set(result->map, "value", got); value_decref(got);
+                return result;
             }
-            /* Check for task/promise readiness: "_result" key present */
-            Value *res = map_get(item->map, "_result");
-            if (res) {
-                XSMap *result = map_new();
-                map_take(result, "index", xs_int(i));
-                map_set(result, "value", value_incref(res));
-                value_decref(res);
-                return xs_module(result);
-            }
+            continue;
+        }
+        Value *res = map_get(item->map, "_result");
+        if (res) {
+            Value *result = xs_map_new();
+            Value *iv = xs_int(i);
+            map_set(result->map, "index", iv); value_decref(iv);
+            map_set(result->map, "value", value_incref(res));
+            return result;
         }
     }
-    /* Nothing ready */
     return value_incref(XS_NULL_VAL);
 }
 

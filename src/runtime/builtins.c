@@ -1154,25 +1154,37 @@ static Value *builtin_chr(Interp *i, Value **args, int argc) {
 Value *native_channel_send(Interp *ig, Value **a, int n);
 Value *native_channel_recv(Interp *ig, Value **a, int n);
 Value *native_channel_try_recv(Interp *ig, Value **a, int n);
+Value *native_channel_close(Interp *ig, Value **a, int n);
+Value *native_channel_is_closed(Interp *ig, Value **a, int n);
 Value *native_channel_len(Interp *ig, Value **a, int n);
+Value *native_channel_cap(Interp *ig, Value **a, int n);
 Value *native_channel_is_empty(Interp *ig, Value **a, int n);
 Value *native_channel_is_full(Interp *ig, Value **a, int n);
 
 static Value *builtin_channel(Interp *i, Value **args, int argc) {
-    (void)i; (void)args; (void)argc;
+    (void)i;
     /* `channel()` returns a real concurrent channel: send wakes
        blocked recvs, recv blocks while empty (releasing the GIL so a
-       sender on another thread can run). The optional cap arg is
-       accepted but currently unbounded; .send never blocks. */
-    int chid = xs_chan_alloc();
+       sender on another thread can run). With a positive cap, send
+       blocks while the buffer is full. */
+    int cap = 0;
+    if (argc > 0 && args[0]) {
+        if (VAL_TAG(args[0]) == XS_INT) cap = (int)VAL_INT(args[0]);
+        else if (VAL_TAG(args[0]) == XS_FLOAT) cap = (int)args[0]->f;
+    }
+    int chid = xs_chan_alloc(cap);
     Value *ch = xs_map_new();
     Value *t = xs_str("Channel");        map_set(ch->map,"_type",t);     value_decref(t);
     Value *idv = xs_int(chid);           map_set(ch->map,"_chan_id",idv); value_decref(idv);
+    Value *capv = xs_int(cap);           map_set(ch->map,"_cap",capv);    value_decref(capv);
     Value *data = xs_array_new();        map_set(ch->map,"_buf",data);    value_decref(data);
     map_take(ch->map, "send", xs_native(native_channel_send));
     map_take(ch->map, "recv", xs_native(native_channel_recv));
     map_take(ch->map, "try_recv", xs_native(native_channel_try_recv));
+    map_take(ch->map, "close", xs_native(native_channel_close));
+    map_take(ch->map, "is_closed", xs_native(native_channel_is_closed));
     map_take(ch->map, "len", xs_native(native_channel_len));
+    map_take(ch->map, "cap", xs_native(native_channel_cap));
     map_take(ch->map, "is_empty", xs_native(native_channel_is_empty));
     map_take(ch->map, "is_full", xs_native(native_channel_is_full));
     return ch;
@@ -1313,6 +1325,10 @@ extern Value *builtin_derived(Interp *, Value **, int);
     interp_define_native(i, "type_of",   builtin_type_of);
     interp_define_native(i, "contains",  builtin_contains);
     interp_define_native(i, "channel",   builtin_channel);
+    {
+        extern Value *native_async_select(Interp *, Value **, int);
+        interp_define_native(i, "select", native_async_select);
+    }
 
     /* Result / Option constructors */
     interp_define_native(i, "Ok",   builtin_ok);
