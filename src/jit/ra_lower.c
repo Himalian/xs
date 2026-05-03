@@ -182,10 +182,17 @@ static int op_supported(Opcode op) {
          * (init runs in its own frame, vm->sp top after vm_step_jit
          * is the last ctor arg, not the instance). It lowers through
          * IR_VM_STEP_DRAIN, which adds a post-step frame_count check
-         * + tier2_run_until before popping the result. */
+         * + tier2_run_until before popping the result. IMPL_METHOD
+         * is the simplest of the bunch -- pops three (type, name,
+         * closure), mutates type->__methods in place, pushes nothing.
+         * TRAIT_APPLY is the same shape minus the name slot: pops
+         * (class, trait), copies trait defaults onto class methods,
+         * pushes nothing. */
         case OP_MAKE_CLASS:
         case OP_MAKE_INST:
         case OP_INHERIT:
+        case OP_IMPL_METHOD:
+        case OP_TRAIT_APPLY:
             return 1;
         default:
             return 0;
@@ -785,6 +792,26 @@ IRFunc *ralow_lower(XSProto *proto) {
                 int idx = ir_emit(f, IR_VM_STEP_DRAIN, d, cls, -1, 0, pc);
                 for (int i = 0; i < nargs; i++) f->insts[idx].call_args[i] = args[i];
                 vstack_push(&vs, d);
+                break;
+            }
+            case OP_IMPL_METHOD: {
+                /* stack: [type, name, closure] -> []. Interpreter
+                 * mutates type->__methods (or __impl__) in place
+                 * with name -> closure, no result. */
+                IRVReg closure = vstack_pop(&vs);
+                IRVReg name    = vstack_pop(&vs);
+                IRVReg type    = vstack_pop(&vs);
+                int idx = ir_emit(f, IR_VM_STEP, -1, type, name, 0, pc);
+                f->insts[idx].call_args[0] = closure;
+                break;
+            }
+            case OP_TRAIT_APPLY: {
+                /* stack: [class, trait] -> []. Interpreter copies
+                 * trait.__defaults onto class.__methods for any
+                 * method the class doesn't already define. */
+                IRVReg trait = vstack_pop(&vs);
+                IRVReg cls   = vstack_pop(&vs);
+                ir_emit(f, IR_VM_STEP, -1, cls, trait, 0, pc);
                 break;
             }
             case OP_CLOSE_UPVALUES:
