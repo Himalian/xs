@@ -181,6 +181,8 @@ Value *vm_concat_fast(Value *a, Value *b);
 Value *vm_iter_get_fast(Value *iter, Value *idx, int want_pairs);
 Value *vm_str_eq_fast(Value *a, Value *b, int invert);
 int    vm_str_eq_branch(Value *a, Value *b, int take_when_equal);
+Value *vm_make_array_fast(VM *vm, int n, int is_tuple);
+Value *vm_make_map_fast(VM *vm, int npairs);
 /* Set up the top frame for `proto` then hand control to `entry` (which
    must be a function pointer to JIT-emitted machine code that takes
    the VM and returns an exit code). vm_run_with sweeps the same global

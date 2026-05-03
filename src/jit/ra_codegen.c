@@ -1520,14 +1520,50 @@ void *ralow_codegen(XSJIT *j, IRFunc *f, IRAlloc *a) {
                 break;
             }
 
+            case IR_MAKE_ARRAY:
+            case IR_MAKE_TUPLE: {
+                /* Push the n element vregs to vm->sp in order, then
+                 * call vm_make_array_fast(vm, n, is_tuple). Helper
+                 * pops the n items, returns +1 array/tuple in rax.
+                 * imm holds n; differentiates tuple via the IR op. */
+                int n = in->imm;
+                for (int k = 0; k < n; k++) {
+                    emit_load_vreg(&em, in->call_args[k], a, RAX);
+                    emit_vmsp_push_rax(&em);
+                }
+                emit_mov_rr(&em, RDI, R12);
+                /* mov esi, n */
+                emit_byte(&em, 0xBE); emit_u32(&em, (uint32_t)n);
+                /* mov edx, is_tuple */
+                emit_byte(&em, 0xBA);
+                emit_u32(&em, in->op == IR_MAKE_TUPLE ? 1u : 0u);
+                emit_call_abs(&em, (void *)(uintptr_t)vm_make_array_fast);
+                emit_store_vreg(&em, in->dst, a, RAX);
+                break;
+            }
+
+            case IR_MAKE_MAP: {
+                /* Push 2*npairs k/v vregs to vm->sp, call
+                 * vm_make_map_fast(vm, npairs). Helper consumes them
+                 * and returns the +1 map. */
+                int npairs = in->imm;
+                int n = npairs * 2;
+                for (int k = 0; k < n; k++) {
+                    emit_load_vreg(&em, in->call_args[k], a, RAX);
+                    emit_vmsp_push_rax(&em);
+                }
+                emit_mov_rr(&em, RDI, R12);
+                emit_byte(&em, 0xBE); emit_u32(&em, (uint32_t)npairs);
+                emit_call_abs(&em, (void *)(uintptr_t)vm_make_map_fast);
+                emit_store_vreg(&em, in->dst, a, RAX);
+                break;
+            }
+
             case IR_INDEX_GET:
             case IR_INDEX_SET:
             case IR_LOAD_FIELD:
             case IR_STORE_FIELD:
             case IR_MAKE_RANGE:
-            case IR_MAKE_ARRAY:
-            case IR_MAKE_TUPLE:
-            case IR_MAKE_MAP:
             case IR_VM_STEP:
             case IR_VM_STEP_CF: {
                 if (in->src1 >= 0) {

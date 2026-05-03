@@ -5964,6 +5964,40 @@ int vm_step_jit(VM *vm) {
     return 1;
 }
 
+/* JIT helper for OP_MAKE_ARRAY / OP_MAKE_TUPLE. The JIT pushes `n`
+   items onto vm->sp before the call; the helper consumes them in
+   insertion order, packages them into a fresh array (or tuple),
+   adjusts vm->sp by -n, and returns the +1 result for the JIT to
+   store into dst. `is_tuple` selects xs_tuple_new vs xs_array_new
+   so one helper covers both ops. */
+Value *vm_make_array_fast(VM *vm, int n, int is_tuple) {
+    Value *r = is_tuple ? xs_tuple_new() : xs_array_new();
+    Value **base = vm->sp - n;
+    for (int i = 0; i < n; i++) {
+        array_push(r->arr, base[i]);
+        value_decref(base[i]);
+    }
+    vm->sp -= n;
+    return r;
+}
+
+/* JIT helper for OP_MAKE_MAP. JIT pushed `2*npairs` items (k0, v0,
+   k1, v1, ...) onto vm->sp; helper consumes them, builds the map,
+   pops them off, returns +1 result. Non-string keys are ignored
+   here, mirroring the interpreter's check. */
+Value *vm_make_map_fast(VM *vm, int npairs) {
+    Value *m = xs_map_new();
+    int n = npairs * 2;
+    Value **base = vm->sp - n;
+    for (int i = 0; i < npairs; i++) {
+        Value *k = base[i*2], *v = base[i*2 + 1];
+        if (VAL_TAG(k) == XS_STR) map_set(m->map, k->s, v);
+        value_decref(k); value_decref(v);
+    }
+    vm->sp -= n;
+    return m;
+}
+
 /* JIT helper for `s == s` / `s != s`: returns the TRUE / FALSE
    singleton (incref'd) and consumes both string operands. The JIT
    tag-checks both for XS_STR before the call, so we trust both
