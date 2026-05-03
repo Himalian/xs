@@ -175,6 +175,14 @@ static int op_supported(Opcode op) {
         case OP_DEFER_RUN:
         case OP_NURSERY_BEGIN:
         case OP_NURSERY_END:
+        /* Class-construction ops we can dispatch through IR_VM_STEP:
+         * each runs entirely inside the interpreter step and leaves
+         * the result on top of vm->sp before vm_step_jit returns.
+         * (OP_MAKE_INST is intentionally excluded -- its closure-init
+         * branch pushes a new call frame mid-op so the result we'd
+         * pop after vm_step_jit is still a callee local.) */
+        case OP_MAKE_CLASS:
+        case OP_INHERIT:
             return 1;
         default:
             return 0;
@@ -344,6 +352,11 @@ IRFunc *ralow_lower(XSProto *proto) {
         if (op == OP_MAKE_MAP) {
             int n = INSTR_C(proto->chunk.code[i]);
             if (n * 2 > IR_MAX_CALL_ARGS)
+                return bail(NULL, RALOW_BAIL_MAKE_LARGE, (int)op);
+        }
+        if (op == OP_MAKE_CLASS) {
+            int nfields = (int)INSTR_A(proto->chunk.code[i]);
+            if (nfields * 2 > IR_MAX_CALL_ARGS)
                 return bail(NULL, RALOW_BAIL_MAKE_LARGE, (int)op);
         }
     }
@@ -724,6 +737,28 @@ IRFunc *ralow_lower(XSProto *proto) {
                 IRVReg a = vstack_pop(&vs);
                 IRVReg d = new_vreg(f);
                 ir_emit(f, IR_VM_STEP, d, a, -1, 0, pc);
+                vstack_push(&vs, d);
+                break;
+            }
+            case OP_INHERIT: {
+                /* stack: [child, base] -> [child]. Interpreter mutates
+                 * child in place and re-pushes it. */
+                IRVReg base  = vstack_pop(&vs);
+                IRVReg child = vstack_pop(&vs);
+                IRVReg d     = new_vreg(f);
+                ir_emit(f, IR_VM_STEP, d, child, base, 0, pc);
+                vstack_push(&vs, d);
+                break;
+            }
+            case OP_MAKE_CLASS: {
+                /* stack: [k0,v0,...,kN-1,vN-1] -> [class]. */
+                int nfields = (int)INSTR_A(ins);
+                int n = nfields * 2;
+                IRVReg items[IR_MAX_CALL_ARGS];
+                for (int i = n - 1; i >= 0; i--) items[i] = vstack_pop(&vs);
+                IRVReg d = new_vreg(f);
+                int idx = ir_emit(f, IR_VM_STEP, d, -1, -1, 0, pc);
+                for (int i = 0; i < n; i++) f->insts[idx].call_args[i] = items[i];
                 vstack_push(&vs, d);
                 break;
             }

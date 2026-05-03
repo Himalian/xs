@@ -9175,6 +9175,39 @@ void interp_exec(Interp *i, Node *stmt) {
         const char *use_path = stmt->use_.path;
         struct stat st2;
 
+        /* Bare-name `use "X"` (no path separators, no .xs extension)
+           resolves through the same fallback chain as `import X`:
+           built-in module registry first, then disk, then package dir.
+           Without this, native modules like http only worked under
+           `import` -- `use "http"` would fail to find http.xs on disk
+           even though make_http_module had populated the global at
+           startup. Path-shaped strings (`./foo`, `foo.xs`, `a/b`) skip
+           the registry to avoid a name in globals shadowing the file
+           the author clearly meant. */
+        if (!stmt->use_.is_plugin
+            && !strchr(use_path, '/')
+            && !strstr(use_path, ".xs")) {
+            Value *registered = env_get(i->globals, use_path);
+            if (registered &&
+                (VAL_TAG(registered) == XS_MODULE ||
+                 VAL_TAG(registered) == XS_MAP)) {
+                /* bind it under the same name (or alias) the user asked for */
+                const char *bind_as = stmt->use_.alias ? stmt->use_.alias : use_path;
+                env_define(i->env, bind_as, registered, 1);
+                if (stmt->use_.import_all && registered->map) {
+                    int nk = 0;
+                    char **keys = map_keys(registered->map, &nk);
+                    for (int j = 0; j < nk; j++) {
+                        Value *v = map_get(registered->map, keys[j]);
+                        if (v) env_define(i->env, keys[j], v, 1);
+                        free(keys[j]);
+                    }
+                    free(keys);
+                }
+                break;
+            }
+        }
+
         /* resolve relative to current file's directory */
         if (use_path[0] != '/') {
             const char *fn = i->filename ? i->filename : "";

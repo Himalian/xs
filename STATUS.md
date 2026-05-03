@@ -5,11 +5,12 @@ release number, check `git tag` or `xs --version`.
 
 ## Bytecode VM
 
-The bytecode VM backend is opt-in via `--vm`. It passes the full test
-suite and is ~4-9x faster than the tree-walk interpreter on compute-
-heavy code. Programs that register `plugin.runtime.after_eval` hooks
-auto-fall back to the interpreter. The interpreter is still the default
-for bare `xs file.xs`; see the Known Footguns section for why.
+The bytecode VM is the default backend. Bare `xs file.xs` runs on the
+VM; pass `--interp` to force the tree-walker, `--jit` to use the
+tier-2 JIT. The VM passes the full test suite and is ~4-9x faster
+than the tree-walk interpreter on compute-heavy code. Programs that
+register `plugin.runtime.after_eval` hooks auto-fall back to the
+interpreter.
 
 ## Tree-Walk Interpreter
 
@@ -250,11 +251,11 @@ These are the sharp edges you are most likely to hit. They are here on
 purpose: the more users trip over silently, the more trust the project
 burns. Fix one, and this list gets shorter.
 
-- **Interpreter is the default, VM is faster.** `xs file.xs` uses the
-  tree-walk interpreter, which is ~10x slower on recursion than the
-  bytecode VM and more conservative about call depth (500 frames,
-  tunable via `XS_MAX_DEPTH`). For anything compute-heavy or
-  long-running, pass `--vm`. Pre-v1.0, we will not flip the default.
+- **Recursion depth limits.** The tree-walker is more conservative
+  about call depth (500 frames, tunable via `XS_MAX_DEPTH`). The VM
+  (default) and JIT (`--jit`) handle deeper stacks fine and are
+  faster on most workloads. If you hit a stack-overflow on the
+  interpreter side, switching backend is usually enough.
 - **Effect handlers on the JS target work via generator delegation.**
   The transpiler wraps the handled expression in a `function*()` and
   uses `yield*` to forward through any nested generators, so
