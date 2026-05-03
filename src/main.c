@@ -26,7 +26,6 @@
 #include "semantic/sema.h"
 #include "semantic/cache.h"
 #include "types/inference.h"
-#include "repl/repl.h"
 #include "lint/lint.h"
 
 #include <stdio.h>
@@ -573,7 +572,6 @@ static void usage(void) {
     printf(
         "Usage:\n"
         "  xs <file.xs> [args...]        Run a script\n"
-        "  xs                            Start interactive REPL\n"
         "  xs -e '<code>'                Evaluate inline code\n"
         "\n"
         "Commands:\n"
@@ -881,20 +879,6 @@ int main(int argc, char **argv) {
                                "  --record <file>  Record execution trace\n"
                                "  --profile        Enable sampling profiler\n"
                                "  --coverage       Enable line coverage tracking\n")
-                H("repl",      "Usage: xs repl\n\n"
-                               "Start the interactive REPL with syntax highlighting.\n\n"
-                               "REPL Commands:\n"
-                               "  :help            Show available commands\n"
-                               "  :reset           Reset the interpreter environment\n"
-                               "  :env             List all bindings in scope\n"
-                               "  :type <expr>     Show the type of an expression\n"
-                               "  :ast <expr>      Show the AST of an expression\n"
-                               "  :time <expr>     Evaluate and show elapsed time\n"
-                               "  :load <file>     Load and execute a file\n"
-                               "  :save <file>     Save history to file\n"
-                               "  :quit / :exit    Exit the REPL\n\n"
-                               "Multiline: lines ending with {, (, [, or \\ continue.\n"
-                               "History: up/down arrows navigate history.\n")
                 H("test",      "Usage: xs test [file.xs | pattern]\n\n"
                                "Run tests. Two modes:\n"
                                "  xs test file.xs    Run #[test] functions in a specific file\n"
@@ -1102,9 +1086,10 @@ int main(int argc, char **argv) {
     }
 
     if (argc == 1) {
-        int rc = repl_run();
+        usage();
+        fflush(stdout);
         cache_free(g_sema_cache);
-        return rc;
+        return 0;
     }
 
     /* Find subcommand: first non-flag argument */
@@ -1139,11 +1124,6 @@ int main(int argc, char **argv) {
         if (strcmp(sub, "--explain") == 0 || strcmp(sub, "explain") == 0) {
             if (sub_argc < 1) { fprintf(stderr, "usage: xs --explain <error-code>\n"); return 1; }
             return diag_explain(sub_arg(0));
-
-        } else if (strcmp(sub, "repl") == 0) {
-            int rc = repl_run();
-            cache_free(g_sema_cache);
-            return rc;
 
         } else if (strcmp(sub, "check") == 0) {
             if (sub_argc < 1) { fprintf(stderr, "xs check: missing file\n"); return 1; }

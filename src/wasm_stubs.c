@@ -15,9 +15,6 @@ int xs_tls_read(xs_tls_conn *conn, void *buf, int len) { (void)conn; (void)buf; 
 int xs_tls_write(xs_tls_conn *conn, const void *buf, int len) { (void)conn; (void)buf; (void)len; return -1; }
 void xs_tls_close(xs_tls_conn *conn) { (void)conn; }
 
-/* REPL - needs terminal stdin */
-int repl_run(void) { fprintf(stderr, "repl not available in wasm\n"); return 1; }
-
 /* LSP/DAP - need stdio/socket communication */
 int lsp_run(int argc, char **argv) { (void)argc; (void)argv; return 0; }
 int dap_run(int argc, char **argv) { (void)argc; (void)argv; return 0; }

@@ -114,8 +114,6 @@ RUNTIME_SRCS = src/runtime/interp.c \
                src/runtime/event_loop.c \
                src/runtime/concurrent.c
 
-REPL_SRCS = src/repl/repl.c
-
 LINT_SRCS = src/lint/lint.c
 
 TYPES_EXTRA_SRCS = src/types/inference.c
@@ -164,7 +162,7 @@ SEMA_SRCS = src/types/types.c \
 
 TLS_SRCS = $(wildcard src/tls/*.c) $(wildcard src/tls/bearssl/**/*.c) $(wildcard src/tls/bearssl/*.c)
 
-SRCS = $(CORE_SRCS) $(COMPILER_SRCS) $(RUNTIME_SRCS) $(REPL_SRCS) $(LINT_SRCS) $(TYPES_EXTRA_SRCS) $(EMBED_SRCS) $(DIAG_SRCS) $(TOOL_SRCS) $(MAIN_SRCS) $(SEMA_SRCS) $(TLS_SRCS) $(DB_SRCS) $(NET_SRCS) $(REGEX_SRCS) $(CHECKER_SRCS) $(MSGPACK_SRCS) $(ASYNC_SRCS)
+SRCS = $(CORE_SRCS) $(COMPILER_SRCS) $(RUNTIME_SRCS) $(LINT_SRCS) $(TYPES_EXTRA_SRCS) $(EMBED_SRCS) $(DIAG_SRCS) $(TOOL_SRCS) $(MAIN_SRCS) $(SEMA_SRCS) $(TLS_SRCS) $(DB_SRCS) $(NET_SRCS) $(REGEX_SRCS) $(CHECKER_SRCS) $(MSGPACK_SRCS) $(ASYNC_SRCS)
 
 # Conditional sources
 ifeq ($(XSC_ENABLE_VM),1)
