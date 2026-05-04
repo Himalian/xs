@@ -113,12 +113,9 @@ xs --check file.xs      # static type check without running
 xs --strict file.xs     # require type annotations everywhere
 ```
 
-> **Which backend:** the tree-walk interpreter is the default so small
-> one-off scripts start instantly and REPL/debug sessions behave
-> predictably. For anything compute-heavy or long-running, pass `--vm`:
-> the bytecode VM is consistently faster and handles deep recursion
-> on its own growable stack. See [STATUS.md](STATUS.md) for the full
-> backend matrix.
+The tree-walk interpreter is the default for fast startup. Pass
+`--vm` for compute-heavy or long-running code. See [STATUS.md](STATUS.md)
+for the backend matrix.
 
 ## What's in the box
 
@@ -163,17 +160,13 @@ math, time, io, string, path, base64, hash, uuid, collections, process, random, 
 Plugins are XS scripts with direct access to the lexer, parser, and runtime. Add keywords, inject globals, hook evaluation, override syntax, intercept imports -- written in XS, not C.
 
 **Networking:**
-HTTP/HTTPS client with zero external dependencies (BearSSL embedded
-for TLS). Process-wide keep-alive connection pool. Hardened HTTP/1.1
-server with configurable per-server limits (body / header / connection
-caps, idle + slow-request culling) and graceful shutdown.
+HTTP / HTTPS client and HTTP/1.1 server. TLS via the bundled BearSSL
+tree, no external dependency. Server has per-server body / header /
+connection caps and idle culling.
 
 **Mobile and embedded:**
-`make ios` produces a static archive for iOS (arm64 device + x86_64
-simulator), `make android` builds the NDK shared library across
-arm64-v8a / armeabi-v7a / x86_64, `make esp32` cross-compiles a
-VM-only build for ESP-IDF as a flashable component. Worked
-embedding examples live under `examples/embedded/`.
+`make ios`, `make android`, `make esp32`. Examples in
+`examples/embedded/`.
 
 ## Quick examples
 
@@ -237,26 +230,13 @@ A tight numeric loop shows where `--jit` pays off relative to `--vm`:
 | 10M-iter `while` sum |  640 ms |  110 ms |   20 ms | 110 ms |
 | 1M-iter `while` sum  |   60 ms |   10 ms |   <1 ms | 110 ms |
 
-`--jit` is 5-8× faster than `--vm` across the board, beats Node on
-every loop, and ties or beats it on short recursion; V8 only pulls
-ahead on heavy recursion where cross-call inlining pays off. See
-STATUS.md for the JIT's implementation notes.
-
-Startup time is the flagship number: on this box `xs file.xs` runs in
-about **2.3 ms** median vs **51 ms** for `node -e 'console.log(1)'`
-and **14 ms** for `python3 -c 'print(1)'`, so roughly **~22x faster
-than Node** and **~6x faster than Python** on a hello-world. That's
-what makes it practical for small CLI tools. For compute the picture
-is mixed: the bytecode VM is in the same ballpark as CPython on simple
-loops (and ahead on small bodies thanks to inline caches) but a few
-times slower on hot recursion. `--jit` closes that gap and pulls
-ahead. Use `--vm` for everyday work, `--jit` when you actually
-profile a hotspot, and treat the tree-walk interpreter as a
-debugging tool, not a backend.
+Startup is around 2.3 ms on this box; `--vm` is in the same ballpark
+as CPython on loops and a few times slower on hot recursion; `--jit`
+closes the gap. Use `--vm` for everyday work, `--jit` when you've
+actually profiled a hotspot.
 
 Reproduce with `benchmarks/bench_fibonacci.xs`, `benchmarks/bench_sort.xs`,
-`benchmarks/bench_strings.xs` and `xs bench` (runs each 10 times and
-reports min/max/avg).
+`benchmarks/bench_strings.xs`, or `xs bench`.
 
 ## Docs
 

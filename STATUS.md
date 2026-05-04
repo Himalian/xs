@@ -195,11 +195,8 @@ with a virtual filesystem, captured stdout/stderr, and a `loadXS()` /
 `xs.run()` / `xs.exec()` API. Releases publish both artefacts, and the
 static repo's daily sync workflow picks up the browser build.
 
-`xs --emit wasm` (the AOT transpiler) is staying parked. The runtime
-path covers the browser story; the C transpiler covers AOT. The
-existing emitter handles arithmetic and direct calls, but bringing it
-to full parity competes with the runtime path on every backend choice
-without giving users something they can't already get cheaper.
+`xs --emit wasm` only handles arithmetic and direct calls. The
+runtime build covers the browser case; `--emit c` covers AOT.
 
 ## Tooling
 
