@@ -901,6 +901,30 @@ Value *call_value(Interp *i, Value *callee, Value **args, int argc,
                           const char *call_site) {
     if (!callee) return value_incref(XS_NULL_VAL);
 
+    /* VM-mode entry: when a script is run from a file the bytecode VM
+       calls native functions with NULL for the Interp* (vm_dispatch's
+       OP_CALL / OP_METHOD_CALL pass NULL because the interp isn't the
+       authoritative environment in that mode). Some natives -- notably
+       http.serve, signal subscribers, map.filter / fold callbacks --
+       turn around and call back into call_value with the same NULL.
+       Without a guard this dereferences i->current_span the moment we
+       reach for a TRACE_* macro and crashes the server. Route by callee
+       kind and skip the frame/trace bookkeeping that's only meaningful
+       for the AST interpreter. */
+    if (!i) {
+        if (VAL_TAG(callee) == XS_NATIVE) {
+            Value *result = callee->native(NULL, args, argc);
+            return result ? result : value_incref(XS_NULL_VAL);
+        }
+#ifdef XSC_ENABLE_VM
+        if (VAL_TAG(callee) == XS_CLOSURE && g_vm_for_invoke) {
+            Value *result = vm_invoke_public(g_vm_for_invoke, callee, args, argc);
+            return result ? result : value_incref(XS_NULL_VAL);
+        }
+#endif
+        return value_incref(XS_NULL_VAL);
+    }
+
     const char *frame_name = call_site;
     if (!frame_name && VAL_TAG(callee) == XS_FUNC && callee->fn->name)
         frame_name = callee->fn->name;
