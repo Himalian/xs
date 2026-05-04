@@ -286,7 +286,35 @@ static void compile_let_pat(Compiler *c, Node *pat) {
             emit_a(c, OP_LOAD_FIELD, fi_idx);
             if (fpat && (VAL_TAG(fpat) == NODE_PAT_TUPLE ||
                          VAL_TAG(fpat) == NODE_PAT_SLICE ||
-                         VAL_TAG(fpat) == NODE_PAT_STRUCT)) {
+                         VAL_TAG(fpat) == NODE_PAT_STRUCT ||
+                         VAL_TAG(fpat) == NODE_PAT_MAP)) {
+                compile_let_pat(c, fpat);
+            } else {
+                const char *bind = key;
+                if (fpat && VAL_TAG(fpat) == NODE_PAT_IDENT && fpat->pat_ident.name)
+                    bind = fpat->pat_ident.name;
+                int ds = local_add(c->current, bind);
+                emit_a(c, OP_STORE_LOCAL, ds);
+            }
+        }
+        return;
+    }
+    if (VAL_TAG(pat) == NODE_PAT_MAP) {
+        /* `let {x, y} = m` and friends. each entry is either a bare
+           shorthand (x: NULL → store under "x") or a key + sub-pattern
+           (x: y → load x, bind to y; or x: (a, b) → recurse). */
+        int slot = local_add_hidden(c);
+        emit_a(c, OP_STORE_LOCAL, slot);
+        for (int i = 0; i < pat->pat_map.nfields; i++) {
+            const char *key = pat->pat_map.keys[i];
+            Node *fpat = pat->pat_map.sub[i];
+            emit_a(c, OP_LOAD_LOCAL, slot);
+            int fi_idx = emit_global_name(c, key);
+            emit_a(c, OP_LOAD_FIELD, fi_idx);
+            if (fpat && (VAL_TAG(fpat) == NODE_PAT_TUPLE ||
+                         VAL_TAG(fpat) == NODE_PAT_SLICE ||
+                         VAL_TAG(fpat) == NODE_PAT_STRUCT ||
+                         VAL_TAG(fpat) == NODE_PAT_MAP)) {
                 compile_let_pat(c, fpat);
             } else {
                 const char *bind = key;
@@ -790,6 +818,8 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
             emit(c, MAKE_A(OP_NEG, 0, 0));
         else if (strcmp(n->unary.op, "~") == 0)
             emit(c, MAKE_A(OP_BNOT, 0, 0));
+        else if (strcmp(n->unary.op, "?") == 0)
+            emit(c, MAKE_A(OP_TRY_OP, 0, 0));
         else
             emit(c, MAKE_A(OP_NOT, 0, 0));
         break;
@@ -921,7 +951,8 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
             emit(c, MAKE_A(OP_PUSH_NULL, 0, 0));
         Node *pat = n->let.pattern;
         if (pat && (VAL_TAG(pat) == NODE_PAT_TUPLE || VAL_TAG(pat) == NODE_PAT_SLICE
-                    || VAL_TAG(pat) == NODE_PAT_STRUCT)) {
+                    || VAL_TAG(pat) == NODE_PAT_STRUCT
+                    || VAL_TAG(pat) == NODE_PAT_MAP)) {
             int val_slot = local_add_hidden(c);
             emit_a(c, OP_STORE_LOCAL, val_slot);
             emit_a(c, OP_LOAD_LOCAL, val_slot);
@@ -2280,47 +2311,53 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
         return;
 
     case NODE_LIST_COMP: {
+        /* Multi-clause comprehensions nest: `[(x,y) for x in xs for y in ys]`
+           runs the y loop inside the x loop. The previous shape was a
+           flat sequence of independent loops, which leaked x's last
+           value into the y loop and left y null during the x loop. */
         emit(c, MAKE_B(OP_MAKE_ARRAY, 0, 0, 0));
         int arr_slot = local_add_hidden(c);
         emit_a(c, OP_STORE_LOCAL, arr_slot);
 
-        for (int ci = 0; ci < n->list_comp.clause_iters.len; ci++) {
+        int n_clauses = n->list_comp.clause_iters.len;
+        if (n_clauses > 32) n_clauses = 32;
+        int loop_tops[32];
+        int exit_jumps[32];
+        int idx_slots[32];
+        int len_slots[32];
+        int iter_slots[32];
+        int cond_skips[32];
+        for (int i = 0; i < 32; i++) cond_skips[i] = -1;
+
+        for (int ci = 0; ci < n_clauses; ci++) {
             Node *iter_expr = n->list_comp.clause_iters.items[ci];
             Node *cpat = n->list_comp.clause_pats.items[ci];
             Node *cond = (ci < n->list_comp.clause_conds.len)
                          ? n->list_comp.clause_conds.items[ci] : NULL;
 
-            /* compile iterator */
             compile_node(c, iter_expr, 1);
-            int iter_slot = local_add_hidden(c);
-            emit_a(c, OP_STORE_LOCAL, iter_slot);
+            iter_slots[ci] = local_add_hidden(c);
+            emit_a(c, OP_STORE_LOCAL, iter_slots[ci]);
 
-            /* len = iter.len */
-            emit_a(c, OP_LOAD_LOCAL, iter_slot);
+            emit_a(c, OP_LOAD_LOCAL, iter_slots[ci]);
             emit(c, MAKE_A(OP_ITER_LEN, 0, 0));
-            int len_slot = local_add_hidden(c);
-            emit_a(c, OP_STORE_LOCAL, len_slot);
+            len_slots[ci] = local_add_hidden(c);
+            emit_a(c, OP_STORE_LOCAL, len_slots[ci]);
 
-            /* idx = 0 */
             emit_const(c, xs_int(0));
-            int idx_slot = local_add_hidden(c);
-            emit_a(c, OP_STORE_LOCAL, idx_slot);
+            idx_slots[ci] = local_add_hidden(c);
+            emit_a(c, OP_STORE_LOCAL, idx_slots[ci]);
 
-            /* loop: */
-            int loop_top = c->current->proto->chunk.len;
-
-            /* if idx >= len: break */
-            emit_a(c, OP_LOAD_LOCAL, idx_slot);
-            emit_a(c, OP_LOAD_LOCAL, len_slot);
+            loop_tops[ci] = c->current->proto->chunk.len;
+            emit_a(c, OP_LOAD_LOCAL, idx_slots[ci]);
+            emit_a(c, OP_LOAD_LOCAL, len_slots[ci]);
             emit(c, MAKE_A(OP_GTE, 0, 0));
-            int exit_jump = emit_jump(c, OP_JUMP_IF_TRUE);
+            exit_jumps[ci] = emit_jump(c, OP_JUMP_IF_TRUE);
 
-            /* elem = iter[idx] */
-            emit_a(c, OP_LOAD_LOCAL, iter_slot);
-            emit_a(c, OP_LOAD_LOCAL, idx_slot);
+            emit_a(c, OP_LOAD_LOCAL, iter_slots[ci]);
+            emit_a(c, OP_LOAD_LOCAL, idx_slots[ci]);
             emit(c, MAKE_A(OP_ITER_GET, 0, 0));
 
-            /* bind pattern variable */
             const char *cpat_name = NULL;
             if (cpat && VAL_TAG(cpat) == NODE_PAT_IDENT) cpat_name = cpat->pat_ident.name;
             else if (cpat && VAL_TAG(cpat) == NODE_IDENT) cpat_name = cpat->ident.name;
@@ -2331,41 +2368,32 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
                 emit(c, MAKE_A(OP_POP, 0, 0));
             }
 
-            /* if cond: only add if true */
-            int skip_push = -1;
             if (cond) {
                 compile_node(c, cond, 1);
-                skip_push = emit_jump(c, OP_JUMP_IF_FALSE);
+                cond_skips[ci] = emit_jump(c, OP_JUMP_IF_FALSE);
             }
-
-            /* result.push(element_expr) */
-            emit_a(c, OP_LOAD_LOCAL, arr_slot);
-            compile_node(c, n->list_comp.element, 1);
-            {
-                int push_idx = emit_global_name(c, "push");
-                emit(c, MAKE_A(OP_METHOD_CALL, 1, (uint16_t)(unsigned)push_idx));
-            }
-            emit(c, MAKE_A(OP_POP, 0, 0)); /* discard push return */
-
-            if (skip_push >= 0)
-                patch_jump(c, skip_push);
-
-            /* idx++ */
-            emit_a(c, OP_LOAD_LOCAL, idx_slot);
-            emit_const(c, xs_int(1));
-            emit(c, MAKE_A(OP_ADD, 0, 0));
-            emit_a(c, OP_STORE_LOCAL, idx_slot);
-
-            /* jump to loop top */
-            {
-                int back = c->current->proto->chunk.len;
-                emit(c, MAKE_A(OP_JUMP, 0, (uint16_t)(int16_t)(loop_top - back - 1)));
-            }
-
-            patch_jump(c, exit_jump);
         }
 
-        /* Push result array */
+        emit_a(c, OP_LOAD_LOCAL, arr_slot);
+        compile_node(c, n->list_comp.element, 1);
+        {
+            int push_idx = emit_global_name(c, "push");
+            emit(c, MAKE_A(OP_METHOD_CALL, 1, (uint16_t)(unsigned)push_idx));
+        }
+        emit(c, MAKE_A(OP_POP, 0, 0));
+
+        for (int ci = n_clauses - 1; ci >= 0; ci--) {
+            if (cond_skips[ci] >= 0) patch_jump(c, cond_skips[ci]);
+            emit_a(c, OP_LOAD_LOCAL, idx_slots[ci]);
+            emit_const(c, xs_int(1));
+            emit(c, MAKE_A(OP_ADD, 0, 0));
+            emit_a(c, OP_STORE_LOCAL, idx_slots[ci]);
+            int back = c->current->proto->chunk.len;
+            emit(c, MAKE_A(OP_JUMP, 0,
+                (uint16_t)(int16_t)(loop_tops[ci] - back - 1)));
+            patch_jump(c, exit_jumps[ci]);
+        }
+
         if (want_value)
             emit_a(c, OP_LOAD_LOCAL, arr_slot);
         return;
@@ -2373,36 +2401,42 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
 
 
     case NODE_MAP_COMP: {
-        /* result = {} */
+        /* Same nested-clause structure as NODE_LIST_COMP. */
         emit(c, MAKE_B(OP_MAKE_MAP, 0, 0, 0));
         int map_slot = local_add_hidden(c);
         emit_a(c, OP_STORE_LOCAL, map_slot);
 
-        for (int ci = 0; ci < n->map_comp.clause_iters.len; ci++) {
+        int n_clauses = n->map_comp.clause_iters.len;
+        if (n_clauses > 32) n_clauses = 32;
+        int loop_tops[32], exit_jumps[32], idx_slots[32];
+        int len_slots[32], iter_slots[32], cond_skips[32];
+        for (int i = 0; i < 32; i++) cond_skips[i] = -1;
+
+        for (int ci = 0; ci < n_clauses; ci++) {
             Node *iter_expr = n->map_comp.clause_iters.items[ci];
             Node *cpat = n->map_comp.clause_pats.items[ci];
             Node *cond = (ci < n->map_comp.clause_conds.len)
                          ? n->map_comp.clause_conds.items[ci] : NULL;
 
             compile_node(c, iter_expr, 1);
-            int iter_slot = local_add_hidden(c);
-            emit_a(c, OP_STORE_LOCAL, iter_slot);
-            emit_a(c, OP_LOAD_LOCAL, iter_slot);
+            iter_slots[ci] = local_add_hidden(c);
+            emit_a(c, OP_STORE_LOCAL, iter_slots[ci]);
+            emit_a(c, OP_LOAD_LOCAL, iter_slots[ci]);
             emit(c, MAKE_A(OP_ITER_LEN, 0, 0));
-            int len_slot = local_add_hidden(c);
-            emit_a(c, OP_STORE_LOCAL, len_slot);
+            len_slots[ci] = local_add_hidden(c);
+            emit_a(c, OP_STORE_LOCAL, len_slots[ci]);
             emit_const(c, xs_int(0));
-            int idx_slot = local_add_hidden(c);
-            emit_a(c, OP_STORE_LOCAL, idx_slot);
+            idx_slots[ci] = local_add_hidden(c);
+            emit_a(c, OP_STORE_LOCAL, idx_slots[ci]);
 
-            int loop_top = c->current->proto->chunk.len;
-            emit_a(c, OP_LOAD_LOCAL, idx_slot);
-            emit_a(c, OP_LOAD_LOCAL, len_slot);
+            loop_tops[ci] = c->current->proto->chunk.len;
+            emit_a(c, OP_LOAD_LOCAL, idx_slots[ci]);
+            emit_a(c, OP_LOAD_LOCAL, len_slots[ci]);
             emit(c, MAKE_A(OP_GTE, 0, 0));
-            int exit_jump = emit_jump(c, OP_JUMP_IF_TRUE);
+            exit_jumps[ci] = emit_jump(c, OP_JUMP_IF_TRUE);
 
-            emit_a(c, OP_LOAD_LOCAL, iter_slot);
-            emit_a(c, OP_LOAD_LOCAL, idx_slot);
+            emit_a(c, OP_LOAD_LOCAL, iter_slots[ci]);
+            emit_a(c, OP_LOAD_LOCAL, idx_slots[ci]);
             emit(c, MAKE_A(OP_ITER_GET, 0, 0));
 
             const char *cpat_name = NULL;
@@ -2415,28 +2449,27 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
                 emit(c, MAKE_A(OP_POP, 0, 0));
             }
 
-            int skip_push = -1;
             if (cond) {
                 compile_node(c, cond, 1);
-                skip_push = emit_jump(c, OP_JUMP_IF_FALSE);
+                cond_skips[ci] = emit_jump(c, OP_JUMP_IF_FALSE);
             }
+        }
 
-            /* map[key] = value */
-            emit_a(c, OP_LOAD_LOCAL, map_slot);
-            compile_node(c, n->map_comp.key, 1);
-            compile_node(c, n->map_comp.value, 1);
-            emit(c, MAKE_A(OP_INDEX_SET, 0, 0));
+        emit_a(c, OP_LOAD_LOCAL, map_slot);
+        compile_node(c, n->map_comp.key, 1);
+        compile_node(c, n->map_comp.value, 1);
+        emit(c, MAKE_A(OP_INDEX_SET, 0, 0));
 
-            if (skip_push >= 0) patch_jump(c, skip_push);
-
-            emit_a(c, OP_LOAD_LOCAL, idx_slot);
+        for (int ci = n_clauses - 1; ci >= 0; ci--) {
+            if (cond_skips[ci] >= 0) patch_jump(c, cond_skips[ci]);
+            emit_a(c, OP_LOAD_LOCAL, idx_slots[ci]);
             emit_const(c, xs_int(1));
             emit(c, MAKE_A(OP_ADD, 0, 0));
-            emit_a(c, OP_STORE_LOCAL, idx_slot);
-
+            emit_a(c, OP_STORE_LOCAL, idx_slots[ci]);
             int back = c->current->proto->chunk.len;
-            emit(c, MAKE_A(OP_JUMP, 0, (uint16_t)(int16_t)(loop_top - back - 1)));
-            patch_jump(c, exit_jump);
+            emit(c, MAKE_A(OP_JUMP, 0,
+                (uint16_t)(int16_t)(loop_tops[ci] - back - 1)));
+            patch_jump(c, exit_jumps[ci]);
         }
 
         if (want_value)

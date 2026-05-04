@@ -2833,24 +2833,25 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                 extern Value *xs_chan_try_recv(Value *);
                 r = xs_chan_try_recv(iter);
             } else if ((VAL_TAG(iter)==XS_MAP||VAL_TAG(iter)==XS_MODULE) && iter->map) {
-                int64_t ki = 0;
+                /* walk m->order so iteration order matches what the
+                   user inserted -- bucket order made `for k in m` and
+                   m.keys() return scrambled keys on the VM. */
                 r = value_incref(XS_NULL_VAL);
-                for (int j = 0; j < iter->map->cap; j++) {
-                    if (iter->map->keys[j]) {
-                        if (ki == i) {
-                            if (want_pairs) {
-                                r = xs_tuple_new();
-                                Value *ks = xs_str(iter->map->keys[j]);
-                                Value *val = iter->map->vals[j];
-                                array_push(r->arr, ks);
-                                array_push(r->arr, val ? val : XS_NULL_VAL);
-                                value_decref(ks);
-                            } else {
-                                r = xs_str(iter->map->keys[j]);
-                            }
-                            break;
+                if (i >= 0 && i < iter->map->len) {
+                    int j = iter->map->order[i];
+                    if (j >= 0 && j < iter->map->cap && iter->map->keys[j]) {
+                        if (want_pairs) {
+                            value_decref(r);
+                            r = xs_tuple_new();
+                            Value *ks = xs_str(iter->map->keys[j]);
+                            Value *val = iter->map->vals[j];
+                            array_push(r->arr, ks);
+                            array_push(r->arr, val ? val : XS_NULL_VAL);
+                            value_decref(ks);
+                        } else {
+                            value_decref(r);
+                            r = xs_str(iter->map->keys[j]);
                         }
-                        ki++;
                     }
                 }
             } else if (VAL_TAG(iter)==XS_RANGE && iter->range) {
@@ -2886,9 +2887,23 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                    from the first miss, so we can skip every map_get
                    probe below and drop straight into invocation. The
                    method-name key is the const-pool pointer so hit
-                   checks are a pointer compare, not a strcmp. */
+                   checks are a pointer compare, not a strcmp.
+                   For struct/class instances we fold __type's string
+                   content into the tag so two distinct types whose
+                   instance maps happen to land in the same heap slot
+                   (the classic short-lived `greet(A()); greet(B())`
+                   shape) don't share a cache slot and dispatch the
+                   first type's method to the second. */
                 {
                     int64_t type_tag = (int64_t)(intptr_t)mc_obj->map;
+                    Value *type_name = map_get(mc_obj->map, "__type");
+                    if (type_name && VAL_TAG(type_name) == XS_STR && type_name->s) {
+                        uint64_t h = 1469598103934665603ULL;
+                        for (const char *p = type_name->s; *p; p++) {
+                            h ^= (uint8_t)*p; h *= 1099511628211ULL;
+                        }
+                        type_tag ^= (int64_t)h;
+                    }
                     Value *cached = ic_lookup_ex(mc_site_id, type_tag, mc_name,
                                                  &mc_cached_is_module,
                                                  &mc_cached_needs_self);
@@ -2933,27 +2948,38 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                         map_set(mc_obj->map, "_done", done_v); value_decref(done_v);
                     }
                 } else if (strcmp(mc_name,"keys")==0) {
+                    /* walk m->order so callers see insertion order, not
+                       bucket order; the bucket walk used to leak hash
+                       layout to user code and made interp / vm disagree
+                       on .keys() / .values() / .entries() output. */
                     Value *arr=xs_array_new();
-                    for(int j=0;j<mc_obj->map->cap;j++){
-                        if(mc_obj->map->keys[j]){
-                            Value *k=xs_str(mc_obj->map->keys[j]);
+                    for(int oi=0; oi < mc_obj->map->len; oi++) {
+                        int bi = mc_obj->map->order[oi];
+                        if (bi >= 0 && bi < mc_obj->map->cap &&
+                            mc_obj->map->keys[bi]) {
+                            Value *k=xs_str(mc_obj->map->keys[bi]);
                             array_push(arr->arr,k); value_decref(k);
                         }
                     }
                     mc_result=arr;
                 } else if (strcmp(mc_name,"values")==0) {
                     Value *arr=xs_array_new();
-                    for(int j=0;j<mc_obj->map->cap;j++){
-                        if(mc_obj->map->keys[j]) array_push(arr->arr,value_incref(mc_obj->map->vals[j]));
+                    for(int oi=0; oi < mc_obj->map->len; oi++) {
+                        int bi = mc_obj->map->order[oi];
+                        if (bi >= 0 && bi < mc_obj->map->cap &&
+                            mc_obj->map->keys[bi])
+                            array_push(arr->arr,value_incref(mc_obj->map->vals[bi]));
                     }
                     mc_result=arr;
                 } else if (strcmp(mc_name,"entries")==0) {
                     Value *arr=xs_array_new();
-                    for(int j=0;j<mc_obj->map->cap;j++){
-                        if(mc_obj->map->keys[j]){
+                    for(int oi=0; oi < mc_obj->map->len; oi++) {
+                        int bi = mc_obj->map->order[oi];
+                        if (bi >= 0 && bi < mc_obj->map->cap &&
+                            mc_obj->map->keys[bi]) {
                             Value *pair=xs_tuple_new();
-                            array_push(pair->arr,xs_str(mc_obj->map->keys[j]));
-                            array_push(pair->arr,value_incref(mc_obj->map->vals[j]));
+                            array_push(pair->arr,xs_str(mc_obj->map->keys[bi]));
+                            array_push(pair->arr,value_incref(mc_obj->map->vals[bi]));
                             array_push(arr->arr,pair);
                         }
                     }
@@ -3290,9 +3316,19 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                             }
                             /* Populate the inline cache so the next call with
                                the same receiver + method name hits fast and
-                               can skip the probes above. */
+                               can skip the probes above. Match the lookup
+                               keying above: fold __type into the tag. */
+                            int64_t upd_tag = (int64_t)(intptr_t)mc_obj->map;
+                            Value *tn = map_get(mc_obj->map, "__type");
+                            if (tn && VAL_TAG(tn) == XS_STR && tn->s) {
+                                uint64_t h = 1469598103934665603ULL;
+                                for (const char *p = tn->s; *p; p++) {
+                                    h ^= (uint8_t)*p; h *= 1099511628211ULL;
+                                }
+                                upd_tag ^= (int64_t)h;
+                            }
                             ic_update_ex(mc_site_id,
-                                         (int64_t)(intptr_t)mc_obj->map,
+                                         upd_tag,
                                          mc_name, fn,
                                          (uint8_t)is_module_call,
                                          (uint8_t)needs_self);
@@ -5813,26 +5849,45 @@ static int vm_dispatch(VM *vm, int stop_frame) {
         }
 
         case OP_TRY_OP: {
+            /* `expr?` -- if the value is an Err variant, propagate it
+               by returning from the enclosing function; if it's an Ok
+               variant, unwrap to the inner value; otherwise pass it
+               through. Two encodings live in the wild: the older
+               XS_MAP-with-_tag/_val shape, and the current XS_ENUM_VAL
+               shape that carries variant + arr_data. The interp's
+               NODE_UNARY case keys off the latter; we accept both so
+               handwritten Result-style maps still work. */
             Value *val = POP();
-            if (VAL_TAG(val) == XS_MAP) {
+            int is_err = 0, is_ok = 0;
+            Value *inner = NULL;
+            if (VAL_TAG(val) == XS_ENUM_VAL && val->en) {
+                if (val->en->variant) {
+                    if (strcmp(val->en->variant, "Err") == 0) is_err = 1;
+                    else if (strcmp(val->en->variant, "Ok") == 0) is_ok = 1;
+                }
+                if (is_ok && val->en->arr_data && val->en->arr_data->len > 0)
+                    inner = val->en->arr_data->items[0];
+            } else if (VAL_TAG(val) == XS_MAP) {
                 Value *tag_val = map_get(val->map, "_tag");
-                if (tag_val && VAL_TAG(tag_val) == XS_STR && strcmp(tag_val->s, "Err") == 0) {
-                    upvalue_close_all(&vm->open_upvalues, frame->base);
-                    while (vm->sp > frame->base) value_decref(POP());
-                    value_decref(frame->closure_val);
-                    vm->frame_count--;
-                    if (vm->frame_count == 0) { value_decref(val); return 0; }
-                    frame = FRAME;
-                    PUSH(val);
-                    break;
+                if (tag_val && VAL_TAG(tag_val) == XS_STR) {
+                    if (strcmp(tag_val->s, "Err") == 0) is_err = 1;
+                    else if (strcmp(tag_val->s, "Ok") == 0) is_ok = 1;
                 }
-                Value *inner = map_get(val->map, "_val");
-                if (inner) {
-                    PUSH(value_incref(inner));
-                    value_decref(val);
-                } else {
-                    PUSH(val);
-                }
+                if (is_ok) inner = map_get(val->map, "_val");
+            }
+            if (is_err) {
+                upvalue_close_all(&vm->open_upvalues, frame->base);
+                while (vm->sp > frame->base) value_decref(POP());
+                value_decref(frame->closure_val);
+                vm->frame_count--;
+                if (vm->frame_count == 0) { value_decref(val); return 0; }
+                frame = FRAME;
+                PUSH(val);
+                break;
+            }
+            if (is_ok && inner) {
+                PUSH(value_incref(inner));
+                value_decref(val);
             } else {
                 PUSH(val);
             }
@@ -6163,13 +6218,12 @@ Value *vm_iter_get_fast(Value *iter, Value *idx, int want_pairs) {
         r = xs_chan_try_recv(iter);
     } else if ((VAL_TAG(iter) == XS_MAP || VAL_TAG(iter) == XS_MODULE)
                && iter->map) {
-        /* Generic map iteration: i-th inserted key, optionally as
-           (key, value) tuple. */
-        int64_t ki = 0;
+        /* Generic map iteration: i-th inserted key (m->order), optionally
+           as (key, value) tuple. Bucket order leaked hash layout. */
         r = value_incref(XS_NULL_VAL);
-        for (int j = 0; j < iter->map->cap; j++) {
-            if (!iter->map->keys[j]) continue;
-            if (ki == i) {
+        if (i >= 0 && i < iter->map->len) {
+            int j = iter->map->order[i];
+            if (j >= 0 && j < iter->map->cap && iter->map->keys[j]) {
                 if (want_pairs) {
                     value_decref(r);
                     r = xs_tuple_new();
@@ -6183,9 +6237,7 @@ Value *vm_iter_get_fast(Value *iter, Value *idx, int want_pairs) {
                     value_decref(r);
                     r = xs_str(iter->map->keys[j]);
                 }
-                break;
             }
-            ki++;
         }
     } else {
         r = value_incref(XS_NULL_VAL);
@@ -6455,6 +6507,17 @@ int vm_method_call_fast(VM *vm, int argc) {
         (int)((uintptr_t)proto ^
               (uintptr_t)(frame->ip + 1 - proto->chunk.code)));
     int64_t type_tag = (int64_t)(intptr_t)obj->map;
+    /* match the slow-path keying: fold __type into the tag so two
+       distinct types whose instance maps land in the same heap slot
+       don't share a cache slot. */
+    Value *tn = map_get(obj->map, "__type");
+    if (tn && VAL_TAG(tn) == XS_STR && tn->s) {
+        uint64_t h = 1469598103934665603ULL;
+        for (const char *p = tn->s; *p; p++) {
+            h ^= (uint8_t)*p; h *= 1099511628211ULL;
+        }
+        type_tag ^= (int64_t)h;
+    }
     uint8_t is_module = 0, needs_self = 0;
     Value *fn = ic_lookup_ex(site_id, type_tag, name,
                              &is_module, &needs_self);

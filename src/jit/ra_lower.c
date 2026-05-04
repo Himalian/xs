@@ -767,12 +767,21 @@ IRFunc *ralow_lower(XSProto *proto) {
             }
             case OP_SPREAD:
             case OP_ITER_LEN:
-            case OP_OPT_CHAIN:
-            case OP_TRY_OP: {
+            case OP_OPT_CHAIN: {
                 IRVReg a = vstack_pop(&vs);
                 IRVReg d = new_vreg(f);
                 ir_emit(f, IR_VM_STEP, d, a, -1, 0, pc);
                 vstack_push(&vs, d);
+                break;
+            }
+            case OP_TRY_OP: {
+                /* may pop the current frame on Err; treat like OP_THROW
+                   and let vm_step_jit unwind, then deopt to interp so
+                   it picks up wherever frame->ip parked. The Ok path
+                   could stay in JIT but it's rare enough that the
+                   conservative bail isn't worth complicating IR for. */
+                IRVReg a = vstack_pop(&vs);
+                ir_emit(f, IR_VM_STEP_CF, -1, a, -1, 0, pc);
                 break;
             }
             case OP_INHERIT: {
