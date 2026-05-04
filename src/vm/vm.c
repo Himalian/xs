@@ -6446,9 +6446,14 @@ int vm_method_call_fast(VM *vm, int argc) {
 
     /* ---- Map / module IC route ---- */
     if (VAL_TAG(obj) != XS_MAP && VAL_TAG(obj) != XS_MODULE) return 1;
+    /* The slow-path OP_METHOD_CALL keys its IC slot off the IP that
+       has already been advanced past this opcode (the dispatch loop
+       does `*frame->ip++`). We're called BEFORE that bump, so add 1
+       here to land on the same site_id; otherwise every IC lookup
+       misses and the fast path is no better than the slow path. */
     int site_id = ic_site_id(
         (int)((uintptr_t)proto ^
-              (uintptr_t)(frame->ip - proto->chunk.code)));
+              (uintptr_t)(frame->ip + 1 - proto->chunk.code)));
     int64_t type_tag = (int64_t)(intptr_t)obj->map;
     uint8_t is_module = 0, needs_self = 0;
     Value *fn = ic_lookup_ex(site_id, type_tag, name,
