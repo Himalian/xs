@@ -118,12 +118,15 @@ library.
 | `--vm`              | full, multi-shot resume               |
 | `--jit`             | full (lowered through vm_step_cf)     |
 | `--emit js`         | full single-shot; multi-shot wraps the handler in a generator |
-| `--emit wasm`       | single-shot only                      |
-| `--emit c`          | not implemented in v1.2               |
+| `--emit c`          | single-shot, via setjmp/longjmp + GCC nested-fn dispatcher |
+| `--emit wasm`       | not implemented; perform on the WASM target traps |
 
-`--emit c` falls back to a runtime error on `perform`. Implementing
-it properly needs delimited continuations on top of longjmp; tracked
-for v1.3.
+The C target uses `setjmp` / `longjmp` and emits the arm body as a
+GCC nested function so it can close over the enclosing scope. That's
+single-shot only — multi-shot resume needs full delimited
+continuations and is tracked for a later release. WASM still needs
+either WASM exception-handling or a CPS rewrite of the runtime; on
+the WASM target `perform` is a runtime trap.
 
 ## Cost
 

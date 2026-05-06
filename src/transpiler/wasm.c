@@ -2055,7 +2055,11 @@ static void compile_expr(Node *node, WasmBuf *code, LocalMap *locals, CompilerCt
     /* ---- Perform ---- */
 
     case NODE_PERFORM:
-        /* Effects not supported in WASM - return null */
+        /* Effects on the WASM target need delimited continuations or
+         * WASM exception-handling, neither of which is wired up yet.
+         * Trap rather than silently returning null so users get a
+         * clear runtime error. */
+        buf_byte(code, OP_UNREACHABLE);
         emit_null(code);
         break;
 
