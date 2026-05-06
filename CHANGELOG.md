@@ -1,5 +1,61 @@
 # Changelog
 
+## 1.2.0
+
+Big subtraction + correctness release. Three rarely-used features
+came out of the language; a pile of "documented but didn't actually
+work" claims got either fixed or owned up to in the docs.
+
+**Cuts.** Easier to learn, easier to type-check, smaller compiler.
+- `adapt fn` (multi-target fn declaration form): gone. Anything it
+  expressed can be a closure over a target switch.
+- `signal()` / `derived()` / `subscribe()` / `effect()` reactive
+  library: gone. The `bind` keyword covers the same use cases on
+  every backend with less surface.
+- `inline c { ... }` blocks: gone. Any program with one immediately
+  failed to transpile to JS or WASM, so the portability story was a
+  lie. FFI is still available via the `ffi` module.
+
+**Real regex.** The Thompson-NFA engine in src/core/regex.c had been
+shipping for releases but the user-facing `re.match` / `re.test` /
+`re.find_all` / `re.split` / `re.replace` / `re.replace_all` /
+`re.groups` natives were thin wrappers around POSIX ERE with a
+hand-rolled `\d -> [0-9]` translator. Re-pointed all of them at the
+real engine. `\d`, `\w`, `\s`, `\b`, non-greedy `*?` / `+?` / `??`,
+non-capturing `(?:...)`, positive `(?=...)` and negative `(?!...)`
+lookaheads all work now.
+
+**JIT.** Stop bailing the entire proto on actor methods, module
+construction, enum construction, send, kwarg calls, or import.
+`OP_MAKE_ACTOR` / `OP_SEND` / `OP_MAKE_ENUM` / `OP_MAKE_MODULE` /
+`OP_END_MODULE` / `OP_CALL_KW` / `OP_IMPORT` / `OP_IMPORT_ITEM`
+now lower through `vm_step_jit` so calling code stays in tier-2
+across `actor.method()`, `import math` etc. The proto-level
+`is_actor_method` / `has_actor` bails are gone with them.
+Closure-callback inlining for `arr.sort(|a,b| ...)` is still
+deferred -- merge sort already kills the O(n²) cliff that was the
+worst part of the perf trap.
+
+**JS target.** Cleared the "rough" reputation:
+- `==` / `!=` / `assert_eq` now use a structural `__xs_eq`. JS `===`
+  is reference equality, which silently broke any conformance test
+  that compared arrays / maps. (this caused 5/9 conformance test
+  failures by itself)
+- `let _ = expr` no longer emits `const _ = ...`, which would crash
+  with `Identifier '_' has already been declared` the moment a
+  function had two side-effecting wildcard lets.
+
+**Doc sweep.** README claimed the tree-walker was the default
+backend. It isn't, and STATUS.md said the opposite. Fixed the bash
+example, the prose, and the backend-list ordering. book/cli.md and
+book/performance.md no longer tell people to "use --vm by default";
+the right rule is `--jit` for hot loops, default for everything
+else, `--interp` for plugin debugging. Acknowledged in
+book/effects.md that `--emit c` doesn't run effects yet (tracked for
+v1.3) and `--emit wasm` is single-shot only. book/transpilers.md
+gained a per-target "what works / what doesn't" section so the gaps
+are visible at the surface, not just by reading source.
+
 ## 1.1.1
 
 Stdlib modules (`math`, `os`, `fs`, `time`, `string`, `path`, `json`,
