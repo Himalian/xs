@@ -54,14 +54,17 @@ Three execution backends, one flag:
 
 | invocation | backend                    | when                          |
 |------------|----------------------------|-------------------------------|
-| `xs`       | tree-walker                | REPL, plugin debugging        |
-| `xs --vm`  | bytecode VM                | the production default        |
+| `xs`       | bytecode VM (default)      | most code, allocation-heavy    |
+| `xs --interp` | tree-walker             | REPL, plugin debugging, some tight numeric loops |
 | `xs --jit` | adaptive JIT (VM + native) | hot loops, long-running jobs  |
 
-The VM is the baseline. Running with `--jit` is identical
-behaviourally; the JIT just trades a few bytes of startup for native
-speed on hot protos. Force the interpreter only when a plugin needs
-AST-level eval hooks.
+The VM is the default. The tree-walker isn't always slower -- on
+tight non-allocating numeric loops it sometimes beats the VM
+because it skips the bytecode dispatch overhead. For real hot
+loops, reach for `--jit`; behavioural output is identical to
+`--vm` and the JIT only kicks in once a proto crosses the call
+threshold. Force `--interp` only when a plugin needs AST-level
+eval hooks.
 
 ## Common workflows
 

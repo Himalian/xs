@@ -8,6 +8,9 @@
 #include <stdint.h>
 
 /* random module */
+/* random.int(lo, hi) -> int in [lo, hi] inclusive on both ends. The
+   inclusive upper bound is intentional and matches lua / ruby; if you
+   need Python's "exclusive end" shape use `random.int(lo, hi - 1)`. */
 static Value *native_random_int(Interp *ig, Value **args, int argc) {
     (void)ig;
     int64_t lo = 0, hi = 100;

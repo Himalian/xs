@@ -808,6 +808,16 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     xs_set_argv(argc, argv);
+    /* Honour the standard NO_COLOR env var (https://no-color.org)
+       and the conventional dumb-terminal opt-out so the CLI quiets
+       its diagnostic colour without --no-color in CI / piped runs.
+       --no-color on the command line still wins later. */
+    {
+        const char *nc = getenv("NO_COLOR");
+        if (nc && nc[0]) g_no_color = 1;
+        const char *term = getenv("TERM");
+        if (term && strcmp(term, "dumb") == 0) g_no_color = 1;
+    }
     if (!g_sema_cache) g_sema_cache = cache_new();
     /* Initialize the global interpreter lock; main thread holds it for
        the duration. spawned threads acquire on entry. */

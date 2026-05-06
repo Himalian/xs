@@ -516,11 +516,26 @@ static Value *vm_sum(Interp *interp, Value **args, int argc) {
     return is_float ? xs_float(sf + (double)si) : xs_int(si);
 }
 
+static int is_callable_tag(int t) {
+    return t == XS_FUNC || t == XS_NATIVE || t == XS_CLOSURE || t == XS_OVERLOAD;
+}
+
 static Value *vm_map_fn(Interp *interp, Value **args, int argc) {
     (void)interp;
     if (argc < 2) return xs_array_new();
-    Value *fn = args[0], *col = args[1];
-    if ((VAL_TAG(col) != XS_ARRAY && VAL_TAG(col) != XS_TUPLE)) return xs_array_new();
+    /* Accept either (col, fn) or (fn, col); the interp's free-fn map
+       takes the array first, the VM's old form took the fn first.
+       Pipe `xs |> map(fn)` always lands as (col, fn). Be tolerant. */
+    Value *fn = NULL, *col = NULL;
+    if ((VAL_TAG(args[0]) == XS_ARRAY || VAL_TAG(args[0]) == XS_TUPLE) &&
+        is_callable_tag(VAL_TAG(args[1]))) {
+        col = args[0]; fn = args[1];
+    } else if (is_callable_tag(VAL_TAG(args[0])) &&
+               (VAL_TAG(args[1]) == XS_ARRAY || VAL_TAG(args[1]) == XS_TUPLE)) {
+        fn = args[0]; col = args[1];
+    } else {
+        return xs_array_new();
+    }
     Value *arr = xs_array_new();
     for (int j = 0; j < col->arr->len; j++) {
         Value *elem = col->arr->items[j];
@@ -535,8 +550,16 @@ static Value *vm_map_fn(Interp *interp, Value **args, int argc) {
 static Value *vm_filter_fn(Interp *interp, Value **args, int argc) {
     (void)interp;
     if (argc < 2) return xs_array_new();
-    Value *fn = args[0], *col = args[1];
-    if ((VAL_TAG(col) != XS_ARRAY && VAL_TAG(col) != XS_TUPLE)) return xs_array_new();
+    Value *fn = NULL, *col = NULL;
+    if ((VAL_TAG(args[0]) == XS_ARRAY || VAL_TAG(args[0]) == XS_TUPLE) &&
+        is_callable_tag(VAL_TAG(args[1]))) {
+        col = args[0]; fn = args[1];
+    } else if (is_callable_tag(VAL_TAG(args[0])) &&
+               (VAL_TAG(args[1]) == XS_ARRAY || VAL_TAG(args[1]) == XS_TUPLE)) {
+        fn = args[0]; col = args[1];
+    } else {
+        return xs_array_new();
+    }
     Value *arr = xs_array_new();
     for (int j = 0; j < col->arr->len; j++) {
         Value *elem = col->arr->items[j];
@@ -552,11 +575,22 @@ static Value *vm_filter_fn(Interp *interp, Value **args, int argc) {
 static Value *vm_reduce_fn(Interp *interp, Value **args, int argc) {
     (void)interp;
     if (argc < 2) return xs_null();
-    Value *fn = args[0], *col = args[1];
-    if ((VAL_TAG(col) != XS_ARRAY && VAL_TAG(col) != XS_TUPLE) || col->arr->len == 0)
-        return argc >= 3 ? value_incref(args[2]) : xs_null();
-    Value *acc = argc >= 3 ? value_incref(args[2]) : value_incref(col->arr->items[0]);
-    int start = argc >= 3 ? 0 : 1;
+    Value *fn = NULL, *col = NULL;
+    Value *seed = NULL;
+    if ((VAL_TAG(args[0]) == XS_ARRAY || VAL_TAG(args[0]) == XS_TUPLE) &&
+        is_callable_tag(VAL_TAG(args[1]))) {
+        col = args[0]; fn = args[1];
+        if (argc >= 3) seed = args[2];
+    } else if (is_callable_tag(VAL_TAG(args[0])) &&
+               (VAL_TAG(args[1]) == XS_ARRAY || VAL_TAG(args[1]) == XS_TUPLE)) {
+        fn = args[0]; col = args[1];
+        if (argc >= 3) seed = args[2];
+    } else {
+        return xs_null();
+    }
+    if (col->arr->len == 0) return seed ? value_incref(seed) : xs_null();
+    Value *acc = seed ? value_incref(seed) : value_incref(col->arr->items[0]);
+    int start = seed ? 0 : 1;
     if (VAL_TAG(fn) == XS_NATIVE || VAL_TAG(fn) == XS_CLOSURE) {
         for (int j = start; j < col->arr->len; j++) {
             Value *pair[2] = {acc, col->arr->items[j]};
@@ -1687,6 +1721,11 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                 fprintf(stderr, "uncaught: %s\n", s);
                 free(s);
                 value_decref(exc);
+                /* Surface the uncaught throw to the host so a trigger
+                   callback (or anyone calling into vm_invoke) doesn't
+                   keep firing on the same broken state. */
+                extern int g_xs_runtime_error_count;
+                g_xs_runtime_error_count++;
                 return 1;
             }
             continue; /* re-enter loop at catch handler */
@@ -2718,6 +2757,8 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                         fprintf(stderr, "uncaught: %s\n", s);
                         free(s);
                         value_decref(exc);
+                        extern int g_xs_runtime_error_count;
+                        g_xs_runtime_error_count++;
                         return 1;
                     }
                 } else {
@@ -4844,6 +4885,8 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                 fprintf(stderr, "uncaught: %s\n", s);
                 free(s);
                 value_decref(exc);
+                extern int g_xs_runtime_error_count;
+                g_xs_runtime_error_count++;
                 return 1;
             }
             break;

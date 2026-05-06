@@ -51,11 +51,9 @@ static int is_builtin_name(const char *name) {
         "int","float","str","bool","char","repr","ord","chr",
         "dbg","pprint","clear","sprintf",
         "channel","select","spawn","nursery","signal","derived",
-        "math","time","io","string","path","base64","hash","uuid",
-        "collections","random","json","log","fmt","test","csv","url",
-        "re","process","os","async","net","crypto","thread","buf",
-        "encode","db","cli","ffi","reflect","gc","reactive",
-        "fs","http","toml","msgpack","Promise",
+        /* Stdlib modules (math, time, fs, os, ...) are no longer in this
+           list -- they require an explicit `import name` and the resolver
+           reports them as undefined otherwise. */
         "argc","argv",
         "provenance","provenance_chain","provenance_stats",
         "provenance_trace","provenance_history",

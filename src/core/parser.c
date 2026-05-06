@@ -2751,6 +2751,21 @@ static Node *parse_for(Parser *p) {
     Token *kw = pp_expect(p, TK_FOR, "expected 'for'");
     Span span = kw->span;
     Node *pat = parse_pattern(p);
+    /* `for k, v in m` -- accept the comma-separated bare form as
+       sugar for `for (k, v) in m`. The pattern parser already handles
+       the parenthesised tuple shape; this branch covers the
+       no-parens form documented in the book / tour. */
+    if (pp_check(p, TK_COMMA)) {
+        NodeList elems = nodelist_new();
+        nodelist_push(&elems, pat);
+        while (pp_match(p, TK_COMMA)) {
+            Node *more = parse_pattern(p);
+            nodelist_push(&elems, more);
+        }
+        Node *tup = node_new(NODE_PAT_TUPLE, pat->span);
+        tup->pat_tuple.elems = elems;
+        pat = tup;
+    }
     pp_expect(p, TK_IN, "expected 'in'");
     Node *iter = parse_expr(p, 0);
     Node *body = parse_block(p);

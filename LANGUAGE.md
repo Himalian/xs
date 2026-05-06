@@ -2872,11 +2872,15 @@ println(re.test("^\\d+$", "123"))              -- true
 
 ```xs
 import random
-println(random.int(1, 10))       -- random int between 1 and 10
-println(random.float())          -- random float 0.0-1.0
+println(random.int(1, 10))       -- random int in [1, 10], inclusive on both ends
+println(random.float())          -- random float 0.0-1.0 (half-open)
 println(random.bool())           -- random boolean
 println(random.choice(["a", "b", "c"]))  -- random element
 ```
+
+`random.int(lo, hi)` is **inclusive** on both ends, like `lua` and
+`ruby`. Coming from Python's exclusive `randrange`? Pass
+`random.int(lo, hi - 1)`.
 
 ---
 

@@ -591,10 +591,15 @@ static Value *builtin_array(Interp *i, Value **args, int argc) {
 }
 
 static Value *builtin_map(Interp *i, Value **args, int argc) {
-    /* map() -> empty map, map(arr, fn) -> mapped array */
+    /* map() -> empty map, map(arr, fn) -> mapped array.
+       The fn-arg type check covers OVERLOAD too because top-level
+       `fn foo(...)` declarations end up as overload sets after the
+       hoist+stmt double pass. */
     if (argc == 0) return xs_map_new();
-    if (argc >= 2 && (VAL_TAG(args[0]) == XS_ARRAY || VAL_TAG(args[0]) == XS_TUPLE) &&
-        (VAL_TAG(args[1]) == XS_FUNC || VAL_TAG(args[1]) == XS_NATIVE || VAL_TAG(args[1]) == XS_CLOSURE)) {
+    int fn_ok = argc >= 2 &&
+        (VAL_TAG(args[1]) == XS_FUNC || VAL_TAG(args[1]) == XS_NATIVE ||
+         VAL_TAG(args[1]) == XS_CLOSURE || VAL_TAG(args[1]) == XS_OVERLOAD);
+    if (argc >= 2 && (VAL_TAG(args[0]) == XS_ARRAY || VAL_TAG(args[0]) == XS_TUPLE) && fn_ok) {
         Value *arr = args[0], *fn = args[1];
         Value *result = xs_array_new();
         for (int j = 0; j < arr->arr->len; j++) {

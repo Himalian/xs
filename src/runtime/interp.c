@@ -2300,24 +2300,41 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
             return value_incref(XS_TRUE_VAL);
         }
         if (strcmp(method, "sort") == 0) {
-            /* simple insertion sort */
-            Value *cmp_fn = (argc>0)?args[0]:NULL;
-            for (int a2=1; a2<arr->len; a2++) {
-                Value *key = arr->items[a2]; int b2 = a2-1;
-                while (b2 >= 0) {
-                    int cmp;
-                    if (cmp_fn) {
-                        Value *ca[2] = {arr->items[b2], key};
-                        Value *r = call_value(i, cmp_fn, ca, 2, "sort");
-                        cmp = (VAL_TAG(r)==XS_INT)?(int)VAL_INT(r):0;
-                        value_decref(r);
-                    } else {
-                        cmp = value_cmp(arr->items[b2], key);
+            /* O(n log n) sort. The previous shape was an insertion
+               sort that turned a 1k-element list into a million
+               compare-callback invocations; merge-sort with cb
+               below is roughly 50x faster on big lists with a user
+               comparator and matches qsort on the cb-less path. */
+            Value *cmp_fn = (argc > 0) ? args[0] : NULL;
+            int n = arr->len;
+            if (n > 1) {
+                Value **buf = xs_malloc((size_t)n * sizeof(Value*));
+                /* bottom-up merge sort */
+                for (int width = 1; width < n; width *= 2) {
+                    for (int s = 0; s < n; s += 2 * width) {
+                        int lo = s;
+                        int mid = (s + width < n) ? s + width : n;
+                        int hi  = (s + 2 * width < n) ? s + 2 * width : n;
+                        int p = lo, q = mid, k = lo;
+                        while (p < mid && q < hi) {
+                            int cmp;
+                            if (cmp_fn) {
+                                Value *ca[2] = { arr->items[p], arr->items[q] };
+                                Value *r = call_value(i, cmp_fn, ca, 2, "sort");
+                                cmp = (VAL_TAG(r) == XS_INT) ? (int)VAL_INT(r) : 0;
+                                value_decref(r);
+                            } else {
+                                cmp = value_cmp(arr->items[p], arr->items[q]);
+                            }
+                            if (cmp <= 0) buf[k++] = arr->items[p++];
+                            else          buf[k++] = arr->items[q++];
+                        }
+                        while (p < mid) buf[k++] = arr->items[p++];
+                        while (q < hi)  buf[k++] = arr->items[q++];
+                        for (int j = lo; j < hi; j++) arr->items[j] = buf[j];
                     }
-                    if (cmp <= 0) break;
-                    arr->items[b2+1] = arr->items[b2]; b2--;
                 }
-                arr->items[b2+1] = key;
+                free(buf);
             }
             return value_incref(obj);
         }
@@ -2329,28 +2346,43 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
             return eval_method(i, copy, "sort", sort_args, argc>0?1:0);
         }
         if (strcmp(method, "sort_by") == 0) {
-            /* sort_by(key_fn): sort a copy by extracted key */
+            /* sort_by(key_fn): sort a copy by extracted key. Same
+               complexity rationale as sort: merge-sort over an
+               extracted keys array, so each element pays exactly one
+               key-fn call instead of N²/2 comparator calls. */
             if (argc < 1) return value_incref(XS_NULL_VAL);
             Value *key_fn = args[0];
             Value *copy = xs_array_new();
             for (int j=0;j<arr->len;j++) array_push(copy->arr, value_incref(arr->items[j]));
             XSArray *ca = copy->arr;
-            /* extract keys */
-            Value **keys = xs_malloc(ca->len * sizeof(Value*));
-            for (int j=0;j<ca->len;j++) {
-                Value *arg[1] = {ca->items[j]};
+            int n = ca->len;
+            Value **keys = xs_malloc((size_t)n * sizeof(Value*));
+            for (int j = 0; j < n; j++) {
+                Value *arg[1] = { ca->items[j] };
                 keys[j] = call_value(i, key_fn, arg, 1, "sort_by");
             }
-            /* insertion sort by keys */
-            for (int a2=1; a2<ca->len; a2++) {
-                Value *kv = keys[a2]; Value *item = ca->items[a2]; int b2 = a2-1;
-                while (b2 >= 0 && value_cmp(keys[b2], kv) > 0) {
-                    ca->items[b2+1] = ca->items[b2];
-                    keys[b2+1] = keys[b2];
-                    b2--;
+            if (n > 1) {
+                Value **kbuf = xs_malloc((size_t)n * sizeof(Value*));
+                Value **ibuf = xs_malloc((size_t)n * sizeof(Value*));
+                for (int width = 1; width < n; width *= 2) {
+                    for (int s = 0; s < n; s += 2 * width) {
+                        int lo = s;
+                        int mid = (s + width < n) ? s + width : n;
+                        int hi  = (s + 2 * width < n) ? s + 2 * width : n;
+                        int p = lo, q = mid, k = lo;
+                        while (p < mid && q < hi) {
+                            if (value_cmp(keys[p], keys[q]) <= 0) {
+                                kbuf[k] = keys[p]; ibuf[k] = ca->items[p]; k++; p++;
+                            } else {
+                                kbuf[k] = keys[q]; ibuf[k] = ca->items[q]; k++; q++;
+                            }
+                        }
+                        while (p < mid) { kbuf[k] = keys[p]; ibuf[k] = ca->items[p]; k++; p++; }
+                        while (q < hi)  { kbuf[k] = keys[q]; ibuf[k] = ca->items[q]; k++; q++; }
+                        for (int j = lo; j < hi; j++) { keys[j] = kbuf[j]; ca->items[j] = ibuf[j]; }
+                    }
                 }
-                ca->items[b2+1] = item;
-                keys[b2+1] = kv;
+                free(kbuf); free(ibuf);
             }
             for (int j=0;j<ca->len;j++) value_decref(keys[j]);
             free(keys);
@@ -5864,17 +5896,26 @@ do_call: ;
             }
         } else if (VAL_TAG(iter) == XS_MAP && map_get(iter->map, "_chan_id") &&
                    VAL_TAG(map_get(iter->map, "_chan_id")) == XS_INT) {
-            /* Channel iteration: snapshot the current buffer length and
-               drain that many values via try_recv. Doesn't block on an
-               open channel; for stream semantics, the caller can write
-               an explicit `while !ch.is_closed() || ch.len() > 0` loop
-               with .recv(). */
-            int snap = xs_chan_len(iter);
-            for (int ci = 0; ci < snap; ci++) {
-                Value *val = xs_chan_try_recv(iter);
+            /* Channel iteration: blocking recv until the channel is
+               closed and drained. Matches what people coming from Go's
+               `for v := range ch` expect; the previous non-blocking
+               drain only ran over what happened to be buffered the
+               instant the loop started, which is rarely useful. Use
+               `ch.try_recv()` if you want the old non-blocking shape. */
+            while (1) {
+                int closed = xs_chan_is_closed(iter);
+                int buffered = xs_chan_len(iter);
+                if (closed && buffered <= 0) break;
+                Value *val;
+                if (closed) val = xs_chan_try_recv(iter);
+                else        val = xs_chan_recv(iter, i);
+                if (!val) {
+                    if (xs_chan_is_closed(iter) && xs_chan_len(iter) <= 0) break;
+                    continue;
+                }
                 push_env(i);
-                bind_pattern(i, n->for_loop.pattern, val ? val : XS_NULL_VAL, i->env, 1);
-                if (val) value_decref(val);
+                bind_pattern(i, n->for_loop.pattern, val, i->env, 1);
+                value_decref(val);
                 interp_exec(i, n->for_loop.body);
                 pop_env(i);
                 FOR_BREAK_CHECK
@@ -8876,7 +8917,21 @@ void interp_exec(Interp *i, Node *stmt) {
         Value *v = xs_func_new(fn);
         if (stmt->fn_decl.name) {
             Value *existing = env_get(i->env, stmt->fn_decl.name);
-            if (existing && VAL_TAG(existing) == XS_OVERLOAD) {
+            /* hoist_functions already bound this exact decl at top
+               level; running the stmt path would wrap it in a single-
+               element overload set with itself. Skip when we recognise
+               the already-hoisted shape (existing fn whose body and
+               name match this stmt). */
+            int already_hoisted = 0;
+            if (existing && VAL_TAG(existing) == XS_FUNC && existing->fn &&
+                existing->fn->body == stmt->fn_decl.body &&
+                existing->fn->name && stmt->fn_decl.name &&
+                strcmp(existing->fn->name, stmt->fn_decl.name) == 0) {
+                already_hoisted = 1;
+            }
+            if (already_hoisted) {
+                /* nothing to do -- hoist already did it */
+            } else if (existing && VAL_TAG(existing) == XS_OVERLOAD) {
                 array_push(existing->overload, value_incref(v));
             } else if (existing && (VAL_TAG(existing) == XS_FUNC || VAL_TAG(existing) == XS_NATIVE)) {
                 Value *oset = xs_overload_new();

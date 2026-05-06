@@ -4,22 +4,49 @@ XS ships three execution backends, switched at the command line:
 
 | flag        | backend            | startup | hot loop | notes                   |
 |-------------|--------------------|---------|----------|-------------------------|
-| `--interp`  | tree-walking       | ~3 ms   | slow     | needed for some plugins |
-| `--vm`      | bytecode VM        | ~5 ms   | medium   | the default             |
-| `--jit`     | tier-2 native JIT  | ~5 ms   | fast     | x86-64 + arm64          |
+| `--interp`  | tree-walking       | ~3 ms   | medium   | needed for some plugins |
+| `--vm`      | bytecode VM        | ~5 ms   | medium   | default; better at allocation-heavy programs |
+| `--jit`     | tier-2 native JIT  | ~5 ms   | fast     | x86-64 + arm64; pick this when you have hot loops |
 
-The default is the VM. JIT kicks in adaptively for hot protos
-(threshold scales with bytecode length: 25 calls for tiny functions,
-200 for big ones).
+The CLI default is `--vm`. **The two slow-path backends are closer
+than you'd expect**: on tight non-allocating numeric loops the
+tree-walker can actually beat the bytecode VM because it skips the
+push/pop dispatch overhead. The VM wins on allocation-heavy code,
+deeply nested calls, and anything that exercises the inline cache.
+For programs with real hot loops, prefer `--jit`. The threshold
+scales with bytecode length (25 calls for tiny functions, 200 for
+big ones), so cold scripts won't pay the JIT compile cost.
+
+Quick-and-dirty rule:
+- One-shot script, mostly stdlib calls -> default `--vm` is fine.
+- Tight inner loop with arithmetic -> `--jit`.
+- Pre-1.0 plugin code with `before_eval` hooks -> `--interp`.
 
 ## Where XS is fast today
 
 From the cross-runtime benchmark suite (`make bench`):
 
-- **Sort, json round-trip, string munging**: faster than CPython,
-  often by 2-5×.
-- **SHA-256 hashing**: faster than CPython, comparable to Node.
+- **Tight integer / numeric loops under `--jit`**: competitive with
+  CPython, often beats it.
+- **String munging, hashing, sort on built-in types**: faster than
+  CPython, often by 2-5×.
 - **Startup**: under 5 ms. CPython is ~15 ms, Node ~50 ms.
+
+## Where XS is slower
+
+- **Allocation-heavy real-world programs** (JSON-heavy ETL, deep
+  map / object construction): currently ~6-7× slower than CPython.
+  The tagged-Value representation forces a heap allocation per
+  field per object; we have a few obvious wins queued (small-map
+  inline storage, JSON parser with reusable buffers) but they
+  haven't landed yet. If you're processing big JSON, prefer
+  streaming over in-memory.
+- **Sort with a user comparator**: ~50× slower than the default
+  comparator because every compare goes through the interpreter
+  and the JIT can't yet inline closure callbacks. Use
+  `arr.sort_by(|x| x.field)` instead of `arr.sort(|a, b| ...)`
+  when you can -- one key-fn call per element is much cheaper than
+  one comparator call per pair.
 
 ## Where XS is slow today
 

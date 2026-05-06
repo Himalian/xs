@@ -115,6 +115,53 @@ Value *trigger_native_register(Interp *interp, Value **args, int argc) {
 
 /* ---- Lifecycle firing ---- */
 
+/* Set when any trigger callback raises an error / throws / panics.
+   trigger_run_event_loop checks this so we stop firing instead of
+   silently re-entering the same broken handler forever. */
+static int g_trigger_loop_aborted = 0;
+int trigger_loop_aborted(void) { return g_trigger_loop_aborted; }
+
+/* Check whether the just-completed callback left an error or
+   uncaught throw, on either the AST interp or the VM, and stop
+   firing further callbacks if so. Without this, a handler that
+   throws every time keeps re-entering forever. */
+static int trigger_callback_failed(Interp *i, const char *name) {
+    extern int g_xs_runtime_error_count;
+    static int g_seen_runtime_errors = 0;
+    int rc_now = g_xs_runtime_error_count;
+    if (rc_now > g_seen_runtime_errors) {
+        g_seen_runtime_errors = rc_now;
+        fprintf(stderr,
+                "xs: error: @%s handler errored; aborting event loop\n",
+                name ? name : "trigger");
+        if (i) i->had_unhandled_exception = 1;
+        g_trigger_loop_aborted = 1;
+        return 1;
+    }
+    if (!i) return 0;
+    if (i->cf.signal == CF_ERROR ||
+        i->cf.signal == CF_THROW ||
+        i->cf.signal == CF_PANIC) {
+        if (i->cf.signal == CF_THROW && i->cf.value) {
+            char *s = value_repr(i->cf.value);
+            fprintf(stderr, "xs: error: uncaught throw in @%s handler: %s\n",
+                    name ? name : "trigger", s ? s : "?");
+            free(s);
+            i->had_unhandled_exception = 1;
+            if (!i->unhandled_exception_value)
+                i->unhandled_exception_value = value_incref(i->cf.value);
+        } else if (i->cf.signal == CF_ERROR) {
+            fprintf(stderr, "xs: error: @%s handler hit a runtime error; aborting event loop\n",
+                    name ? name : "trigger");
+            i->had_unhandled_exception = 1;
+        }
+        CF_CLEAR(i);
+        g_trigger_loop_aborted = 1;
+        return 1;
+    }
+    return 0;
+}
+
 static void fire_named(Interp *i, const char *name, Value *opt_arg) {
     int n_args = opt_arg ? 1 : 0;
     Value *args[1];
@@ -126,6 +173,7 @@ static void fire_named(Interp *i, const char *name, Value *opt_arg) {
         if (e->fn) {
             Value *r = call_value(i, e->fn, opt_arg ? args : NULL, n_args, name);
             if (r) value_decref(r);
+            if (trigger_callback_failed(i, name)) return;
         }
         e->fired_once = 1;
     }
@@ -189,6 +237,7 @@ static void fire_signal(Interp *i, const char *which) {
         if (e->fn) {
             Value *r = call_value(i, e->fn, NULL, 0, "on_signal");
             if (r) value_decref(r);
+            if (trigger_callback_failed(i, "on_signal")) return;
         }
         e->fired_once = 1;
     }
@@ -462,6 +511,7 @@ static void check_watches(Interp *i) {
             if (e->fn) {
                 Value *r = call_value(i, e->fn, NULL, 0, "watch");
                 if (r) value_decref(r);
+                if (trigger_callback_failed(i, "watch")) return;
             }
             e->fired_once = 1;
             e->next_fire_ns = 0;
@@ -533,6 +583,7 @@ static void fire_due(Interp *i, int64_t now_ns) {
         if (e->fn) {
             Value *r = call_value(i, e->fn, NULL, 0, e->name);
             if (r) value_decref(r);
+            if (trigger_callback_failed(i, e->name)) return;
         }
         e->fired_once = 1;
         if (is_periodic) {
@@ -561,7 +612,9 @@ static void sleep_ns(int64_t ns) {
 
 void trigger_run_event_loop(Interp *i) {
     if (!has_persistent_triggers()) return;
+    g_trigger_loop_aborted = 0;
     while (has_persistent_triggers()) {
+        if (g_trigger_loop_aborted) break;
         int64_t now = now_mono_ns();
         int64_t next = soonest_fire_ns(now);
         if (next == INT64_MAX) {
@@ -575,7 +628,9 @@ void trigger_run_event_loop(Interp *i) {
             sleep_ns(budget);
         }
         trigger_pump_signals(i);
+        if (g_trigger_loop_aborted) break;
         check_watches(i);
+        if (g_trigger_loop_aborted) break;
         fire_due(i, now_mono_ns());
     }
 }
