@@ -35,10 +35,19 @@
 
 int    g_xs_argc = 0;
 char **g_xs_argv = NULL;
+int    g_xs_user_argc = 0;
+char **g_xs_user_argv = NULL;
 
 void xs_set_argv(int argc, char **argv) {
     g_xs_argc = argc;
     g_xs_argv = argv;
+    g_xs_user_argc = 0;
+    g_xs_user_argv = argv + argc;
+}
+
+void xs_set_user_args(int argc, char **argv) {
+    g_xs_user_argc = argc;
+    g_xs_user_argv = argv;
 }
 #if !defined(__MINGW32__) && !defined(__wasi__)
 #  include <unistd.h>

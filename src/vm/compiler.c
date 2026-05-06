@@ -2394,7 +2394,8 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
 
             emit_a(c, OP_LOAD_LOCAL, iter_slots[ci]);
             emit_a(c, OP_LOAD_LOCAL, idx_slots[ci]);
-            emit(c, MAKE_A(OP_ITER_GET, 0, 0));
+            int want_pairs = (cpat && VAL_TAG(cpat) == NODE_PAT_TUPLE) ? 1 : 0;
+            emit(c, MAKE_A(OP_ITER_GET, want_pairs, 0));
 
             const char *cpat_name = NULL;
             if (cpat && VAL_TAG(cpat) == NODE_PAT_IDENT) cpat_name = cpat->pat_ident.name;
@@ -2402,6 +2403,27 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
             if (cpat_name) {
                 int var_slot = local_add(c->current, cpat_name);
                 emit_a(c, OP_STORE_LOCAL, var_slot);
+            } else if (cpat && (VAL_TAG(cpat) == NODE_PAT_TUPLE ||
+                                VAL_TAG(cpat) == NODE_PAT_SLICE)) {
+                /* Destructure (k, v) / [a, b, c] inline, mirroring the
+                   for-loop's compile path. Without this the value would
+                   just be popped and the names left undefined. */
+                NodeList *elems = (VAL_TAG(cpat) == NODE_PAT_TUPLE)
+                    ? &cpat->pat_tuple.elems : &cpat->pat_slice.elems;
+                int elem_slot = local_add_hidden(c);
+                emit_a(c, OP_STORE_LOCAL, elem_slot);
+                for (int di = 0; di < elems->len; di++) {
+                    Node *sub = elems->items[di];
+                    emit_a(c, OP_LOAD_LOCAL, elem_slot);
+                    emit_const(c, xs_int(di));
+                    emit(c, MAKE_A(OP_INDEX_GET, 0, 0));
+                    if (VAL_TAG(sub) == NODE_PAT_IDENT && sub->pat_ident.name) {
+                        int ds = local_add(c->current, sub->pat_ident.name);
+                        emit_a(c, OP_STORE_LOCAL, ds);
+                    } else {
+                        emit(c, MAKE_A(OP_POP, 0, 0));
+                    }
+                }
             } else {
                 emit(c, MAKE_A(OP_POP, 0, 0));
             }
@@ -2475,7 +2497,8 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
 
             emit_a(c, OP_LOAD_LOCAL, iter_slots[ci]);
             emit_a(c, OP_LOAD_LOCAL, idx_slots[ci]);
-            emit(c, MAKE_A(OP_ITER_GET, 0, 0));
+            int want_pairs = (cpat && VAL_TAG(cpat) == NODE_PAT_TUPLE) ? 1 : 0;
+            emit(c, MAKE_A(OP_ITER_GET, want_pairs, 0));
 
             const char *cpat_name = NULL;
             if (cpat && VAL_TAG(cpat) == NODE_PAT_IDENT) cpat_name = cpat->pat_ident.name;
@@ -2483,6 +2506,27 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
             if (cpat_name) {
                 int var_slot = local_add(c->current, cpat_name);
                 emit_a(c, OP_STORE_LOCAL, var_slot);
+            } else if (cpat && (VAL_TAG(cpat) == NODE_PAT_TUPLE ||
+                                VAL_TAG(cpat) == NODE_PAT_SLICE)) {
+                /* Destructure (k, v) / [a, b, c] inline, mirroring the
+                   for-loop's compile path. Without this the value would
+                   just be popped and the names left undefined. */
+                NodeList *elems = (VAL_TAG(cpat) == NODE_PAT_TUPLE)
+                    ? &cpat->pat_tuple.elems : &cpat->pat_slice.elems;
+                int elem_slot = local_add_hidden(c);
+                emit_a(c, OP_STORE_LOCAL, elem_slot);
+                for (int di = 0; di < elems->len; di++) {
+                    Node *sub = elems->items[di];
+                    emit_a(c, OP_LOAD_LOCAL, elem_slot);
+                    emit_const(c, xs_int(di));
+                    emit(c, MAKE_A(OP_INDEX_GET, 0, 0));
+                    if (VAL_TAG(sub) == NODE_PAT_IDENT && sub->pat_ident.name) {
+                        int ds = local_add(c->current, sub->pat_ident.name);
+                        emit_a(c, OP_STORE_LOCAL, ds);
+                    } else {
+                        emit(c, MAKE_A(OP_POP, 0, 0));
+                    }
+                }
             } else {
                 emit(c, MAKE_A(OP_POP, 0, 0));
             }

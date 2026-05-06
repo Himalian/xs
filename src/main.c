@@ -778,6 +778,7 @@ static void ast_dump(Node *n, int depth) {
 }
 
 extern void xs_set_argv(int argc, char **argv);
+extern void xs_set_user_args(int argc, char **argv);
 
 static void sigint_handler(int sig) {
     (void)sig;
@@ -2267,6 +2268,9 @@ test_again: ;
     }
 
     if (!filename) { usage(); return 1; }
+
+    if (file_arg >= 0 && file_arg + 1 <= argc)
+        xs_set_user_args(argc - file_arg - 1, argv + file_arg + 1);
 
     if (do_watch) {
         int rc = watch_and_run(filename, file_arg, argc, argv);

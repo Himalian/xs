@@ -165,8 +165,8 @@ static Value *native_os_env_all(Interp *ig, Value **a, int n) {
 Value *make_os_module(Interp *ig) {
     XSMap *m=map_new();
     Value *args_arr=xs_array_new();
-    for (int ai = 0; ai < g_xs_argc; ai++) {
-        Value *s = xs_str(g_xs_argv[ai]);
+    for (int ai = 0; ai < g_xs_user_argc; ai++) {
+        Value *s = xs_str(g_xs_user_argv[ai]);
         array_push(args_arr->arr, s);
         value_decref(s);
     }

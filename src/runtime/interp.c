@@ -4841,6 +4841,35 @@ static void list_comp_recurse(Interp *i, Node *n, Value *result, int cl) {
             array_push(range_arr->arr, xs_int(ri));
         iter_len = range_arr->arr->len;
         iter_items = range_arr->arr->items;
+    } else if (VAL_TAG(iter_val) == XS_MAP || VAL_TAG(iter_val) == XS_MODULE) {
+        /* Iterate map entries the same way the for-loop does: emit a
+           (key, value) tuple when the pattern is a tuple, else just the
+           key. Lets `[k for k in m]` and `[(k, v) for k, v in m]` both
+           work without forcing the user to pre-call `.entries()`. */
+        int want_pairs = (pat && VAL_TAG(pat) == NODE_PAT_TUPLE);
+        int nkeys = 0;
+        char **keys = map_keys(iter_val->map, &nkeys);
+        range_arr = xs_array_new();
+        for (int j = 0; j < nkeys; j++) {
+            if (want_pairs) {
+                Value *t = xs_tuple_new();
+                Value *ks = xs_str(keys[j]);
+                Value *val = map_get(iter_val->map, keys[j]);
+                array_push(t->arr, ks);
+                array_push(t->arr, val ? val : XS_NULL_VAL);
+                value_decref(ks);
+                array_push(range_arr->arr, t);
+                value_decref(t);
+            } else {
+                Value *ks = xs_str(keys[j]);
+                array_push(range_arr->arr, ks);
+                value_decref(ks);
+            }
+            free(keys[j]);
+        }
+        free(keys);
+        iter_len = range_arr->arr->len;
+        iter_items = range_arr->arr->items;
     }
 
     push_env(i);

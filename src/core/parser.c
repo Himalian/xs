@@ -500,6 +500,7 @@ static void validate_decorators(Parser *p, int n_params,
     }
 }
 static Node *parse_pattern(Parser *p);
+static Node *parse_loop_pattern(Parser *p);
 static Node *parse_prefix(Parser *p);
 static Node *parse_postfix(Parser *p, Node *left);
 static Node *parse_primary(Parser *p);
@@ -1107,7 +1108,7 @@ static Node *parse_primary(Parser *p) {
             n->list_comp.clause_iters = nodelist_new();
             n->list_comp.clause_conds = nodelist_new();
             /* Parse first for clause */
-            Node *pat = parse_pattern(p);
+            Node *pat = parse_loop_pattern(p);
             pp_expect(p, TK_IN, "expected 'in' in list comprehension");
             Node *iter = parse_expr(p, 0);
             nodelist_push(&n->list_comp.clause_pats, pat);
@@ -1116,7 +1117,7 @@ static Node *parse_primary(Parser *p) {
             /* Parse additional for clauses */
             while (pp_check(p, TK_FOR)) {
                 pp_advance(p);
-                Node *pat2 = parse_pattern(p);
+                Node *pat2 = parse_loop_pattern(p);
                 pp_expect(p, TK_IN, "expected 'in' in list comprehension");
                 Node *iter2 = parse_expr(p, 0);
                 nodelist_push(&n->list_comp.clause_pats, pat2);
@@ -1223,7 +1224,7 @@ static Node *parse_primary(Parser *p) {
                         n->map_comp.clause_conds = nodelist_new();
                         while (pp_check(p, TK_FOR)) {
                             pp_advance(p); /* consume 'for' */
-                            Node *pat = parse_pattern(p);
+                            Node *pat = parse_loop_pattern(p);
                             pp_expect(p, TK_IN, "expected 'in' in map comprehension");
                             Node *iter = parse_expr(p, 0);
                             nodelist_push(&n->map_comp.clause_pats, pat);
@@ -2743,14 +2744,10 @@ static Node *parse_while(Parser *p) {
     return n;
 }
 
-static Node *parse_for(Parser *p) {
-    Token *kw = pp_expect(p, TK_FOR, "expected 'for'");
-    Span span = kw->span;
+/* Pattern with the bare comma-tuple sugar: `k, v` parses as `(k, v)`.
+ * Used by `for k, v in ...` (statement and comprehension forms). */
+static Node *parse_loop_pattern(Parser *p) {
     Node *pat = parse_pattern(p);
-    /* `for k, v in m` -- accept the comma-separated bare form as
-       sugar for `for (k, v) in m`. The pattern parser already handles
-       the parenthesised tuple shape; this branch covers the
-       no-parens form documented in the book / tour. */
     if (pp_check(p, TK_COMMA)) {
         NodeList elems = nodelist_new();
         nodelist_push(&elems, pat);
@@ -2762,6 +2759,13 @@ static Node *parse_for(Parser *p) {
         tup->pat_tuple.elems = elems;
         pat = tup;
     }
+    return pat;
+}
+
+static Node *parse_for(Parser *p) {
+    Token *kw = pp_expect(p, TK_FOR, "expected 'for'");
+    Span span = kw->span;
+    Node *pat = parse_loop_pattern(p);
     pp_expect(p, TK_IN, "expected 'in'");
     Node *iter = parse_expr(p, 0);
     Node *body = parse_block(p);
