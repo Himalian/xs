@@ -164,6 +164,15 @@ static Token *pp_peek(Parser *p, int off) {
     return &p->tokens[idx];
 }
 
+/* Any keyword can stand in for an identifier in name-only positions —
+ * after `.` (field access, method call), after `::` (path), as a struct
+ * field name, as a map-literal key. Those slots are already disambiguated
+ * by the surrounding syntax, so the parser has no use for the keyword
+ * meaning there. Centralised here so we don't drift across call sites. */
+static int is_ident_or_kw(TokenKind k) {
+    return k == TK_IDENT || (k >= TK_IF && k <= TK_LOAD);
+}
+
 static Token *pp_advance(Parser *p) {
     Token *t = &p->tokens[p->pos];
     if (p->pos < p->ntokens - 1) p->pos++;
@@ -850,16 +859,13 @@ static Node *parse_primary(Parser *p) {
                     }
                     Token *fn_tok = pp_peek(p, 0);
                     char *fname = NULL;
-                    /* Accept soft keywords as field names. They are only
-                       keywords in their declaration position; as field names
-                       they are plain identifiers. */
-                    if (fn_tok->kind == TK_IDENT ||
-                        fn_tok->kind == TK_TYPE || fn_tok->kind == TK_FROM ||
-                        fn_tok->kind == TK_AS   || fn_tok->kind == TK_EXPORT ||
-                        fn_tok->kind == TK_PUB  || fn_tok->kind == TK_ASYNC ||
-                        fn_tok->kind == TK_AWAIT) {
+                    /* Accept any keyword as a field name; in this slot
+                       (after `Name {`) the syntax already disambiguates,
+                       so the keyword meaning never applies. */
+                    if (is_ident_or_kw(fn_tok->kind)) {
                         pp_advance(p);
-                        fname = xs_strdup(fn_tok->sval ? fn_tok->sval : "");
+                        fname = xs_strdup(fn_tok->sval ? fn_tok->sval :
+                                          token_kind_name(fn_tok->kind));
                     } else break;
                     pp_expect(p, TK_COLON, "expected ':' in struct init");
                     Node *fval = parse_expr(p, 0);
@@ -881,15 +887,7 @@ static Node *parse_primary(Parser *p) {
             Token *t1 = pp_peek(p, 1);
             Token *t2 = pp_peek(p, 2);
             int is_si = 0;
-            /* Soft keywords that should count as valid field names in a
-               struct initializer. These are declaration-position keywords
-               everywhere else but plain identifiers at a `{ <name>: ... }`
-               shape. */
-            int t1_field_ident =
-                t1->kind == TK_IDENT || t1->kind == TK_TYPE ||
-                t1->kind == TK_FROM  || t1->kind == TK_AS   ||
-                t1->kind == TK_EXPORT || t1->kind == TK_PUB ||
-                t1->kind == TK_ASYNC || t1->kind == TK_AWAIT;
+            int t1_field_ident = is_ident_or_kw(t1->kind);
             if (next->kind == TK_LBRACE) {
                 if (t1->kind == TK_RBRACE) is_si = 1; /* empty */
                 else if (t1_field_ident && t2->kind == TK_COLON) is_si = 1;
@@ -910,13 +908,10 @@ static Node *parse_primary(Parser *p) {
                     }
                     Token *fn_tok = pp_peek(p, 0);
                     char *fname = NULL;
-                    if (fn_tok->kind == TK_IDENT ||
-                        fn_tok->kind == TK_TYPE || fn_tok->kind == TK_FROM ||
-                        fn_tok->kind == TK_AS   || fn_tok->kind == TK_EXPORT ||
-                        fn_tok->kind == TK_PUB  || fn_tok->kind == TK_ASYNC ||
-                        fn_tok->kind == TK_AWAIT) {
+                    if (is_ident_or_kw(fn_tok->kind)) {
                         pp_advance(p);
-                        fname = xs_strdup(fn_tok->sval ? fn_tok->sval : "");
+                        fname = xs_strdup(fn_tok->sval ? fn_tok->sval :
+                                          token_kind_name(fn_tok->kind));
                     } else break;
                     pp_expect(p, TK_COLON, "expected ':' in struct init");
                     Node *fval = parse_expr(p, 0);
@@ -1453,8 +1448,7 @@ static Node *parse_postfix(Parser *p, Node *left) {
         if (tok->kind == TK_DOT) {
             pp_advance(p);
             Token *name_tok = pp_peek(p, 0);
-            if (name_tok->kind == TK_IDENT ||
-                (name_tok->kind >= TK_IF && name_tok->kind <= TK_LOAD)) {
+            if (is_ident_or_kw(name_tok->kind)) {
                 pp_advance(p);
                 char *fname = xs_strdup(name_tok->sval ? name_tok->sval :
                                         token_kind_name(name_tok->kind));
@@ -1499,9 +1493,10 @@ static Node *parse_postfix(Parser *p, Node *left) {
         if (tok->kind == TK_QUESTION_DOT) {
             pp_advance(p);
             Token *name_tok = pp_peek(p, 0);
-            if (name_tok->kind == TK_IDENT) {
+            if (is_ident_or_kw(name_tok->kind)) {
                 pp_advance(p);
-                char *fname = xs_strdup(name_tok->sval ? name_tok->sval : "");
+                char *fname = xs_strdup(name_tok->sval ? name_tok->sval :
+                                        token_kind_name(name_tok->kind));
                 if (pp_check(p, TK_LPAREN)) {
                     pp_advance(p);
                     NodeList args = nodelist_new();
@@ -3077,13 +3072,11 @@ static Node *parse_fn_decl(Parser *p, int is_pub, int is_async, int is_pure) {
     if (name_tok->kind == TK_IDENT) {
         pp_advance(p);
         fname = xs_strdup(name_tok->sval ? name_tok->sval : "");
-    } else if ((name_tok->kind >= TK_IF && name_tok->kind <= TK_PANIC) ||
-               name_tok->kind == TK_SELF || name_tok->kind == TK_SUPER ||
-               name_tok->kind == TK_EFFECT || name_tok->kind == TK_PERFORM ||
-               name_tok->kind == TK_HANDLE || name_tok->kind == TK_RESUME) {
-        /* keyword used as fn name */
+    } else if (is_ident_or_kw(name_tok->kind)) {
+        /* keyword used as fn name -- a name-only slot, no ambiguity here */
         pp_advance(p);
-        fname = xs_strdup(token_kind_name(name_tok->kind));
+        fname = xs_strdup(name_tok->sval ? name_tok->sval :
+                          token_kind_name(name_tok->kind));
     } else if (name_tok->kind == TK_PLUS || name_tok->kind == TK_MINUS ||
                name_tok->kind == TK_STAR || name_tok->kind == TK_SLASH ||
                name_tok->kind == TK_PERCENT || name_tok->kind == TK_POWER ||
@@ -3220,8 +3213,7 @@ static Node *parse_actor_decl(Parser *p) {
         } else {
             /* bare field: name = default or name: type = default */
             Token *fn_tok = pp_peek(p, 0);
-            if (fn_tok->kind != TK_IDENT &&
-                !(fn_tok->kind >= TK_IF && fn_tok->kind <= TK_PANIC))
+            if (!is_ident_or_kw(fn_tok->kind))
                 break;
             pp_advance(p);
             char *fn_name = xs_strdup(fn_tok->sval ? fn_tok->sval : token_kind_name(fn_tok->kind));
@@ -3314,7 +3306,7 @@ static Node *parse_class_decl(Parser *p) {
         } else {
             /* field decl: name: type [= default] */
             Token *fn_tok = pp_peek(p, 0);
-            if (fn_tok->kind != TK_IDENT && !(fn_tok->kind >= TK_IF && fn_tok->kind <= TK_PANIC))
+            if (!is_ident_or_kw(fn_tok->kind))
                 break;
             pp_advance(p);
             char *fn_name = xs_strdup(fn_tok->sval ? fn_tok->sval : token_kind_name(fn_tok->kind));
@@ -3381,7 +3373,7 @@ static Node *parse_struct_decl(Parser *p) {
         /* skip modifiers */
         while (pp_check(p, TK_PUB) || pp_check(p, TK_MUT)) pp_advance(p);
         Token *fn_tok = pp_peek(p, 0);
-        if (fn_tok->kind != TK_IDENT && !(fn_tok->kind >= TK_IF && fn_tok->kind <= TK_PANIC))
+        if (!is_ident_or_kw(fn_tok->kind))
             break;
         pp_advance(p);
         char *fn_name = xs_strdup(fn_tok->sval ? fn_tok->sval : token_kind_name(fn_tok->kind));
