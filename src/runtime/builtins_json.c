@@ -3,6 +3,7 @@
 #include "core/xs_compat.h"
 #include "runtime/interp.h"
 #include "runtime/builtins.h"
+#include "runtime/error.h"
 #include "core/value.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -249,18 +250,28 @@ static void json_stringify_val(Value *v, int indent, int depth, char **out, int 
 }
 
 static Value *native_json_parse(Interp *ig, Value **a, int n) {
-    (void)ig;
-    if (n<1||VAL_TAG(a[0])!=XS_STR) return value_incref(XS_NULL_VAL);
+    if (n<1||VAL_TAG(a[0])!=XS_STR) {
+        xs_runtime_error(ig ? ig->current_span : (Span){0},
+                         "JsonError", NULL,
+                         "json.parse: expected string argument");
+        return value_incref(XS_NULL_VAL);
+    }
     JsonParser p={a[0]->s,0,0};
     Value *v=json_parse_value(&p);
     if (!v || p.err) {
         if (v) value_decref(v);
+        xs_runtime_error(ig ? ig->current_span : (Span){0},
+                         "JsonError", "use json.parse_safe for nullable parsing",
+                         "json.parse: invalid JSON at offset %d", p.pos);
         return value_incref(XS_NULL_VAL);
     }
-    /* Reject trailing junk: `{}xyz` should not parse to `{}` silently. */
     json_skip_ws(&p);
     if (p.s[p.pos] != '\0') {
         value_decref(v);
+        xs_runtime_error(ig ? ig->current_span : (Span){0},
+                         "JsonError", NULL,
+                         "json.parse: trailing data after JSON value at offset %d",
+                         p.pos);
         return value_incref(XS_NULL_VAL);
     }
     return v;

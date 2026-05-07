@@ -356,6 +356,7 @@ static RENode *parse_char_class(ParseCtx *p) {
     }
 
     if (peek(p) == ']') next_ch(p);
+    else p->error = 1;
     return n;
 }
 
@@ -411,6 +412,11 @@ static RENode *make_shorthand_class(ParseCtx *p, int esc_ch) {
 static RENode *parse_atom(ParseCtx *p) {
     int c = peek(p);
     if (c == -1 || c == ')' || c == '|') return NULL;
+    if (c == '*' || c == '+' || c == '?' || c == '{' || c == '}' || c == ']') {
+        p->error = 1;
+        next_ch(p);
+        return NULL;
+    }
 
     /* grouping */
     if (c == '(') {
@@ -425,12 +431,14 @@ static RENode *parse_atom(ParseCtx *p) {
                 /* non-capturing group */
                 RENode *body = parse_alt(p);
                 if (peek(p) == ')') next_ch(p);
+                else p->error = 1;
                 return body;
             } else if (nc == '=') {
                 /* positive lookahead - simplified: just parse body */
                 next_ch(p);
                 RENode *body = parse_alt(p);
                 if (peek(p) == ')') next_ch(p);
+                else p->error = 1;
                 RENode *la = alloc_node(p);
                 la->type = RE_LOOKAHEAD;
                 la->look_start = body;
@@ -440,6 +448,7 @@ static RENode *parse_atom(ParseCtx *p) {
                 next_ch(p);
                 RENode *body = parse_alt(p);
                 if (peek(p) == ')') next_ch(p);
+                else p->error = 1;
                 RENode *la = alloc_node(p);
                 la->type = RE_NEG_LOOKAHEAD;
                 la->look_start = body;
@@ -448,6 +457,7 @@ static RENode *parse_atom(ParseCtx *p) {
             /* unknown group modifier, treat as non-capturing */
             RENode *body = parse_alt(p);
             if (peek(p) == ')') next_ch(p);
+            else p->error = 1;
             return body;
         }
 
@@ -464,6 +474,7 @@ static RENode *parse_atom(ParseCtx *p) {
         save_end->sub = grp * 2 + 1;
 
         if (peek(p) == ')') next_ch(p);
+        else p->error = 1;
 
         if (body) {
             save_start->out1 = body;
@@ -783,6 +794,7 @@ int xs_regex_compile(XSRegex *re, const char *pattern, int flags) {
     save0_start->sub = 0;
 
     RENode *body = parse_alt(&ctx);
+    if (ctx.pos < ctx.len) ctx.error = 1;
 
     RENode *save0_end = alloc_node(&ctx);
     save0_end->type = RE_SAVE;

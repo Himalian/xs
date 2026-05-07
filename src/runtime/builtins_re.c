@@ -3,6 +3,7 @@
 #include "core/xs_compat.h"
 #include "runtime/interp.h"
 #include "runtime/builtins.h"
+#include "runtime/error.h"
 #include "core/value.h"
 #include "core/regex.h"
 #include <stdlib.h>
@@ -17,16 +18,19 @@
    doesn't ship (notably `\b` and the lookarounds), so we just
    call the real engine directly. */
 
-static int compile_or_null(const char *pat, XSRegex *re) {
-    return xs_regex_compile(re, pat, 0) == 0;
+static int compile_or_raise(Interp *ig, const char *pat, XSRegex *re) {
+    if (xs_regex_compile(re, pat, 0) == 0) return 1;
+    xs_runtime_error(ig ? ig->current_span : (Span){0},
+                     "RegexError", NULL,
+                     "invalid regular expression: %s", pat);
+    return 0;
 }
 
 static Value *native_re_test(Interp *ig, Value **a, int n) {
-    (void)ig;
     if (n < 2 || VAL_TAG(a[0]) != XS_STR || VAL_TAG(a[1]) != XS_STR)
         return value_incref(XS_FALSE_VAL);
     XSRegex re;
-    if (!compile_or_null(a[0]->s, &re)) return value_incref(XS_FALSE_VAL);
+    if (!compile_or_raise(ig, a[0]->s, &re)) return value_incref(XS_FALSE_VAL);
     XSMatch m;
     int ok = xs_regex_search(&re, a[1]->s, (int)strlen(a[1]->s), 0, &m) && m.matched;
     xs_regex_free(&re);
@@ -34,11 +38,10 @@ static Value *native_re_test(Interp *ig, Value **a, int n) {
 }
 
 static Value *native_re_match(Interp *ig, Value **a, int n) {
-    (void)ig;
     if (n < 2 || VAL_TAG(a[0]) != XS_STR || VAL_TAG(a[1]) != XS_STR)
         return value_incref(XS_NULL_VAL);
     XSRegex re;
-    if (!compile_or_null(a[0]->s, &re)) return value_incref(XS_NULL_VAL);
+    if (!compile_or_raise(ig, a[0]->s, &re)) return value_incref(XS_NULL_VAL);
     XSMatch m;
     Value *res = value_incref(XS_NULL_VAL);
     int slen = (int)strlen(a[1]->s);
@@ -51,11 +54,10 @@ static Value *native_re_match(Interp *ig, Value **a, int n) {
 }
 
 static Value *native_re_find_all(Interp *ig, Value **a, int n) {
-    (void)ig;
     if (n < 2 || VAL_TAG(a[0]) != XS_STR || VAL_TAG(a[1]) != XS_STR)
         return xs_array_new();
     XSRegex re;
-    if (!compile_or_null(a[0]->s, &re)) return xs_array_new();
+    if (!compile_or_raise(ig, a[0]->s, &re)) return xs_array_new();
     Value *arr = xs_array_new();
     const char *s = a[1]->s;
     int slen = (int)strlen(s);
@@ -71,12 +73,11 @@ static Value *native_re_find_all(Interp *ig, Value **a, int n) {
 }
 
 static Value *native_re_replace(Interp *ig, Value **a, int n) {
-    (void)ig;
     if (n < 3 || VAL_TAG(a[0]) != XS_STR || VAL_TAG(a[1]) != XS_STR ||
         VAL_TAG(a[2]) != XS_STR)
         return n > 1 ? value_incref(a[1]) : xs_str("");
     XSRegex re;
-    if (!compile_or_null(a[0]->s, &re)) return value_incref(a[1]);
+    if (!compile_or_raise(ig, a[0]->s, &re)) return value_incref(a[1]);
     int slen = (int)strlen(a[1]->s);
     char *out = xs_regex_replace(&re, a[1]->s, slen, a[2]->s);
     xs_regex_free(&re);
@@ -87,12 +88,11 @@ static Value *native_re_replace(Interp *ig, Value **a, int n) {
 }
 
 static Value *native_re_replace_all(Interp *ig, Value **a, int n) {
-    (void)ig;
     if (n < 3 || VAL_TAG(a[0]) != XS_STR || VAL_TAG(a[1]) != XS_STR ||
         VAL_TAG(a[2]) != XS_STR)
         return n > 1 ? value_incref(a[1]) : xs_str("");
     XSRegex re;
-    if (!compile_or_null(a[0]->s, &re)) return value_incref(a[1]);
+    if (!compile_or_raise(ig, a[0]->s, &re)) return value_incref(a[1]);
     int slen = (int)strlen(a[1]->s);
     char *out = xs_regex_replace_all(&re, a[1]->s, slen, a[2]->s);
     xs_regex_free(&re);
@@ -103,16 +103,22 @@ static Value *native_re_replace_all(Interp *ig, Value **a, int n) {
 }
 
 static Value *native_re_split(Interp *ig, Value **a, int n) {
-    (void)ig;
     if (n < 2 || VAL_TAG(a[0]) != XS_STR || VAL_TAG(a[1]) != XS_STR)
         return xs_array_new();
+    if (a[0]->s[0] == '\0') {
+        xs_runtime_error(ig ? ig->current_span : (Span){0},
+                         "RegexError", "split needs a non-empty pattern",
+                         "re.split: empty pattern");
+        Value *arr = xs_array_new();
+        array_push(arr->arr, value_incref(a[1]));
+        return arr;
+    }
     XSRegex re;
-    if (!compile_or_null(a[0]->s, &re)) return xs_array_new();
+    if (!compile_or_raise(ig, a[0]->s, &re)) return xs_array_new();
     int slen = (int)strlen(a[1]->s);
     char **parts = NULL;
     int nparts = 0;
     Value *arr = xs_array_new();
-    /* xs_regex_split returns the number of parts produced, not 0/-1. */
     xs_regex_split(&re, a[1]->s, slen, &parts, &nparts);
     if (parts) {
         for (int j = 0; j < nparts; j++) {
@@ -126,11 +132,10 @@ static Value *native_re_split(Interp *ig, Value **a, int n) {
 }
 
 static Value *native_re_groups(Interp *ig, Value **a, int n) {
-    (void)ig;
     if (n < 2 || VAL_TAG(a[0]) != XS_STR || VAL_TAG(a[1]) != XS_STR)
         return xs_array_new();
     XSRegex re;
-    if (!compile_or_null(a[0]->s, &re)) return xs_array_new();
+    if (!compile_or_raise(ig, a[0]->s, &re)) return xs_array_new();
     int slen = (int)strlen(a[1]->s);
     XSMatch m;
     Value *arr = xs_array_new();
