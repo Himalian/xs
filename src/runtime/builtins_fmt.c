@@ -83,7 +83,16 @@ static Value *native_fmt_filesize(Interp *ig, Value **a, int n) {
     while (v>=1024.0&&ui<5){v/=1024.0;ui++;}
     char buf[64];
     if (ui==0) snprintf(buf,sizeof(buf),"%.0f %s",v,units[ui]);
-    else snprintf(buf,sizeof(buf),"%.2f %s",v,units[ui]);
+    else {
+        /* Trim trailing zero(s) so 1536 prints "1.5 KB" not "1.50 KB",
+           but keep "10.0 MB" unchanged: drop the extra precision only
+           when the second decimal digit is 0. */
+        snprintf(buf,sizeof(buf),"%.2f %s",v,units[ui]);
+        char *dot = strchr(buf, '.');
+        if (dot && dot[1] && dot[2] == '0' && dot[3] == ' ') {
+            memmove(&dot[2], &dot[3], strlen(&dot[3]) + 1);
+        }
+    }
     return xs_str(buf);
 }
 static Value *native_fmt_ordinal(Interp *ig, Value **a, int n) {

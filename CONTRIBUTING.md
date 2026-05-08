@@ -44,7 +44,7 @@ anyway, but catching sanitizer reports locally is faster.
 
 ```
 make fuzz-parser                    # needs clang with -fsanitize=fuzzer
-./fuzz_parser -max_len=65536 tests/ examples/
+./fuzz_parser -max_len=65536 tests/
 ```
 
 Run it for a weekend and file anything it finds.

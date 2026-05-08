@@ -86,7 +86,7 @@ Or build from source:
 make            # produces ./xs (or xs.exe on Windows)
 make debug      # -g -O0 with AddressSanitizer + UBSan
 make release    # -O3 with LTO, stripped
-make test       # runs tests/run-all.sh (7 layers: unit, e2e, negative, property, golden, regression, conformance)
+make test       # runs tests/run-all.sh (7 layers: behavioural + adversarial + property + fuzz + golden + regression + conformance)
 make install    # install release build to /usr/local/bin/xs
 make wasm       # produces xs.wasm via wasi-sdk (needs WASI_SDK env var)
 ```
@@ -148,8 +148,8 @@ for the backend matrix.
 - Package manager (`xs install`, `xs remove`)
 - Doc generator (`xs doc`)
 
-**Standard library** (37 built-in modules, all registered at startup):
-math, time, io, string, path, base64, hash, uuid, collections, process, random, os, json, log, fmt, test, csv, url, re, msgpack, Promise, async, net, crypto, thread, buf, encode, db, cli, ffi, reflect, gc, reactive, toml, http, fs, tracing
+**Standard library** (36 built-in modules, lazy-loaded on first `import`):
+math, time, io, string, path, base64, hash, uuid, collections, process, random, os, json, log, fmt, test, csv, url, re, msgpack, Promise, async, net, crypto, thread, buf, encode, db, cli, ffi, reflect, gc, toml, http, fs, tracing
 
 **Plugin system:**
 Plugins are XS scripts with direct access to the lexer, parser, and runtime. Add keywords, inject globals, hook evaluation, override syntax, intercept imports -- written in XS, not C.
@@ -160,8 +160,7 @@ tree, no external dependency. Server has per-server body / header /
 connection caps and idle culling.
 
 **Mobile and embedded:**
-`make ios`, `make android`, `make esp32`. Examples in
-`examples/embedded/`.
+`make ios`, `make android`, `make esp32`.
 
 ## Quick examples
 
@@ -188,7 +187,7 @@ c.increment()
 println(c.get())  -- 2
 
 -- gradual typing catches mistakes
-let nums: [int] = [1, 2, "oops"]  -- runtime error: expected '[int]', got '[mixed]'
+let n: int = "oops"     -- error: expected 'int', got 'str'
 ```
 
 ## Project layout
@@ -197,8 +196,7 @@ let nums: [int] = [1, 2, "oops"]  -- runtime error: expected '[int]', got '[mixe
 src/             compiler and runtime, one subdirectory per subsystem
 src/tls/         bundled BearSSL for HTTPS
 tests/           behavioural tests (test_*.xs) and shell drivers (test_cli.sh, test_lint.sh, test_errors.sh, test_transpiler.sh)
-tests/*/         adversarial, conformance, golden, regression, negative, property, fuzz layers
-examples/        example programs (examples/plugins/ for plugin demos)
+tests/*/         adversarial, conformance, fuzz, golden, lint_samples, negative, plugins, property, regression
 benchmarks/      benchmark programs
 editors/vscode/  VS Code extension
 Makefile         build system
@@ -210,27 +208,26 @@ xs.toml          project config
 Wall-clock numbers from a single Linux x86_64 machine, O2 release build,
 warm caches. Treat as indicative, not authoritative.
 
-| Program          | Python 3 | Node.js  | xs (interp) | xs (--vm) |
-|------------------|----------|----------|-------------|-----------|
-| Hello world (startup) | ~15 ms | ~54 ms | **~4 ms** | ~4 ms |
-| `fib(25)` recursion   | ~21 ms | ~54 ms | ~101 ms | **~20 ms** |
-| `fib(30)` recursion   | ~160 ms | ~60 ms | ~2.2 s  | **~170 ms** |
+| Program               | Python 3 | Node.js | xs --interp | xs (default --vm) |
+|-----------------------|---------|---------|-------------|-------------------|
+| Hello world (startup) | ~15 ms  | ~54 ms  | ~4 ms       | **~4 ms**         |
+| `fib(25)` recursion   | ~21 ms  | ~54 ms  | ~85 ms      | **~18 ms**        |
+| `fib(30)` recursion   | ~160 ms | ~60 ms  | ~900 ms     | **~170 ms**       |
 
 A tight numeric loop shows where `--jit` pays off relative to `--vm`:
 
 | Program              | `--vm`  | `--jit` | gcc -O2 | node   |
 |----------------------|---------|---------|---------|--------|
-| `fib(30)`            |  210 ms |   20 ms |   <1 ms | 110 ms |
-| `fib(35)`            | 2320 ms |  520 ms |   80 ms | 210 ms |
-| 10M-iter `while` sum |  640 ms |  110 ms |   20 ms | 110 ms |
-| 1M-iter `while` sum  |   60 ms |   10 ms |   <1 ms | 110 ms |
+| `fib(30)`            |  170 ms |   30 ms |   <1 ms | 110 ms |
+| `fib(35)`            | 1900 ms |  315 ms |   80 ms | 210 ms |
+| 10M-iter `while` sum |  535 ms |   60 ms |   20 ms | 110 ms |
 
-Startup is around 2.3 ms on this box; `--vm` is in the same ballpark
-as CPython on loops and a few times slower on hot recursion; `--jit`
-closes the gap. Use `--vm` for everyday work, `--jit` when you've
-actually profiled a hotspot.
+Startup is around 3 ms on this box. The default backend (bytecode VM)
+sits in the same ballpark as CPython on loops and a few times slower
+on hot recursion; `--jit` closes the gap. Stick with the default for
+everyday work; `--jit` is for hotspots you've actually profiled.
 
-Reproduce with `benchmarks/bench_fibonacci.xs`, `benchmarks/bench_sort.xs`,
+Reproduce with `benchmarks/bench_fib.xs`, `benchmarks/bench_sort.xs`,
 `benchmarks/bench_strings.xs`, or `xs bench`.
 
 ## Docs

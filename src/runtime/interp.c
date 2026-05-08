@@ -1749,6 +1749,22 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
         return value_incref(XS_NULL_VAL);
     }
 
+    /* Optional-style helpers usable on any value: null behaves as
+       None, anything else as Some(self). Lets users write
+       `let n: int? = null; n.is_none()` without explicit Option/Some
+       wrapping. */
+    if (strcmp(method, "is_none") == 0)
+        return (VAL_TAG(obj) == XS_NULL)
+                ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL);
+    if (strcmp(method, "is_some") == 0)
+        return (VAL_TAG(obj) == XS_NULL)
+                ? value_incref(XS_FALSE_VAL) : value_incref(XS_TRUE_VAL);
+    if (strcmp(method, "unwrap_or") == 0) {
+        if (VAL_TAG(obj) == XS_NULL)
+            return argc >= 1 ? value_incref(args[0]) : value_incref(XS_NULL_VAL);
+        return value_incref(obj);
+    }
+
     // --- string methods
     if (VAL_TAG(obj) == XS_STR) {
         const char *s = obj->s;
@@ -2517,6 +2533,42 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
                 else if(VAL_TAG(arr->items[j])==XS_INT) si+=VAL_INT(arr->items[j]);
             }
             return is_f?xs_float(sf+(double)si):xs_int(si);
+        }
+        if (strcmp(method, "avg") == 0 || strcmp(method, "mean") == 0) {
+            if (arr->len == 0) return xs_float(0.0);
+            double s = 0;
+            for (int j = 0; j < arr->len; j++) {
+                if (VAL_TAG(arr->items[j]) == XS_FLOAT) s += arr->items[j]->f;
+                else if (VAL_TAG(arr->items[j]) == XS_INT) s += (double)VAL_INT(arr->items[j]);
+            }
+            return xs_float(s / (double)arr->len);
+        }
+        if (strcmp(method, "cycle") == 0) {
+            int n = (argc > 0 && VAL_TAG(args[0]) == XS_INT) ? (int)VAL_INT(args[0]) : 1;
+            if (n < 0) n = 0;
+            Value *res = xs_array_new();
+            for (int rep = 0; rep < n; rep++)
+                for (int j = 0; j < arr->len; j++)
+                    array_push(res->arr, value_incref(arr->items[j]));
+            return res;
+        }
+        if (strcmp(method, "count_by") == 0) {
+            if (argc < 1) return xs_map_new();
+            Value *res = xs_map_new();
+            for (int j = 0; j < arr->len; j++) {
+                Value *a[1] = { arr->items[j] };
+                Value *k = call_value(i, args[0], a, 1, "count_by");
+                if (i->cf.signal) { value_decref(k); break; }
+                char *ks = value_str(k);
+                Value *cur = map_get(res->map, ks);
+                int64_t c = (cur && VAL_TAG(cur) == XS_INT) ? VAL_INT(cur) : 0;
+                Value *nv = xs_int(c + 1);
+                map_set(res->map, ks, nv);
+                value_decref(nv);
+                free(ks);
+                value_decref(k);
+            }
+            return res;
         }
         if (strcmp(method, "min") == 0) {
             if (arr->len==0) return value_incref(XS_NULL_VAL);
@@ -3873,6 +3925,16 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
             return xs_int((int64_t)ceil(obj->f));
         }
         if (strcmp(method, "round") == 0) {
+            /* Optional `digits` argument: x.round(2) keeps two decimal
+               places. Without it, returns the nearest int. */
+            int digits = (argc > 0 && VAL_TAG(args[0]) == XS_INT) ?
+                         (int)VAL_INT(args[0]) : -1;
+            if (digits >= 0) {
+                double v = (VAL_TAG(obj)==XS_INT) ? (double)VAL_INT(obj) : obj->f;
+                double scale = 1.0;
+                for (int k = 0; k < digits; k++) scale *= 10.0;
+                return xs_float(round(v * scale) / scale);
+            }
             if (VAL_TAG(obj)==XS_INT) return value_incref(obj);
             return xs_int((int64_t)round(obj->f));
         }
@@ -4262,7 +4324,7 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
         }
     }
 
-    char *repr = value_repr(obj);
+    const char *tname = value_type_str(obj);
     static const char *str_methods[] = {"len","trim","upper","lower","split","contains","replace","starts_with","ends_with","chars","to_str","bytes","repeat","join","slice","index_of","parse_int","parse_float","is_empty","reverse","capitalize","pad_left","pad_right","count",NULL};
     static const char *arr_methods[] = {"len","push","pop","map","filter","reduce","sort","reverse","contains","join","slice","flatten","chunks","enumerate","zip","any","all","find","index_of",NULL};
     static const char *map_methods[] = {"len","keys","values","contains","remove","clear","entries","merge","filter","map","clone",NULL};
@@ -4296,11 +4358,10 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
         }
     }
     char label_buf[128];
-    snprintf(label_buf, sizeof label_buf, "no method '%s' on type '%s'", method, repr);
+    snprintf(label_buf, sizeof label_buf, "no method '%s' on type '%s'", method, tname);
     xs_runtime_error(i->current_span, label_buf,
             hint_buf[0] ? hint_buf : NULL,
-            "value of type '%s' has no method '%s'", repr, method);
-    free(repr);
+            "value of type '%s' has no method '%s'", tname, method);
     i->cf.signal = CF_ERROR;
     return value_incref(XS_NULL_VAL);
 }
@@ -5545,7 +5606,14 @@ do_call: ;
         if (n->method_call.optional && VAL_TAG(obj) == XS_NULL) {
             return obj;
         }
-        if (!obj || VAL_TAG(obj) == XS_NULL) {
+        /* null.is_none() / null.is_some() / null.unwrap_or(d) are
+           legitimate calls -- only null-propagate for everything else. */
+        const char *mc_method_name = n->method_call.method;
+        int null_method_ok = mc_method_name && (
+            strcmp(mc_method_name, "is_none") == 0 ||
+            strcmp(mc_method_name, "is_some") == 0 ||
+            strcmp(mc_method_name, "unwrap_or") == 0);
+        if ((!obj || VAL_TAG(obj) == XS_NULL) && !null_method_ok) {
             if (obj) value_decref(obj);
             return value_incref(XS_NULL_VAL);
         }
@@ -8311,6 +8379,11 @@ static int    g_load_nrenames = 0;
 /* exec_load_stmt: handle NODE_LOAD by creating a temp NODE_USE wrapper and
    calling exec_plugin_load */
 static void exec_load_stmt(Interp *i, Node *stmt) {
+    /* The parser already evaluated this plugin eagerly so any keywords
+       it registered were in scope for the rest of the parse pass. Skip
+       the runtime path; running the plugin body twice would re-register
+       its hooks. */
+    if (stmt->load_.preloaded) return;
     const char *load_path = stmt->load_.path;
 
     /* resolve relative to current file's directory */

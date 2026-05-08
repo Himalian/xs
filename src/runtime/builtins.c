@@ -432,6 +432,24 @@ static Value *builtin_repr(Interp *i, Value **args, int argc) {
     Value *v = xs_str(s); free(s); return v;
 }
 
+/* Helper for spread calls: __xs_call_with_array(fn, [a, b, c]) calls
+   fn with the array's elements as positional arguments. The VM
+   lowering for `f(...arr)` emits this so the static argc immediate on
+   OP_CALL stays correct -- the array is built (with all spreads
+   inline-expanded) and unpacked by the helper. */
+static Value *builtin_xs_call_with_array(Interp *interp, Value **args, int argc) {
+    if (argc < 1 || !args[0]) return value_incref(XS_NULL_VAL);
+    Value *callee = args[0];
+    Value *arr = (argc >= 2) ? args[1] : NULL;
+    int n = (arr && (VAL_TAG(arr) == XS_ARRAY || VAL_TAG(arr) == XS_TUPLE) &&
+             arr->arr) ? arr->arr->len : 0;
+    Value **pargs = n ? xs_malloc(sizeof(Value*) * n) : NULL;
+    for (int j = 0; j < n; j++) pargs[j] = arr->arr->items[j];
+    Value *r = call_value(interp, callee, pargs, n, "apply");
+    free(pargs);
+    return r ? r : value_incref(XS_NULL_VAL);
+}
+
 /* Apply an f-string format spec like "%.2f" / ">5" / "x" / "b" / "%".
  * Mirrors the Python mini-language: alignment + width + precision +
  * type. Unknown specs leave the value as-is (default str). */
@@ -444,6 +462,9 @@ static Value *builtin_xs_fmt(Interp *i, Value **args, int argc) {
 
     char align = 0;
     char fill = ' ';
+    char sign = 0;       /* '+', '-', ' ', or 0 */
+    int alt_form = 0;    /* '#' alternate form (0b/0o/0x prefixes) */
+    int zero_pad = 0;    /* leading '0' before width: sign-aware zero fill */
     int width = 0;
     int precision = -1;
     char type = 0;
@@ -458,6 +479,13 @@ static Value *builtin_xs_fmt(Interp *i, Value **args, int argc) {
     } else if (slen >= 1 && (spec[0] == '<' || spec[0] == '>' || spec[0] == '^')) {
         align = spec[0];
         sp = 1;
+    }
+    if (sp < slen && (spec[sp] == '+' || spec[sp] == '-' || spec[sp] == ' ')) {
+        sign = spec[sp]; sp++;
+    }
+    if (sp < slen && spec[sp] == '#') { alt_form = 1; sp++; }
+    if (sp < slen && spec[sp] == '0' && !align) {
+        zero_pad = 1; fill = '0'; align = '>'; sp++;
     }
     while (sp < slen && spec[sp] >= '0' && spec[sp] <= '9') {
         width = width * 10 + (spec[sp] - '0'); sp++;
@@ -492,6 +520,20 @@ static Value *builtin_xs_fmt(Interp *i, Value **args, int argc) {
             snprintf(buf, sizeof(buf), "%s", tmp + p);
         }
         body = xs_strdup(buf);
+        if (alt_form) {
+            const char *prefix =
+                type == 'x' ? "0x" : type == 'X' ? "0X" :
+                type == 'o' ? "0o" : "0b";
+            int neg = (body[0] == '-');
+            int bl = (int)strlen(body);
+            char *nb = xs_malloc(bl + 3);
+            int wi = 0;
+            if (neg) nb[wi++] = '-';
+            nb[wi++] = prefix[0]; nb[wi++] = prefix[1];
+            memcpy(nb + wi, body + neg, (size_t)(bl - neg));
+            nb[wi + bl - neg] = '\0';
+            free(body); body = nb;
+        }
     } else if (type == 'f' || (precision >= 0 && (VAL_TAG(v) == XS_FLOAT || VAL_TAG(v) == XS_INT))) {
         double fv = (VAL_TAG(v) == XS_FLOAT) ? v->f
                   : (VAL_TAG(v) == XS_INT) ? (double)VAL_INT(v) : 0.0;
@@ -542,6 +584,24 @@ static Value *builtin_xs_fmt(Interp *i, Value **args, int argc) {
     }
     if (!body) body = xs_strdup("");
 
+    /* Sign prefix: '+' forces a sign on non-negatives; ' ' uses a space
+       in front of non-negatives; '-' is the default. Numbers already
+       carry a leading '-' when negative, so we only synthesise the
+       prefix for non-negative numeric output. */
+    int is_numeric = (type == 'd' || type == 'f' || type == 'e' ||
+                      type == 'E' || type == 'g' || type == 'G' ||
+                      type == 'x' || type == 'X' || type == 'b' ||
+                      type == 'o' || type == 0 ||
+                      VAL_TAG(v) == XS_INT || VAL_TAG(v) == XS_FLOAT);
+    if (sign && is_numeric && body[0] != '-' &&
+        body[0] != '\0' && (sign == '+' || sign == ' ')) {
+        int bl = (int)strlen(body);
+        char *nb = xs_malloc(bl + 2);
+        nb[0] = sign;
+        memcpy(nb + 1, body, (size_t)(bl + 1));
+        free(body); body = nb;
+    }
+
     int blen = (int)strlen(body);
     if (width > blen) {
         int pad = width - blen;
@@ -557,6 +617,28 @@ static Value *builtin_xs_fmt(Interp *i, Value **args, int argc) {
             for (int j = 0; j < lpad; j++) r[j] = fill;
             memcpy(r + lpad, body, blen);
             for (int j = 0; j < rpad; j++) r[lpad + blen + j] = fill;
+            r[width] = '\0';
+        } else if (zero_pad && is_numeric) {
+            /* Sign- and alt-form-aware zero pad: keep any sign and the
+               `0x`/`0b`/`0o` prefix anchored at the front, fill between
+               the prefix and digits with '0'. Without this `{-42:05}`
+               would render `00-42` and `{42:#08x}` `00000x2a`. */
+            int prefix_len = 0;
+            int neg = (body[0] == '-' || body[0] == '+' || body[0] == ' ');
+            if (neg) prefix_len = 1;
+            if (alt_form && (type == 'x' || type == 'X' ||
+                             type == 'b' || type == 'o') &&
+                blen - prefix_len >= 2 &&
+                body[prefix_len] == '0' &&
+                (body[prefix_len+1] == 'x' || body[prefix_len+1] == 'X' ||
+                 body[prefix_len+1] == 'b' || body[prefix_len+1] == 'o')) {
+                prefix_len += 2;
+            }
+            r = xs_malloc(width + 1);
+            for (int j = 0; j < prefix_len; j++) r[j] = body[j];
+            for (int j = 0; j < pad; j++) r[prefix_len + j] = '0';
+            memcpy(r + prefix_len + pad, body + prefix_len,
+                   (size_t)(blen - prefix_len));
             r[width] = '\0';
         } else {
             r = xs_malloc(width + 1);
@@ -1436,6 +1518,7 @@ void stdlib_register(Interp *i) {
     interp_define_native(i, "char",      builtin_char);
     interp_define_native(i, "repr",      builtin_repr);
     interp_define_native(i, "__xs_fmt",  builtin_xs_fmt);
+    interp_define_native(i, "__xs_call_with_array", builtin_xs_call_with_array);
     interp_define_native(i, "dbg",       builtin_dbg);
     interp_define_native(i, "pprint",    builtin_pprint);
     interp_define_native(i, "len",       builtin_len);
@@ -1620,4 +1703,8 @@ Value *stdlib_load_module(Interp *i, const char *name) {
 
 Value *builtin_xs_fmt_export(Interp *i, Value **args, int argc) {
     return builtin_xs_fmt(i, args, argc);
+}
+
+Value *builtin_xs_call_with_array_export(Interp *i, Value **args, int argc) {
+    return builtin_xs_call_with_array(i, args, argc);
 }

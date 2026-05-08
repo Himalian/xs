@@ -613,6 +613,7 @@ struct Node {
             char **rename_vals;
             int    nrenames;
             int    sandbox_flags; /* 1=inject_only, 2=no_override, 4=no_eval_hook */
+            int    preloaded;     /* parser-time eager-load already evaluated the plugin */
         } load_;
 
         struct {

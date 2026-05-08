@@ -139,6 +139,6 @@ for the supported release stream, and publish a CVE advisory within
 Supported streams: latest stable release, latest LTS (if distinct), and
 any release that is less than 6 months old.
 
-Signed releases: every tag triggers a minisign signature on each
-artifact, published with the release. The public key lives at
-`https://xslang.org/pubkey` and in this repo as `MINISIGN.pub`.
+Release artefacts are SHA-256-checksummed at publish time; signed
+releases (minisign) land alongside the LTS line and aren't a 1.x
+guarantee yet.

@@ -886,6 +886,28 @@ int value_cmp(Value *a, Value *b) {
 
 Value *value_copy(Value *v) {
     if (!v) return xs_null();
+    /* Shallow copy of mutable containers; immutable types share. The
+       intent of `copy(x)` is "give me a separate handle so I can mutate
+       it without affecting the original" -- a refcount bump fails that
+       contract. */
+    if (VAL_TAG(v) == XS_ARRAY || VAL_TAG(v) == XS_TUPLE) {
+        Value *r = (VAL_TAG(v) == XS_ARRAY) ? xs_array_new() : xs_tuple_new();
+        if (v->arr) {
+            for (int i = 0; i < v->arr->len; i++)
+                array_push(r->arr, v->arr->items[i]);
+        }
+        return r;
+    }
+    if (VAL_TAG(v) == XS_MAP) {
+        Value *r = xs_map_new();
+        if (v->map) {
+            for (int i = 0; i < v->map->len; i++) {
+                int j = v->map->order ? v->map->order[i] : i;
+                map_set(r->map, v->map->keys[j], v->map->vals[j]);
+            }
+        }
+        return r;
+    }
     return value_incref(v);
 }
 

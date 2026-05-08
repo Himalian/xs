@@ -89,7 +89,11 @@ println(greeting)                -- hello xs
 
 `bind` tracks which variables are read when the expression is first evaluated. When any of those variables are reassigned, the binding automatically recomputes. Cascading works: if binding A depends on binding B, and B's dependency changes, both B and A update in order.
 
-In the VM and transpilers, `bind` acts as a regular `let` (no reactivity). Reactive updates only happen in the interpreter.
+Reactivity is wired through the interpreter, the VM, and the JIT;
+all three replay the bound expression on dependency change.
+Transpiler targets (`--emit js`, `--emit c`, `--emit wasm`) lower
+`bind` as a regular `let` since static targets can't observe variable
+mutation through the same hook.
 
 ### Contracts (where clauses)
 
@@ -334,7 +338,8 @@ Color strings support interpolation in the text part: `c"bold;x = {x}"`.
 "a" ++ "b" ++ "c"               -- "abc"
 ```
 
-`+` does **not** concatenate strings. Use `++`.
+Strings concatenate with either `++` or `+`; `++` is the canonical
+form so it's clear at the call site that the operands are strings.
 
 ---
 
@@ -558,7 +563,10 @@ println(type(pat))               -- re
 let digits: re = /[0-9]+/
 ```
 
-Uses POSIX extended regex syntax. Use character classes like `[0-9]`, `[a-z]`, `[[:digit:]]` instead of shorthand like `\d`.
+The engine is a Thompson NFA. Beyond POSIX extended syntax it
+recognises the common shortcuts `\d`, `\D`, `\s`, `\S`, `\w`, `\W`,
+`\b`; non-greedy quantifiers `*?` / `+?` / `??`; non-capturing groups
+`(?:...)`; and positive `(?=...)` / negative `(?!...)` lookaheads.
 
 ### Regex Methods
 
@@ -771,12 +779,14 @@ println(7 % (-3))                -- 1   (sign follows 7)
 
 ### Division by Zero
 
-Division by zero doesn't crash: it prints a runtime warning to stderr and returns `null`:
+Dividing by zero raises a catchable runtime error:
 
 ```xs
-let d = 10 / 0                   -- prints warning, d is null
-let m = 10 % 0                   -- prints warning, m is null
+try { let d = 10 / 0 } catch e { println(e.kind) }   -- "division by zero"
+try { let m = 10 % 0 } catch e { println(e.kind) }   -- "modulo by zero"
 ```
+
+Guard the divisor or wrap the operation in `try`/`catch`.
 
 ### Float-to-Integer Conversion
 
@@ -1129,12 +1139,12 @@ fn show_for(name) {
 ### `@scoped` bindings
 
 `@scoped` annotates a `let` or `var` whose value must not outlive
-the lexical block that introduced it. The semantic analyzer rejects
-the obvious escape patterns (returning the binding, storing it in a
-non-scoped container, calling a method that retains it, capturing
-it in a closure that survives the scope). The runtime opts the
-value out of cycle detection because refcounting alone suffices
-once escape is statically forbidden.
+the lexical block that introduced it. Run with `--check` or `--strict`
+and the semantic analyzer rejects the obvious escape patterns
+(returning the binding, storing it in a non-scoped container, capturing
+it in a closure that survives the scope). The runtime opts the value
+out of cycle detection because refcounting alone suffices once escape
+is statically forbidden.
 
 ```xs
 fn process() {
@@ -1144,7 +1154,7 @@ fn process() {
 
 fn leak() {
     @scoped let buf = make_buffer(64 * 1024)
-    return buf            -- error S0042: scoped binding escapes
+    return buf            -- xs --check: error S0042: scoped binding escapes
 }
 ```
 
@@ -1994,28 +2004,6 @@ unsafe {
 
 ---
 
-## Inline C
-
-`inline c { ... }` embeds raw C code inside an XS function. The C code is passed through verbatim to the C transpiler. The interpreter errors out on inline C blocks (use `xs transpile --target c` instead), so give the enclosing XS function a fallback body if you want it to run under the interpreter.
-
-```xs
-fn fast_hash(data) {
-    inline c {
-        uint64_t h = 0x525201;
-        const char *s = xs_to_cstr(args[0]);
-        while (*s) h = h * 31 + *s++;
-        xs_return_int(h);
-    }
-    return 0  -- fallback for interpreter mode
-}
-```
-
-Use `xs transpile --target c` to compile code that uses inline C. The raw C code has access to the enclosing function's arguments via an `args[]` array and can return values using helper macros.
-
-This is useful for performance-critical inner loops, FFI glue, or leveraging C libraries directly without writing a full native plugin.
-
----
-
 ## Reactive bindings
 
 `bind` declares a name whose value tracks an expression: when any
@@ -2290,17 +2278,17 @@ When one task in a nursery throws, the surviving siblings get a cooperative canc
 
 ```xs
 import math
-println(math.sqrt(16))           -- 4
-println(math.PI)                 -- 3.14159
+println(math.sqrt(16))           -- 4.0
+println(math.PI)                 -- 3.141592653589793
 
 -- with alias
 import math as m
-println(m.sqrt(16))              -- 4
+println(m.sqrt(16))              -- 4.0
 
 -- selective import
 from math import { sqrt, PI }
-println(sqrt(25))                -- 5
-println(PI)                      -- 3.14159
+println(sqrt(25))                -- 5.0
+println(PI)                      -- 3.141592653589793
 ```
 
 ### Importing Files
@@ -2494,7 +2482,7 @@ println(reduce([1, 2, 3], fn(a, b) { a + b }, 0))  -- 6
 |----------|-------------|
 | `assert(cond, msg?)` | Assert truthy; panics on failure |
 | `assert_eq(a, b)` | Assert `a == b`; shows both values on failure |
-| `dbg(val)` | Debug-print to stderr with type info, returns `val` |
+| `dbg(val)` | Print `[dbg] <repr>` to stderr, returns `val` |
 | `pprint(val)` | Pretty-print with indentation |
 | `repr(val)` | Debug string representation |
 | `panic(msg)` | Print to stderr and exit (not catchable) |
@@ -2538,15 +2526,15 @@ println(format("hello {} you are {}", "world", 42))
 | `INF` | Infinity (float) |
 | `NAN` | Not a Number (float) |
 
-### Globals
+### Command-line Arguments
 
-| Name | Type | Description |
-|------|------|-------------|
-| `argv` | array | Command-line args after the script name |
+Read positional args via `os.args`. The list excludes the interpreter
+path and the script filename:
 
 ```xs
+import os
 -- Run: xs script.xs hello world
-println(argv)                    -- ["hello", "world"]
+println(os.args)                 -- ["hello", "world"]
 ```
 
 ---
@@ -2588,15 +2576,15 @@ Import with `import <module>` and access via `module.member`.
 
 ```xs
 import math
-println(math.sqrt(16))           -- 4
+println(math.sqrt(16))           -- 4.0
 println(math.gcd(12, 8))         -- 4
 println(math.factorial(5))       -- 120
-println(math.clamp(15, 0, 10))   -- 10
+println(math.clamp(15, 0, 10))   -- 10.0
 println(math.sign(-5))           -- -1
-println(math.degrees(math.PI))   -- 180
-println(math.radians(180))       -- 3.14159...
-println(math.lerp(0, 100, 0.5))  -- 50
-println(math.hypot(3, 4))        -- 5
+println(math.degrees(math.PI))   -- 180.0
+println(math.radians(180))       -- 3.141592653589793
+println(math.lerp(0, 100, 0.5))  -- 50.0
+println(math.hypot(3, 4))        -- 5.0
 ```
 
 ---
@@ -3123,16 +3111,19 @@ println(r["code"])               -- 0
 
 ### `buf`
 
-Binary buffer for low-level I/O.
+Growable byte buffer for binary protocols and low-level I/O. Width
+suffixes follow the integer size: `u8` is one byte, `u32` four,
+`u64` eight. All multi-byte writes are little-endian.
 
 | Function | Description |
 |----------|-------------|
 | `new(cap)` | Create buffer with initial capacity |
-| `write_u8(v)` | Append a byte |
-| `read_u8()` | Read a byte |
+| `write_u8(v)` / `write_u16(v)` / `write_u32(v)` / `write_u64(v)` | Append integer at the configured width |
+| `read_u8()` / `read_u16()` / `read_u32()` / `read_u64()` | Read at current cursor |
+| `write_str(s)` | Append a string's bytes |
 | `to_str()` | Convert buffer to string |
-| `to_hex()` | Convert buffer to hex string |
-| `len()` | Buffer length |
+| `to_hex()` | Hex dump of buffer bytes |
+| `len()` | Bytes written so far |
 
 ---
 
@@ -3151,33 +3142,107 @@ Embedded database (SQLite-style).
 
 ### `gc`
 
-Manual control of the garbage collector.
+Manual control of the garbage collector. Day-to-day code shouldn't
+need this; it's here for benchmarks and tight-loop tuning.
 
 | Function | Description |
 |----------|-------------|
 | `collect()` | Trigger collection |
 | `disable()` | Disable automatic collection |
 | `enable()` | Re-enable automatic collection |
-| `stats()` | Return GC statistics map |
+| `stats()` | Map of collection counters and tracked-object counts |
+| `set_threshold(n)` | Allocation threshold that triggers a young-gen collect |
 
 ---
 
 
 ### `fs`
 
-Additional filesystem operations (mirrors much of `io`).
+Filesystem and path operations. Reads return strings (text mode), `read_bytes` returns a byte array.
+
+| Function | Description |
+|----------|-------------|
+| `read(path)` | Read whole file as a string |
+| `read_bytes(path)` | Read whole file as a byte array |
+| `read_lines(path)` | Read file split on `\n` |
+| `read_stream(path)` | Open a streaming reader (`.read(n)`, `.close()`) |
+| `write(path, str)` | Write string, replacing the file |
+| `write_bytes(path, arr)` | Write a byte array |
+| `write_stream(path)` | Open a streaming writer (`.write(s)`, `.close()`) |
+| `append(path, str)` | Append to a file |
+| `exists(path)` | Whether the path exists |
+| `is_file(path)` / `is_dir(path)` | Type checks |
+| `size(path)` | File size in bytes |
+| `stat(path)` | Map of `size`, `mtime`, `is_dir`, `is_file`, `mode` |
+| `remove(path)` | Delete a file |
+| `rename(from, to)` | Move / rename |
+| `copy(from, to)` | Copy a file |
+| `mkdir(path)` / `mkdir_p(path)` | Create directory (the `_p` form creates parents) |
+| `rmdir(path)` | Remove an empty directory |
+| `list(path)` / `ls(path)` | Direct children of a directory |
+| `walk(path)` | Recursive iterator yielding `{path, is_dir, ...}` |
+| `glob(pat)` | Expand a glob pattern relative to cwd |
+| `chmod(path, mode)` | POSIX mode bits |
+| `symlink(target, link)` | Create a symbolic link |
+| `readlink(path)` / `realpath(path)` | Resolve symlinks / canonicalise |
+| `join(a, b, ...)` | Path join with the platform separator |
+| `basename(path)` / `dirname(path)` / `ext(path)` | Path components |
+| `abs(path)` | Absolute path |
+| `temp_dir()` / `temp_file(prefix?)` | Platform temp locations |
+| `watch(path, fn)` | Run `fn(event)` on changes |
+
+```xs
+fs.write("/tmp/hi.txt", "hello")
+let s = fs.read("/tmp/hi.txt")     -- read; not read_string
+let bytes = fs.read_bytes("/tmp/hi.txt")
+for line in fs.read_lines("/etc/hosts") { println(line) }
+```
 
 ---
 
 ### `cli`
 
-Command-line argument parsing utilities.
+Command-line argument parsing. The parser is built up declaratively
+and `parse(args)` returns a map of `{flags, options, positional}`.
+
+| Function | Description |
+|----------|-------------|
+| `flag(name, help?)` | Boolean flag like `--verbose` |
+| `option(name, default?, help?)` | Value flag like `--port 8080` |
+| `positional(name, help?)` | Required positional arg |
+| `parse(args)` | Parse against the configured spec; returns a map |
+
+```xs
+import cli
+cli.flag("verbose")
+cli.option("port", 8080)
+cli.positional("file")
+let opts = cli.parse(argv)
+println(opts.options.port)
+```
 
 ---
 
 ### `ffi`
 
-Foreign function interface for calling native C code.
+Foreign function interface for calling functions in shared libraries.
+Use sparingly: most needs are covered by stdlib modules already.
+
+| Function | Description |
+|----------|-------------|
+| `load(path)` | Open a shared library (`.so`/`.dylib`/`.dll`) |
+| `sym(lib, name)` | Resolve a symbol from a loaded library |
+| `call(sym, ret_type, arg_types, args)` | Invoke a resolved symbol |
+| `close(lib)` | Release the library handle |
+| `typeof(value)` | FFI type tag for a value |
+
+```xs
+import ffi
+let lib = ffi.load("libm.so.6")
+let cos = ffi.sym(lib, "cos")
+println(ffi.call(cos, "double", ["double"], [0.0]))
+ffi.close(lib)
+```
 
 ---
 
@@ -3354,14 +3419,17 @@ handlers.
 ## Execution Backends
 
 ```bash
-xs script.xs                     -- tree-walker interpreter (default)
-xs --vm script.xs                -- bytecode VM (faster)
+xs script.xs                     -- bytecode VM (default)
+xs --interp script.xs            -- tree-walker (use for plugin debugging)
 xs --jit script.xs               -- JIT (x86-64 and aarch64)
 xs build script.xs               -- compile to bytecode (.xsc)
 xs run script.xsc                -- run compiled bytecode
 ```
 
-Both the interpreter and VM produce identical results for correct programs. The VM is faster for compute-heavy code.
+The VM and interpreter produce identical results for correct programs.
+The VM is the default because it's a few times faster on every workload
+the interpreter handles; the interpreter exists for AST-level
+plugin hooks and for debugging the interpreter itself.
 
 The JIT is a single register-allocating tier. Bytecode is lowered to a
 small linear IR, per-block liveness is computed, three callee-saved
@@ -3384,7 +3452,7 @@ XS can be compiled to WebAssembly using wasi-sdk, allowing the full interpreter 
 make wasm    # produces xs.wasm
 ```
 
-The WASM build includes the interpreter, VM, semantic analysis, type checking, effects, pattern matching, generators, closures, enums, structs, classes, universal literals, temporal primitives, and the JS/C transpiler. Output matches the native binary on the suites that don't require networking, real filesystem access, signals, or native plugins.
+The WASM build includes the interpreter, VM, semantic analysis, type checking, effects, pattern matching, generators, closures, enums, structs, classes, duration literals, temporal primitives, and the JS/C transpiler. Output matches the native binary on the suites that don't require networking, real filesystem access, signals, or native plugins.
 
 Not available in WASM:
 - Networking (HTTP, sockets, TLS) - no raw sockets in browser

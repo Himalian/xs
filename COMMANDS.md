@@ -12,22 +12,22 @@ Reference for the `xs` command-line tool. Most of these work, some are rough aro
 
 ### `xs <file.xs> [args...]`
 
-Run an XS script with the tree-walker interpreter (default backend).
+Run an XS script on the bytecode VM (the default backend).
 
 ```bash
 xs hello.xs
 xs server.xs --port 8080
 ```
 
-Arguments after the filename are available in the script via the `argv` global
-array. `argv` does **not** include the interpreter path or the script filename:
-only the arguments that follow.
+Arguments after the filename are available in the script via `os.args`
+after `import os`. `os.args` does not include the interpreter path or
+the script filename; only the arguments that follow.
 
 ### `xs run <file.xs|file.xsc> [args...]`
 
 Run a source file or compiled bytecode:
 
-- `xs run <file.xs>`: same as `xs <file.xs>`, runs through the interpreter
+- `xs run <file.xs>`: same as `xs <file.xs>`, runs on the default VM backend
 - `xs run <file.xsc>`: run a compiled bytecode file produced by `xs build`
 
 ```bash
@@ -68,8 +68,8 @@ xs --backend interp program.xs
 xs --backend jit program.xs
 ```
 
-- `interp`: tree-walker interpreter (default)
-- `vm`: bytecode VM
+- `vm`: bytecode VM (default; same as bare `xs file.xs`)
+- `interp`: tree-walker interpreter (use for plugin debugging or AST-level runtime hooks)
 - `jit`: JIT compilation on x86-64 and aarch64. A register-allocating
   specialiser lowers bytecode through a small linear IR, runs liveness
   and linear-scan allocation over three callee-saved regs, and emits
@@ -87,18 +87,13 @@ xs --backend jit program.xs
 
 ### `xs` (no arguments)
 
-Start the interactive Read-Eval-Print Loop.
+When stdin is a TTY, start the interactive Read-Eval-Print Loop. With
+stdin redirected from a non-tty (a script, a pipe), the binary prints
+the usage banner and exits.
 
 ```bash
-xs
-```
-
-### `xs repl`
-
-Explicit REPL command.
-
-```bash
-xs repl
+xs                       # REPL when stdin is a tty
+echo 'println(1)' | xs   # one-off, then exits
 ```
 
 **REPL commands:**
@@ -467,16 +462,14 @@ Creates:
 myapp/
 |-- xs.toml                 # package manifest
 |-- src/main.xs             # hello world entry point
-|-- tests/test_main.xs      # starter test
-|-- README.md
 |-- .gitignore
 ```
 
 ### `xs init`
 
-Initialize an XS project in the current directory. Writes `xs.toml`, creates
-`src/main.xs` and `tests/`, and adds a `.gitignore` if none exists. Fails if
-`xs.toml` already exists.
+Initialize an XS project in the current directory. Writes `xs.toml`,
+writes `src/main.xs` if absent, and adds a `.gitignore` if none exists.
+Fails if `xs.toml` already exists.
 
 ```bash
 xs init
@@ -567,9 +560,7 @@ xs list
 ### `xs pkg <subcommand>`
 
 Alternative package management interface. Implemented subcommands:
-`install`, `remove`, `update`, `list`, `add`. (The usage string also mentions
-`publish` and `search`, but those are not wired up under `pkg`; use the
-top-level `xs publish` / `xs search` instead.)
+`install`, `remove`, `update`, `list`, `add`, `search`, `publish`.
 
 ```bash
 xs pkg list             # list installed packages

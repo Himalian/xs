@@ -30,7 +30,6 @@ AST-level runtime hooks. Pass `--interp` to force it.
 | Tagged blocks (user-defined control structures) | works |
 | Reactive bindings (bind) | works |
 | Gradual contracts (where clauses) | works |
-| Inline C blocks (for C transpiler) | works |
 | Generators (fn*/yield) | works |
 | Structs, impl, traits | works |
 | Enums with associated data | works |
@@ -40,7 +39,8 @@ AST-level runtime hooks. Pass `--interp` to force it.
 | `@scoped` annotations + escape analysis | works |
 | `@[macro]` procedural-macro markers | works |
 | Decorators (`@on_start`/`@every`/`@cron`/`@watch`/`@export`/`@once`/`@bench`/...) | works |
-| Algebraic effects (effect/perform/handle/resume) | works |
+| Algebraic effects: effect/perform/handle/resume (single-shot) | works |
+| Multi-shot effects (resume called more than once) | partial: VM and JIT replay correctly; the tree-walker still returns the resume's first value. Use `--vm` or `--jit` for cartesian-product effect arms. |
 | Concurrency (spawn, async/await, channels, actors, nurseries) | works |
 | Error handling (try/catch/finally, throw, defer) | works |
 | Modules and imports | works |
@@ -48,7 +48,7 @@ AST-level runtime hooks. Pass `--interp` to force it.
 | Pipe operator | works |
 | Gradual typing (--check, --strict) | works |
 | Plugin system | works |
-| Standard library (37 modules) | works |
+| Standard library (36 modules) | works |
 | HTTPS client via embedded BearSSL | works |
 | Generational refcount GC + concurrent cycle collector | works |
 | First-class `Duration` type (`5s`, `100ms`, `1ns`, `2m30s`) | works |
@@ -114,11 +114,15 @@ Recursive calls stay in native code through a small dispatcher
 (`tier2_run_until`) that re-enters compiled protos via the
 `XSProto.jit_entry` cache.
 
-Supported opcodes (from `op_supported` in `src/jit/ra_lower.c`): the
-full bytecode set except generators and `OP_STORE_GLOBAL`-writes of
-locals captured by inner closures (shadow-model guard). Anything that
-falls outside the subset drops the whole proto back to the bytecode
-VM; no template-JIT middle tier.
+Supported opcodes (from `op_supported` in `src/jit/ra_lower.c`):
+the full bytecode set, modulo the `OP_STORE_GLOBAL` write of a local
+captured by an inner closure (shadow-model guard). Control-flow ops
+(`OP_YIELD`, `OP_THROW`, `OP_TAIL_CALL`, `OP_AWAIT`, `OP_SPAWN`, the
+`OP_EFFECT_*` family, the `OP_DEFER_*` family) and the actor /
+module / kwarg / import set lower through the `vm_step_jit` deopt
+trampoline rather than full native code, so calling code stays in
+tier-2 across `actor.method()`, `import math`, generators, etc. No
+template-JIT middle tier.
 
 | Feature | Status |
 |---------|--------|
@@ -164,7 +168,8 @@ diffs the three outputs.
 | Async/await (sequential) | works |
 | Closures capturing mutable state | works |
 | Generators | not yet |
-| Algebraic effects | not yet |
+| Algebraic effects (single-shot) | works (setjmp/longjmp, nested-fn dispatcher) |
+| Algebraic effects (multi-shot resume) | not yet (needs delimited continuations) |
 | Plugins | not supported (requires runtime) |
 
 ## JavaScript Transpiler
@@ -195,8 +200,13 @@ with a virtual filesystem, captured stdout/stderr, and a `loadXS()` /
 `xs.run()` / `xs.exec()` API. Releases publish both artefacts, and the
 static repo's daily sync workflow picks up the browser build.
 
-`xs --emit wasm` only handles arithmetic and direct calls. The
-runtime build covers the browser case; `--emit c` covers AOT.
+`xs --emit wasm` covers arithmetic, match (with guards), try/catch,
+struct field access, format methods, divide-by-zero, tuple swap, and
+direct calls. `perform` traps with `wasm 'unreachable'` (effect support
+needs WASM exception-handling or a CPS rewrite); `spawn` / channels /
+nurseries lower to single-thread sequencing because WASI doesn't grant
+real threads to a freestanding module. The runtime build covers the
+browser case; `--emit c` covers AOT.
 
 ## Tooling
 
@@ -236,11 +246,12 @@ regression layers under wasmtime.
 
 ## Standard Library
 
-37 modules are registered at interpreter startup (`stdlib_register` in `src/runtime/builtins.c`):
+36 modules are lazy-loaded on first `import` (`stdlib_load_module` in
+`src/runtime/builtins.c`):
 `math`, `time`, `io`, `string`, `path`, `base64`, `hash`, `uuid`, `collections`, `process`,
 `random`, `os`, `json`, `log`, `fmt`, `test`, `csv`, `url`, `re`, `msgpack`, `Promise`,
 `async`, `net`, `crypto`, `thread`, `buf`, `encode`, `db`, `cli`, `ffi`, `reflect`, `gc`,
-`reactive`, `toml`, `http`, `fs`, `tracing`.
+`toml`, `http`, `fs`, `tracing`.
 
 ## Known Footguns
 
@@ -250,7 +261,10 @@ regression layers under wasmtime.
 - `{` inside `"..."` is interpolation. For literal braces use a
   backtick raw string: `` `{"a": 1}` ``. `{{` collapses to one `{`
   but the contents are still parsed as an expression.
-- Regex is POSIX extended. No `\d`, `\w`, lookaround, backrefs.
+- Regex (Thompson NFA, `src/core/regex.c`) covers POSIX extended plus
+  the common shortcuts (`\d`, `\D`, `\s`, `\S`, `\w`, `\W`, `\b`),
+  non-greedy quantifiers, non-capturing groups, and `(?=...)` /
+  `(?!...)` lookaheads. No backrefs.
 - `.upper()` / `.lower()` are ASCII-only. Strings are byte-indexed;
   multi-byte UTF-8 round-trips through everything that doesn't need
   case mapping.
@@ -258,12 +272,20 @@ regression layers under wasmtime.
   `--emit c` for AOT, or the runtime build (`xs-browser.wasm`) for
   the browser.
 - Effects on the JS target lower through generator delegation
-  (`yield*`). `perform` outside a `handle` is a parse error.
-  Effects on the C target are not implemented.
+  (`yield*`); the handle body itself runs inside a `function*()` so
+  bare `yield` no longer escapes the wrapper. `perform` outside a
+  `handle` is a parse error.
+- Effects on the C target run single-shot via setjmp/longjmp + a GCC
+  nested-function dispatcher (v1.2.1). Multi-shot resume on `--emit c`
+  still needs full delimited continuations; tracked for v1.3.
+- Effects on the WASM transpiler (`--emit wasm`) trap with `wasm
+  'unreachable'` on `perform`. The runtime build (`make wasm` / `xs.wasm`)
+  is the path for browser execution; `--emit wasm` covers the AOT
+  arithmetic / direct-call subset only.
 - `XS_GC_CONCURRENT=1` moves GC sweep onto a worker thread; off by
   default.
-- JIT bails on actor methods (and any proto that builds one). The
-  fallback to VM is automatic. x86-64 and aarch64 only.
+- JIT covers actor protos via the deopt trampoline (1.2.0+). x86-64
+  and aarch64 only.
 - JIT and VM disagree on a few `--jit` corner cases listed in the
   test suite as documented carryovers; pass `--vm` if you hit a
   silent miscompile.

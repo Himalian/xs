@@ -2071,6 +2071,9 @@ test_again: ;
 #ifdef XSC_ENABLE_VM
                 do_vm = 0;
 #endif
+            } else {
+                fprintf(stderr, "xs: --backend: unknown backend '%s' (expected interp, vm, or jit)\n", be);
+                return 1;
             }
         }
         else if (strcmp(argv[i], "--vm")       == 0) {
@@ -2552,6 +2555,17 @@ run_file:;
                 int (*fn)(VM *) = (int (*)(VM *))jit_compile(jit, proto);
                 if (fn) {
                     VM *vm = vm_new();
+                    if (vm && vm->globals) {
+                        int nargs = argc - file_arg - 1;
+                        Value *argv_val = xs_array_new();
+                        for (int i = 0; i < nargs; i++) {
+                            Value *sv = xs_str(argv[file_arg + 1 + i]);
+                            array_push(argv_val->arr, sv);
+                            value_decref(sv);
+                        }
+                        map_set(vm->globals, "argv", argv_val);
+                        value_decref(argv_val);
+                    }
                     int jit_rc = vm_run_with(vm, proto, fn);
                     trigger_fire_on_start(NULL);
                     trigger_run_event_loop(NULL);
@@ -2567,14 +2581,31 @@ run_file:;
                     return jit_rc;
                 }
                 jit_free(jit);
-                fprintf(stderr, "xs: --jit: native code emit failed, falling back to VM\n");
+                if (getenv("XS_VERBOSE_JIT"))
+                    fprintf(stderr, "xs: --jit: native code emit failed, falling back to VM\n");
             } else {
                 if (jit) jit_free(jit);
-                fprintf(stderr, "xs: --jit: native JIT unavailable on this build, falling back to VM\n");
+                if (getenv("XS_VERBOSE_JIT"))
+                    fprintf(stderr, "xs: --jit: native JIT unavailable on this build, falling back to VM\n");
             }
         }
 #endif
         VM *vm = vm_new();
+        /* Mirror the interp's `argv` binding: trailing CLI args after
+           the script path become an array on the VM's globals. Without
+           this, `argv` resolved to null under the default backend even
+           though it worked under --interp. */
+        if (vm && vm->globals) {
+            int nargs = argc - file_arg - 1;
+            Value *argv_val = xs_array_new();
+            for (int i = 0; i < nargs; i++) {
+                Value *sv = xs_str(argv[file_arg + 1 + i]);
+                array_push(argv_val->arr, sv);
+                value_decref(sv);
+            }
+            map_set(vm->globals, "argv", argv_val);
+            value_decref(argv_val);
+        }
         int rc = vm_run(vm, proto);
         trigger_fire_on_start(NULL);
         trigger_run_event_loop(NULL);

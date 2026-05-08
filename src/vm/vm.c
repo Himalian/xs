@@ -715,6 +715,7 @@ static Value *vm_None_fn(Interp *interp, Value **args, int argc) {
 /* Defined in builtins.c; reused so format() works the same in both
    backends without duplicating the spec parser. */
 extern Value *builtin_format(Interp *i, Value **args, int argc);
+extern const char *value_type_str(Value *v);
 
 static Value *vm_format(Interp *interp, Value **args, int argc) {
     (void)interp;
@@ -1028,6 +1029,10 @@ static void vm_register_stdlib(VM *vm) {
     {
         extern Value *builtin_xs_fmt_export(Interp *, Value **, int);
         REG("__xs_fmt", builtin_xs_fmt_export);
+    }
+    {
+        extern Value *builtin_xs_call_with_array_export(Interp *, Value **, int);
+        REG("__xs_call_with_array", builtin_xs_call_with_array_export);
     }
     REG("range",   vm_range);
     REG("abs",     vm_abs);
@@ -2972,6 +2977,8 @@ static int vm_dispatch(VM *vm, int stop_frame) {
             Value **mc_args = vm->sp - mc_argc;
             Value *mc_result = NULL;
             int mc_called = 0; /* set to 1 if we pushed a call frame */
+            int mc_unknown = 0; /* type-specific dispatch fell through */
+            int mc_plugin_matched = 0;
 
             /* inline cache: key the site by the caller proto + IP offset so
                it survives across vm_invoke reentry without aliasing between
@@ -3502,15 +3509,14 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                        The dispatch loop's top-of-iteration check on
                        g_xs_pending_throw will unwind on the next pass. */
                     {
-                        char *repr = value_repr(mc_obj);
+                        const char *tname = value_type_str(mc_obj);
                         char label[160];
                         snprintf(label, sizeof label,
                                  "no method '%s' on type '%s'",
-                                 mc_name, repr ? repr : "?");
+                                 mc_name, tname ? tname : "?");
                         xs_runtime_error(span_zero(), label, NULL,
                                          "value of type '%s' has no method '%s'",
-                                         repr ? repr : "?", mc_name);
-                        free(repr);
+                                         tname ? tname : "?", mc_name);
                         for (int j = 0; j < mc_argc; j++) value_decref(POP());
                         value_decref(POP());
                         PUSH(value_incref(XS_NULL_VAL));
@@ -3561,9 +3567,24 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                     mc_result = value_incref(XS_NULL_VAL);
                 } else {
                     mc_result = value_incref(XS_NULL_VAL);
+                    mc_unknown = 1;
                 }
             }
 
+            else if (strcmp(mc_name,"is_none")==0) {
+                mc_result = (VAL_TAG(mc_obj) == XS_NULL)
+                            ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL);
+            }
+            else if (strcmp(mc_name,"is_some")==0) {
+                mc_result = (VAL_TAG(mc_obj) == XS_NULL)
+                            ? value_incref(XS_FALSE_VAL) : value_incref(XS_TRUE_VAL);
+            }
+            else if (strcmp(mc_name,"unwrap_or")==0) {
+                if (VAL_TAG(mc_obj) == XS_NULL)
+                    mc_result = (mc_argc >= 1) ? value_incref(mc_args[0])
+                                               : value_incref(XS_NULL_VAL);
+                else mc_result = value_incref(mc_obj);
+            }
             else if (VAL_TAG(mc_obj) == XS_STR) {
                 const char *s = mc_obj->s;
                 int slen = (int)strlen(s);
@@ -3975,7 +3996,7 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                     mc_result=value_incref(mc_obj);
                 } else if (strcmp(mc_name,"is_a")==0&&mc_argc>=1&&VAL_TAG(mc_args[0])==XS_STR) {
                     mc_result=xs_bool(strcmp(mc_args[0]->s,"str")==0||strcmp(mc_args[0]->s,"String")==0);
-                } else mc_result=value_incref(XS_NULL_VAL);
+                } else { mc_result=value_incref(XS_NULL_VAL); mc_unknown=1; }
             }
             else if (VAL_TAG(mc_obj)==XS_ARRAY||VAL_TAG(mc_obj)==XS_TUPLE) {
                 if (strcmp(mc_name,"len")==0||strcmp(mc_name,"size")==0)
@@ -4205,6 +4226,41 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                         else if(VAL_TAG(mc_obj->arr->items[j])==XS_FLOAT){sf+=mc_obj->arr->items[j]->f;is_float=1;}
                     }
                     mc_result=is_float?xs_float(sf+(double)si):xs_int(si);
+                } else if (strcmp(mc_name,"avg")==0||strcmp(mc_name,"mean")==0) {
+                    if (mc_obj->arr->len == 0) mc_result = xs_float(0.0);
+                    else {
+                        double s = 0;
+                        for (int j = 0; j < mc_obj->arr->len; j++) {
+                            if (VAL_TAG(mc_obj->arr->items[j]) == XS_FLOAT) s += mc_obj->arr->items[j]->f;
+                            else if (VAL_TAG(mc_obj->arr->items[j]) == XS_INT) s += (double)VAL_INT(mc_obj->arr->items[j]);
+                        }
+                        mc_result = xs_float(s / (double)mc_obj->arr->len);
+                    }
+                } else if (strcmp(mc_name,"cycle")==0) {
+                    int n = (mc_argc>0&&VAL_TAG(mc_args[0])==XS_INT)?(int)VAL_INT(mc_args[0]):1;
+                    if (n < 0) n = 0;
+                    Value *arr = xs_array_new();
+                    for (int rep = 0; rep < n; rep++)
+                        for (int j = 0; j < mc_obj->arr->len; j++)
+                            array_push(arr->arr, value_incref(mc_obj->arr->items[j]));
+                    mc_result = arr;
+                } else if (strcmp(mc_name,"count_by")==0 && mc_argc >= 1) {
+                    Value *res = xs_map_new();
+                    for (int j = 0; j < mc_obj->arr->len; j++) {
+                        Value *elem = mc_obj->arr->items[j];
+                        Value *k = vm_invoke(vm, mc_args[0], &elem, 1);
+                        frame = FRAME;
+                        if (!k) k = value_incref(XS_NULL_VAL);
+                        char *ks = value_str(k);
+                        Value *cur = map_get(res->map, ks);
+                        int64_t c = (cur && VAL_TAG(cur) == XS_INT) ? VAL_INT(cur) : 0;
+                        Value *nv = xs_int(c + 1);
+                        map_set(res->map, ks, nv);
+                        value_decref(nv);
+                        free(ks);
+                        value_decref(k);
+                    }
+                    mc_result = res;
                 } else if (strcmp(mc_name,"min")==0) {
                     mc_result=mc_obj->arr->len>0?value_incref(mc_obj->arr->items[0]):value_incref(XS_NULL_VAL);
                     for(int j=1;j<mc_obj->arr->len;j++) if(value_cmp(mc_obj->arr->items[j],mc_result)<0){value_decref(mc_result);mc_result=value_incref(mc_obj->arr->items[j]);}
@@ -4566,7 +4622,7 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                     buf[wpos]='\0'; mc_result=xs_str(buf); free(buf);
                 } else if (strcmp(mc_name,"is_a")==0&&mc_argc>=1&&VAL_TAG(mc_args[0])==XS_STR) {
                     mc_result=xs_bool(strcmp(mc_args[0]->s,"array")==0||strcmp(mc_args[0]->s,"Array")==0||strcmp(mc_args[0]->s,"List")==0);
-                } else mc_result=value_incref(XS_NULL_VAL);
+                } else { mc_result=value_incref(XS_NULL_VAL); mc_unknown=1; }
             }
             else if (VAL_TAG(mc_obj)==XS_INT||VAL_TAG(mc_obj)==XS_FLOAT||VAL_TAG(mc_obj)==XS_BIGINT) {
                 double num_f=(VAL_TAG(mc_obj)==XS_FLOAT)?mc_obj->f:(VAL_TAG(mc_obj)==XS_BIGINT?bigint_to_double(mc_obj->bigint):(double)VAL_INT(mc_obj));
@@ -4597,7 +4653,14 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                     if(VAL_TAG(mc_obj)==XS_INT) mc_result=xs_int(VAL_INT(mc_obj));
                     else mc_result=xs_int((int64_t)ceil(mc_obj->f));
                 } else if (strcmp(mc_name,"round")==0) {
-                    if(VAL_TAG(mc_obj)==XS_INT) mc_result=xs_int(VAL_INT(mc_obj));
+                    int digits = (mc_argc > 0 && VAL_TAG(mc_args[0]) == XS_INT) ?
+                                 (int)VAL_INT(mc_args[0]) : -1;
+                    if (digits >= 0) {
+                        double v = (VAL_TAG(mc_obj)==XS_INT) ? (double)VAL_INT(mc_obj) : mc_obj->f;
+                        double scale = 1.0;
+                        for (int k = 0; k < digits; k++) scale *= 10.0;
+                        mc_result = xs_float(round(v * scale) / scale);
+                    } else if(VAL_TAG(mc_obj)==XS_INT) mc_result=xs_int(VAL_INT(mc_obj));
                     else mc_result=xs_int((int64_t)round(mc_obj->f));
                 } else if (strcmp(mc_name,"trunc")==0) {
                     if(VAL_TAG(mc_obj)==XS_INT) mc_result=xs_int(VAL_INT(mc_obj));
@@ -4658,7 +4721,7 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                     int match=(VAL_TAG(mc_obj)==XS_INT&&(strcmp(mc_args[0]->s,"int")==0||strcmp(mc_args[0]->s,"Int")==0))||
                               (VAL_TAG(mc_obj)==XS_FLOAT&&(strcmp(mc_args[0]->s,"float")==0||strcmp(mc_args[0]->s,"Float")==0));
                     mc_result=xs_bool(match);
-                } else mc_result=value_incref(XS_NULL_VAL);
+                } else { mc_result=value_incref(XS_NULL_VAL); mc_unknown=1; }
                 (void)num_f; (void)num_i;
             }
             else if (VAL_TAG(mc_obj) == XS_RANGE && mc_obj->range) {
@@ -4691,7 +4754,7 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                     }
                     mc_result = arr;
                 }
-                else mc_result = value_incref(XS_NULL_VAL);
+                else { mc_result = value_incref(XS_NULL_VAL); mc_unknown=1; }
             }
             else if (VAL_TAG(mc_obj) == XS_REGEX && mc_obj->s) {
                 /* Regex methods: .test/.is_match, .match/.find, .replace,
@@ -4749,6 +4812,7 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                     mc_result = xs_str(pat);
                 } else {
                     mc_result = value_incref(XS_NULL_VAL);
+                    mc_unknown = 1;
                 }
             }
             else {
@@ -4765,6 +4829,7 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                 } else {
                 /* check plugin methods */
                 Value *pmethods = map_get(vm->globals, "__plugin_methods");
+                int generic_matched = 0;
                 if (pmethods && VAL_TAG(pmethods) == XS_MAP) {
                     const char *type_name = NULL;
                     if (VAL_TAG(mc_obj) == XS_STR) type_name = "str";
@@ -4786,10 +4851,13 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                                 mc_result = vm_invoke(vm, pfn, pargs, total);
                                 frame = FRAME;
                                 if (!mc_result) mc_result = value_incref(XS_NULL_VAL);
-                            } else mc_result = value_incref(XS_NULL_VAL);
-                        } else mc_result = value_incref(XS_NULL_VAL);
-                    } else mc_result = value_incref(XS_NULL_VAL);
-                } else mc_result = value_incref(XS_NULL_VAL);
+                                generic_matched = 1;
+                                mc_plugin_matched = 1;
+                            }
+                        }
+                    }
+                }
+                if (!generic_matched) { mc_result = value_incref(XS_NULL_VAL); mc_unknown = 1; }
                 } /* end is_a else */
             }
 
@@ -4817,10 +4885,25 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                                 mc_result = vm_invoke(vm, pfn, pargs, ptotal);
                                 frame = FRAME;
                                 if (!mc_result) mc_result = value_incref(XS_NULL_VAL);
+                                mc_plugin_matched = 1;
                             }
                         }
                     }
                 }
+            }
+            /* Type-specific dispatch fell through and no plugin method
+               picked it up: surface a runtime error like the map path
+               does. Without this str.foo() / [1].foo() / 1.foo()
+               silently evaluated to null and exited 0. */
+            if (!mc_called && mc_unknown && !mc_plugin_matched) {
+                const char *tname = value_type_str(mc_obj);
+                char label[160];
+                snprintf(label, sizeof label,
+                         "no method '%s' on type '%s'",
+                         mc_name, tname ? tname : "?");
+                xs_runtime_error(span_zero(), label, NULL,
+                                 "value of type '%s' has no method '%s'",
+                                 tname ? tname : "?", mc_name);
             }
             if (!mc_called) {
                 for(int j=0;j<mc_argc;j++) value_decref(POP());

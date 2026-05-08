@@ -1,5 +1,77 @@
 # Changelog
 
+## 1.2.1
+
+Cleared the v1.2 deferred queue plus a friend-feedback batch.
+
+**`--emit c` effects.** Single-shot perform/resume now lower through
+setjmp/longjmp + a GCC nested-function dispatcher that closes over
+the enclosing scope. Multi-shot resume on the C target still needs
+delimited continuations and is tracked for v1.3.
+
+**JS target.** 9/9 of the original tracked conformance corpus passes.
+BigInt-aware `__xs_add`/`__xs_arith`/`__xs_pow`/`__xs_eq` now carry
+overflow promotion, try-as-expr returns the body's trailing value,
+`.to_str` / `.to_int` / `.to_float` map to the obvious JS conversions,
+and compile-time float-divide detection means `0.0/0.0` evaluates to
+NaN instead of throwing.
+
+**VM merge sort.** Closed the O(n²) cliff that hit any `arr.sort(|a,b| ...)`
+once the array got past a few thousand elements.
+
+**Friend-feedback batch.**
+- `timeout` is contextual now so `timeout = 30` doesn't shadow the
+  block keyword.
+- `@on_exit` runs on `os.exit` / `process.exit` instead of being a
+  no-op.
+- Float repr keeps the `.0` (`println(1.0)` -> `1.0`, not `1`).
+- `@test` is an alias for `@example` so the natural decorator name
+  works.
+- Struct-variant exhaustiveness covers the variant fields, not just
+  the enum head.
+- `m.delete(k)` actually removes the key.
+- HTTP headers are lowercased before lookup so `headers["Content-Type"]`
+  and `headers["content-type"]` both work.
+- `arr ++ [x]` produces a flat array on VM/JIT (was nesting `[x]`).
+- `xs --emit jit-ir` dumps the lowered IR per proto for eligibility
+  decisions.
+- Lint surfaces `shadowed-builtin` cleanly.
+- `jit.h` doc sweep.
+
+**Multi-shot resume + nested perform** now produces the cartesian
+product across VM and JIT. Compiler plumbs `handle_local_base` through
+`OP_EFFECT_HANDLE` -> `TryEntry` -> `EffectCont` so the snapshot
+captures only `[arm_local_base, arm_sp_off)`; outer-arm restore on
+`OP_EFFECT_DONE` walks the eff_stack instead of stomping outer locals.
+JIT `FRAME_SIZE` updated for the grown `TryEntry`.
+
+**`for v in ch`** blocks until the channel is closed-and-drained on
+both VM and interp. The VM was snapshotting the buffered length at
+loop start; ITER_LEN now reports `INT64_MAX` for channels and
+ITER_GET does a blocking recv. Interp's null check was missing the
+`XS_NULL_VAL` singleton path and bound null once before exit.
+
+**Embed C API.** `xs_eval` returns the trailing expression's value
+(was always `XS_NULL`). `xs_call` routes through the parser via a
+synthesized call expression instead of the segfault-prone direct
+call_value path.
+
+**Bug fixes.** `[v; n]` repeat literal works on the VM. Map int-key
+round-trip on dynamic assignment. JS yield no longer escapes the
+`function*()` wrapper for effect handlers. `xs doc <dir>` walks `.xs`
+files and `xs doc <file>` emits `---` doc comments. f-string format
+specs (Python-style: alignment, width, precision, type, comma).
+`re.*` raises `RegexError` on bad regex; `re.split` rejects empty
+pattern. `json.parse` raises on invalid input (use `json.parse_safe`
+for the null fallback).
+
+**Quiet JIT fallback.** The `--jit: native code emit failed` and
+`native JIT unavailable` stderr lines now require `XS_VERBOSE_JIT=1`;
+graceful fallback is silent by default.
+
+**`--backend foo`** now errors instead of silently accepting unknown
+backends.
+
 ## 1.2.0
 
 Big subtraction + correctness release. Three rarely-used features

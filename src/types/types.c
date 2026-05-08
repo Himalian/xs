@@ -108,6 +108,11 @@ int ty_equal(const XsType *a, const XsType *b) {
     TyKind ka = (TyKind)ty_kind_canonical(a);
     TyKind kb = (TyKind)ty_kind_canonical(b);
     if (ka == TY_DYN || kb == TY_DYN) return 1;
+    /* Generic type parameters lower to TY_UNKNOWN (typecheck.c line 81),
+       so [T] becomes ty_array(unknown). Treat unknown as wildcard at
+       every level so first<T>([1,2,3]) doesn't trip
+       'expected [T], got [i64]'. */
+    if (ka == TY_UNKNOWN || kb == TY_UNKNOWN) return 1;
     if (ka != kb) return 0;
     if (ka != a->kind || kb != b->kind) return 1;
     switch (a->kind) {

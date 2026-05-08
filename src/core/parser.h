@@ -44,6 +44,12 @@ extern int (*g_plugin_is_keyword)(const char *word);
 /* phase 3: parser override hook (set by interp.c) */
 extern Node *(*g_plugin_try_parser_override)(Parser *p, const char *keyword);
 
+/* eager-load: when a `load "path"` statement is parsed, pre-execute
+   the plugin file on the current interpreter so any keywords / syntax
+   handlers it registers are visible to the rest of the parse pass.
+   Set by interp.c. Returns 0 on success, -1 on error. */
+extern int (*g_parser_eager_load)(const char *path, const char *containing_file);
+
 /* disambiguation: forced plugin id for <plugin-id> syntax (set by parser, read by interp.c) */
 extern const char *g_plugin_forced_id;
 

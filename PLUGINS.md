@@ -35,9 +35,8 @@ That's it. The plugin file runs in a temporary interpreter, but the hooks and gl
 load "path/to/plugin.xs"
 ```
 
-Always use `load`. The older `use plugin "..."` form still parses for
-backward compatibility but emits a deprecation warning at runtime, and
-it will be removed before v1.0.
+`load` is the preferred form. `use plugin "..."` parses to the same
+node and is kept for older snippets you may have lying around.
 
 The path is resolved relative to the file doing the loading. Plugins
 execute top-to-bottom at load time, before the rest of your program
@@ -238,53 +237,45 @@ Mostly useful for debugging or for meta-plugins that inspect what other plugins 
 
 ## Syntax Extension
 
-This is where plugins get interesting. You can add entirely new syntax to the language.
+For new syntax, use the declarative `plugin "name" { ... }` form below
+- it's the only path the parser sees at parse time. The imperative
+`plugin.lexer.add_keyword(...)` / `plugin.parser.on_unknown(...)` API
+exists for runtime hooks (after-eval rewrites, dynamic dispatch
+overrides, etc.); registrations made there land *after* the host file
+has been parsed, so they cannot introduce new statement keywords for
+the same file.
 
-### Adding Keywords
-
-Before the parser will recognize a new word as a statement, you need to register it:
-
-```xs
-plugin.lexer.add_keyword("unless")
-```
-
-Without this, the parser treats `unless` as an identifier and you'll get parse errors.
-
-### Handling Unknown Tokens
-
-`plugin.parser.on_unknown(fn)` fires when the parser sees a token it doesn't know how to handle as a statement. Your handler gets the token and returns an AST node (or `null` to pass).
+### Declarative parser productions
 
 ```xs
-plugin.parser.on_unknown(fn(token) {
-    if token.value == "unless" {
-        let cond = plugin.parser.expr()
-        let body = plugin.parser.block()
-        return plugin.ast.if_expr(
-            plugin.ast.unary("!", cond),
-            body
-        )
+plugin "unless" {
+  meta { id: "unless"; version: "0.1.0" }
+
+  parser {
+    production unless(parser, token) {
+      let cond = parser.expr()
+      let body = parser.block()
+      plugin.ast.if_expr(plugin.ast.unary("!", cond), body)
     }
-    return null
-})
-```
+  }
+}
 
-Now this works in the host:
-
-```xs
 unless x > 10 {
     println("x is small")
 }
 ```
 
-The plugin desugars it into `if !(x > 10) { ... }` at parse time.
+The `plugin "..." { parser { production NAME(...) { ... } } }` form is
+parsed natively, so the production is registered before the next
+statement is read and `unless` is available to the rest of the file.
 
-### Expression-Level Handlers
+### Runtime hooks
 
-`plugin.parser.on_unknown_expr(fn)` is the same idea but for expression position. Use this when your custom syntax should be valid inside an expression, not just as a standalone statement.
-
-### Postfix Handlers
-
-`plugin.parser.on_postfix(fn)` fires after an expression is parsed, letting you handle custom postfix operators or suffixes.
+Hooks registered through `plugin.parser.on_unknown(fn)`,
+`plugin.parser.on_unknown_expr(fn)`, and `plugin.parser.on_postfix(fn)`
+fire on subsequent reparses (REPL, `eval`, dynamic loads from another
+file). They do not affect parses already in progress when the plugin
+runs.
 
 ### Parser Access
 
@@ -440,15 +431,18 @@ plugin.ast.return_node(expr)           -- return statement
 plugin.ast.assign("name", value_node)  -- assignment
 ```
 
-### Universal Literals
+### Duration Literal
 
 ```xs
 plugin.ast.duration(5000)                -- duration node (value in ms)
-plugin.ast.color(255, 102, 0, 255)       -- color node (r, g, b, a)
-plugin.ast.date("2024-03-15")            -- date node (ISO string)
-plugin.ast.size(10240)                   -- size node (value in bytes)
-plugin.ast.angle(1.5708)                 -- angle node (value in radians)
 ```
+
+This is the only domain-typed literal the lexer/parser produces.
+The plugin AST table also exposes `plugin.ast.color`, `plugin.ast.date`,
+`plugin.ast.size`, `plugin.ast.angle` as tagged-map constructors for
+plugins that want to assemble bespoke AST shapes; nothing in the host
+language treats those tags as literals, so use them only when you're
+also writing the matching evaluation hook.
 
 ### Temporal Primitives
 
@@ -519,37 +513,6 @@ println(clamp(-5, 0, 10))       -- 0
 println(repeat_str("ha", 3))    -- hahaha
 ```
 
-### Syntax Sugar Plugin (unless)
-
-```xs
--- unless_plugin.xs
-plugin.meta = #{ name: "unless", version: "1.0.0" }
-
-plugin.lexer.add_keyword("unless")
-
-plugin.parser.on_unknown(fn(token) {
-    if token.value == "unless" {
-        let cond = plugin.parser.expr()
-        let body = plugin.parser.block()
-        return plugin.ast.if_expr(
-            plugin.ast.unary("!", cond),
-            body
-        )
-    }
-    return null
-})
-```
-
-```xs
--- main.xs
-load "unless_plugin.xs"
-
-let x = 5
-unless x > 10 {
-    println("x is not greater than 10")
-}
-```
-
 ### Testing Framework Plugin
 
 ```xs
@@ -615,7 +578,10 @@ run_tests()
 
 ### Web Framework Plugin (Showcase)
 
-This one uses almost every plugin feature -- custom syntax, virtual modules, eval hooks, method injection, teardown. See `examples/plugins/showcase_plugin.xs` for the full source and `examples/plugin_demo.xs` for usage. Here's the highlights:
+This one uses almost every plugin feature: virtual modules, eval
+hooks, method injection, teardown. The runnable plugin samples live
+under `tests/plugins/` (`pipeline_*.xs`, `method_plugin.xs`,
+`provenance.xs`); the snippet below is abbreviated.
 
 ```xs
 -- showcase_plugin.xs (abbreviated)

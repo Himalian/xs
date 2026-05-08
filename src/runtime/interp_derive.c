@@ -24,7 +24,11 @@ Value *builtin_debug_to_string(Interp *interp, Value **args, int argc) {
 
 Value *builtin_clone(Interp *interp, Value **args, int argc) {
     (void)interp;
-    if (argc < 1 || VAL_TAG(args[0]) != XS_INST) return value_incref(XS_NULL_VAL);
+    if (argc < 1) return value_incref(XS_NULL_VAL);
+    /* For non-instance values, clone is a shallow copy (same behaviour
+       as `copy()`); the dedicated path below handles class instances
+       which need their own field+method maps. */
+    if (VAL_TAG(args[0]) != XS_INST) return value_copy(args[0]);
     Value *self = args[0];
     XSInst *inst = xs_calloc(1, sizeof(XSInst));
     inst->class_ = self->inst->class_;

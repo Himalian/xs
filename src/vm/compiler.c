@@ -1120,9 +1120,80 @@ static void compile_node(Compiler *c, Node *n, int want_value) {
         return;
 
     case NODE_CALL: {
-        compile_node(c, n->call.callee, 1);
         int argc  = n->call.args.len;
         int nkw   = n->call.kwargs.len;
+        /* Spread args: lower `f(a, ...arr, b)` to
+              __xs_call_with_array(f, [a, ...arr, b])
+           so the OP_CALL argc immediate stays static. The array
+           literal compilation already expands NODE_SPREAD inline,
+           so we just synthesize a call to the helper with the
+           original callee + an array of all args. Kwargs aren't
+           supported alongside spread (Python's not either). */
+        int has_spread = 0;
+        for (int i = 0; i < argc; i++) {
+            Node *an = n->call.args.items[i];
+            if (an && VAL_TAG(an) == NODE_SPREAD) { has_spread = 1; break; }
+        }
+        if (has_spread) {
+            /* Stack on entry: [helper, callee, args_array]. We build
+               args_array in place using the same loop shape as the
+               array-literal spread compilation: store-into-arr_slot,
+               then push.method_call("push", v) for each element. */
+            compile_name_load(c, "__xs_call_with_array");
+            compile_node(c, n->call.callee, 1);
+            emit(c, MAKE_B(OP_MAKE_ARRAY, 0, 0, 0));
+            int arr_slot = local_add_hidden(c);
+            emit_a(c, OP_STORE_LOCAL, arr_slot);
+            for (int i = 0; i < argc; i++) {
+                Node *an = n->call.args.items[i];
+                if (an && VAL_TAG(an) == NODE_SPREAD) {
+                    int sp_slot = local_add_hidden(c);
+                    int sp_len  = local_add_hidden(c);
+                    int sp_idx  = local_add_hidden(c);
+                    compile_node(c, an->spread.expr, 1);
+                    emit_a(c, OP_STORE_LOCAL, sp_slot);
+                    emit_a(c, OP_LOAD_LOCAL, sp_slot);
+                    emit(c, MAKE_A(OP_ITER_LEN, 0, 0));
+                    emit_a(c, OP_STORE_LOCAL, sp_len);
+                    emit_const(c, xs_int(0));
+                    emit_a(c, OP_STORE_LOCAL, sp_idx);
+                    int loop_top = c->current->proto->chunk.len;
+                    emit_a(c, OP_LOAD_LOCAL, sp_idx);
+                    emit_a(c, OP_LOAD_LOCAL, sp_len);
+                    emit(c, MAKE_A(OP_LT, 0, 0));
+                    int j_exit = emit_jump(c, OP_JUMP_IF_FALSE);
+                    emit_a(c, OP_LOAD_LOCAL, arr_slot);
+                    emit_a(c, OP_LOAD_LOCAL, sp_slot);
+                    emit_a(c, OP_LOAD_LOCAL, sp_idx);
+                    emit(c, MAKE_A(OP_ITER_GET, 0, 0));
+                    {
+                        int pi = emit_global_name(c, "push");
+                        emit(c, MAKE_A(OP_METHOD_CALL, 1, (uint16_t)(unsigned)pi));
+                    }
+                    emit(c, MAKE_A(OP_POP, 0, 0));
+                    emit_a(c, OP_LOAD_LOCAL, sp_idx);
+                    emit_const(c, xs_int(1));
+                    emit(c, MAKE_A(OP_ADD, 0, 0));
+                    emit_a(c, OP_STORE_LOCAL, sp_idx);
+                    int back_off = loop_top - (c->current->proto->chunk.len + 1);
+                    emit(c, MAKE_A(OP_JUMP, 0, (uint16_t)(int16_t)back_off));
+                    patch_jump(c, j_exit);
+                } else {
+                    emit_a(c, OP_LOAD_LOCAL, arr_slot);
+                    compile_node(c, an, 1);
+                    {
+                        int pi = emit_global_name(c, "push");
+                        emit(c, MAKE_A(OP_METHOD_CALL, 1, (uint16_t)(unsigned)pi));
+                    }
+                    emit(c, MAKE_A(OP_POP, 0, 0));
+                }
+            }
+            emit_a(c, OP_LOAD_LOCAL, arr_slot);
+            emit(c, MAKE_B(OP_CALL, 0, 0, 2));
+            if (!want_value) emit(c, MAKE_A(OP_POP, 0, 0));
+            return;
+        }
+        compile_node(c, n->call.callee, 1);
         for (int i = 0; i < argc; i++)
             compile_node(c, n->call.args.items[i], 1);
         if (nkw > 0) {

@@ -426,8 +426,20 @@ static int is_float_kind(TyKind k) {
 
 int tc_check(Node *n, XsType *expected, SymTab *st, SemaCtx *ctx) {
     if (!expected || expected->kind == TY_UNKNOWN) return 1;
+    /* `null` always assigns to an optional type without needing a
+       Some(...) wrapper -- otherwise `let n: int? = null` would fail. */
+    if (n && VAL_TAG(n) == NODE_LIT_NULL && expected->kind == TY_OPTION) return 1;
     XsType *actual = tc_synth(n, st, ctx);
     if (actual->kind == TY_UNKNOWN) return 1;
+    /* int? accepts a bare int (similarly for str?, [T]?, ...): the
+       optional is just "T or null", not a wrapper users have to
+       construct manually. */
+    if (expected->kind == TY_OPTION && actual->kind != TY_OPTION) {
+        if (ty_equal(actual, expected->option.inner)) {
+            if (!actual->is_singleton) ty_free(actual);
+            return 1;
+        }
+    }
     if (actual->kind == TY_I64 && is_int_kind(expected->kind)) {
         if (!actual->is_singleton) ty_free(actual);
         return 1;
@@ -637,6 +649,14 @@ static void tc_walk(Node *n, SymTab *st, SemaCtx *ctx) {
                 int nparams = params->len;
                 int limit = nargs < nparams ? nargs : nparams;
                 int had_mismatch = 0;
+                /* Push the callee's generic type-parameter names so any
+                   `T` inside the parameter annotation lowers to
+                   ty_unknown() (which ty_equal already treats as a
+                   wildcard). Without this, `fn first<T>(arr: [T])`
+                   reads as `[T-named]`, and a real `[i64]` argument
+                   fails the equality check. */
+                int gpushed = tc_push_generics(fn_sym->decl->fn_decl.type_params,
+                                               fn_sym->decl->fn_decl.n_type_params);
                 for (int i = 0; i < limit; i++) {
                     Param *pm = &params->items[i];
                     if (!pm->type_ann) continue;
@@ -650,6 +670,7 @@ static void tc_walk(Node *n, SymTab *st, SemaCtx *ctx) {
                     }
                     if (!expected->is_singleton) ty_free(expected);
                 }
+                tc_pop_generics(gpushed);
                 if (had_mismatch && ctx->diag && ctx->diag->n_items > 0) {
                     Diagnostic *last = &ctx->diag->items[ctx->diag->n_items - 1];
                     char *sig = format_fn_signature(n->call.callee->ident.name, fn_sym->decl);

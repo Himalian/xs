@@ -32,15 +32,16 @@ opt-in flag first.
 
 Modules importable without `@unstable`:
 
-- `math`, `string`, `time`, `random`, `fmt`, `assert`
+- `math`, `string`, `time`, `random`, `fmt`
 - `io`, `fs`, `path`, `os`, `process`, `cli`
-- `json`, `csv`, `toml`, `url`, `base64`, `hash`, `uuid`, `encode`
-- `collections`, `re`, `bigint`, `buf`
-- `crypto` (SHA, HMAC, AES, ChaCha20), `tls` (BearSSL),
-  `http` (client + server with router)
+- `json`, `csv`, `toml`, `url`, `base64`, `hash`, `uuid`, `encode`,
+  `msgpack`
+- `collections`, `re`, `buf`
+- `crypto` (SHA, HMAC, AES, ChaCha20),
+  `http` (client + server with router; HTTPS via embedded BearSSL)
 - `net` (TCP), `db` (SQLite-compatible)
 - `ffi`, `reflect`, `gc`, `log`, `tracing`
-- `concurrent`, `async`, `reactive`
+- `Promise`, `async`, `thread`
 
 `@unstable` modules at 1.0 (Tier 2; opt-in only):
 
@@ -50,27 +51,28 @@ Modules importable without `@unstable`:
 
 Frozen subcommands:
 
-- Run: `xs <file>`, `xs run`, `xs check`, `xs build`, `xs eval`, `xs repl`.
+- Run: `xs <file>`, `xs run`, `xs check`, `xs build`, `xs -e <code>`.
+  Bare `xs` enters the REPL on a TTY; with stdin redirected it prints
+  the help banner.
 - Tooling: `xs fmt`, `xs lint`, `xs doc`, `xs test`, `xs bench`,
   `xs profile`, `xs coverage`, `xs explain`.
-- Debug: `xs --debug <file>`, `xs replay`, `xs lsp`, `xs dap`.
-- Pkg: `xs new`, `xs init`, `xs install`, `xs add`, `xs remove`,
-  `xs update`, `xs list`, `xs publish`, `xs search`, `xs login`,
-  `xs logout`, `xs whoami`, `xs pkg <subcmd>`.
+- Debug: `xs --record <trace> <file>`, `xs replay`, `xs lsp`, `xs dap`.
+- Pkg: `xs new`, `xs install`, `xs remove`, `xs update`, `xs publish`,
+  `xs search`, `xs login`, `xs logout`, `xs whoami`,
+  `xs pkg <subcmd>` (subcmds: `install`, `remove`, `update`, `list`,
+  `add`, `search`, `publish`).
 - Transpile: `xs transpile`, `xs --emit {ast,bytecode,ir,js,c,wasm}`.
 
-Frozen flags: `--strict`, `--check`, `--lenient`, `--vm`, `--jit`,
-`--no-color`, `--watch`, `--explain`, `--instr-limit`, `--time-limit`,
-`--max-memory`, `--target`, `--out`, `--gc-debug`, `--optimize`,
-`--plugin`, `--allow-unstable`, `--record`, `--replay`, `--trace-sample`,
-`--debug`.
+Frozen flags: `--strict`, `--check`, `--lenient`, `--vm`, `--interp`,
+`--jit`, `--backend {interp,vm,jit}`, `--no-color`, `--watch`,
+`--gc-debug`, `--optimize`, `--plugin`, `--record`.
 
 ### Diagnostic shape
 
 The `error[CODE]: ...` / `--> file:line:col` layout, the `hint:` and
 `for more info: xs --explain` lines, and the error code prefixes
 (`L0xxx` lexer, `P0xxx` parser, `T0xxx` types, `R0xxx` runtime,
-`D0xxx` deprecation) are part of the contract. Editors and CI that
+`S0xxx` semantic) are part of the contract. Editors and CI that
 parse the output stay valid.
 
 ### File formats
@@ -83,10 +85,22 @@ parse the output stay valid.
 
 ### Plugin API surface
 
-Hooks documented in `PLUGINS.md`:
-- `load`, `before_eval`, `after_eval`
-- Parser overrides registered via `parser_register(...)`
-- Tag filtering via `with_tags(...)` / `without_tags(...)`
+Surfaces documented in `PLUGINS.md`:
+- The `load "..."` form for loading a plugin file.
+- Runtime hooks: `plugin.runtime.before_eval(tag, fn)`,
+  `plugin.runtime.after_eval(tag, fn)`,
+  `plugin.runtime.global.set(name, value)`,
+  `plugin.runtime.add_method(type, name, fn)`,
+  `plugin.runtime.resolve_import(fn)`,
+  `plugin.runtime.on_error(fn)`.
+- Parser hooks: `plugin.parser.override(keyword, fn)`,
+  `plugin.parser.on_unknown(fn)`,
+  `plugin.parser.on_unknown_expr(fn)`,
+  `plugin.parser.on_postfix(fn)`.
+- Tag filtering: pass the tag string as the first argument to
+  `before_eval` / `after_eval` to filter by AST node type.
+- The declarative `plugin "name" { meta { ... } parser { ... } lexer { ... } }`
+  form for parse-time syntax extension.
 
 Internals not in `PLUGINS.md` (AST node layout, value tag values,
 GC trigger heuristics) stay un-frozen; see `POLICY.md` "What isn't

@@ -12,6 +12,7 @@
 Node *(*g_plugin_try_syntax_handler)(Parser *p, Token *tok) = NULL;
 Node *(*g_plugin_try_syntax_expr_handler)(Parser *p, Token *tok) = NULL;
 int (*g_plugin_is_keyword)(const char *word) = NULL;
+int (*g_parser_eager_load)(const char *path, const char *containing_file) = NULL;
 Node *(*g_plugin_try_parser_override)(Parser *p, const char *keyword) = NULL;
 const char *g_plugin_forced_id = NULL;
 
@@ -878,6 +879,32 @@ static Node *parse_primary(Parser *p) {
         pp_advance(p);
         char *name = xs_strdup(tok->sval ? tok->sval : "");
 
+        /* Unparenthesized single-arg arrow lambda: `x => body`. The
+           parens form `(x) => body` is handled later in the LPAREN
+           branch; this catches the bare-name shape that's common in
+           `arr.map(x => x * 2)` / `xs |> filter(it => it > 0)`. The
+           no_arrow_lambda guard mirrors the parens path so match arms
+           (`pattern => result`) keep working. */
+        if (!p->no_arrow_lambda && pp_check(p, TK_FAT_ARROW)) {
+            pp_advance(p);
+            ParamList pl = paramlist_new();
+            Param pm = {0};
+            pm.span = span;
+            pm.name = xs_strdup(name);
+            Node *id = node_new(NODE_IDENT, span);
+            id->ident.name = xs_strdup(name);
+            pm.pattern = id;
+            paramlist_push(&pl, pm);
+            free(name);
+            Node *body;
+            if (pp_check(p, TK_LBRACE)) body = parse_block(p);
+            else                          body = parse_expr(p, 0);
+            Node *n = node_new(NODE_LAMBDA, span);
+            n->lambda.params = pl;
+            n->lambda.body   = body;
+            return n;
+        }
+
         /* Scope resolution: Name::Item */
         if (pp_check(p, TK_COLON_COLON)) {
             /* build a chain */
@@ -1025,7 +1052,11 @@ static Node *parse_primary(Parser *p) {
     case TK_STATIC: {
         pp_advance(p);
         Node *n = node_new(NODE_IDENT, span);
-        n->ident.name = xs_strdup(tok->sval ? tok->sval : "");
+        /* Keyword tokens drop sval; without the spelling fallback the
+           IDENT carries an empty name and sema/runtime can't resolve
+           it. Hits the `import async; async.channel()` shape. */
+        n->ident.name = xs_strdup(tok->sval ? tok->sval :
+                                  token_kind_name(tok->kind));
         return n;
     }
 
@@ -2292,6 +2323,7 @@ static Node *parse_pattern(Parser *p) {
             tok->kind == TK_HASH_LBRACE ||
             a->kind == TK_RBRACE ||
             a->kind == TK_DOTDOT ||
+            a->kind == TK_DOTDOTDOT ||
             a->kind == TK_STRING ||
             (a->kind == TK_IDENT && (b->kind == TK_COLON || b->kind == TK_COMMA || b->kind == TK_RBRACE));
         if (looks_like_map) {
@@ -2299,7 +2331,14 @@ static Node *parse_pattern(Parser *p) {
             char **keys = NULL; Node **subs = NULL;
             int nfields = 0, cap = 0; int rest = 0;
             while (!pp_check2(p, TK_RBRACE, TK_EOF)) {
-                if (pp_check(p, TK_DOTDOT)) { pp_advance(p); rest = 1; break; }
+                if (pp_check(p, TK_DOTDOT) || pp_check(p, TK_DOTDOTDOT)) {
+                    pp_advance(p); rest = 1;
+                    /* `..rest` / `...rest` -- skip the bound name; we
+                       don't currently expose it as a value, but
+                       accepting it keeps the syntax forgiving. */
+                    if (pp_peek(p, 0)->kind == TK_IDENT) pp_advance(p);
+                    break;
+                }
                 Token *kt = pp_peek(p, 0);
                 char *key = NULL;
                 if (kt->kind == TK_STRING) {
@@ -2700,7 +2739,9 @@ static Node *parse_pattern(Parser *p) {
         NodeList elems = nodelist_new();
         char *rest = NULL;
         while (!pp_check2(p, TK_RBRACKET, TK_EOF)) {
-            if (pp_check(p, TK_DOTDOT)) {
+            /* Accept both `..rest` and `...rest`: the latter mirrors the
+               spread call/array literal syntax users already write. */
+            if (pp_check(p, TK_DOTDOT) || pp_check(p, TK_DOTDOTDOT)) {
                 pp_advance(p);
                 if (pp_peek(p, 0)->kind == TK_IDENT) {
                     Token *rn = pp_advance(p);
@@ -2726,7 +2767,7 @@ static Node *parse_pattern(Parser *p) {
         NodeList defaults = nodelist_new();
         int rest = 0;
         while (!pp_check2(p, TK_RBRACE, TK_EOF)) {
-            if (pp_check(p, TK_DOTDOT)) { pp_advance(p); rest=1; break; }
+            if (pp_check(p, TK_DOTDOT) || pp_check(p, TK_DOTDOTDOT)) { pp_advance(p); rest=1; break; }
             Token *fn = pp_peek(p, 0);
             if (fn->kind != TK_IDENT) break;
             pp_advance(p);
@@ -3761,10 +3802,17 @@ static Node *parse_import(Parser *p) {
     int from_style = 0;
     if (pp_check(p, TK_FROM)) { pp_advance(p); from_style = 1; }
 
-    /* Collect path parts (allow hyphens in names: math-utils -> "math-utils") */
+    /* Collect path parts (allow hyphens in names: math-utils -> "math-utils").
+       Stdlib modules whose name collides with a keyword (`async`, `type`,
+       `from`, `as`, ...) lex as the keyword token; we accept those here
+       so `import async` actually binds the module. */
     char **path = NULL; int nparts = 0;
     Token *pt = pp_peek(p, 0);
-    if (pt->kind == TK_IDENT || pt->kind == TK_STRING) {
+    int pt_is_kw_ident = (pt->kind == TK_TYPE || pt->kind == TK_FROM ||
+                           pt->kind == TK_AS || pt->kind == TK_EXPORT ||
+                           pt->kind == TK_ASYNC || pt->kind == TK_AWAIT ||
+                           pt->kind == TK_PUB || pt->kind == TK_STATIC);
+    if (pt->kind == TK_IDENT || pt->kind == TK_STRING || pt_is_kw_ident) {
         if (pt->kind == TK_STRING) {
             /* import "math-utils" */
             path = xs_malloc(sizeof(char*));
@@ -3773,7 +3821,9 @@ static Node *parse_import(Parser *p) {
         } else {
             /* import math or import math-utils */
             char namebuf[512];
-            snprintf(namebuf, sizeof(namebuf), "%s", pt->sval ? pt->sval : "");
+            const char *spelling = pt->sval ? pt->sval :
+                                   (pt_is_kw_ident ? token_kind_name(pt->kind) : "");
+            snprintf(namebuf, sizeof(namebuf), "%s", spelling);
             pp_advance(p);
             /* absorb hyphen-ident sequences: math-utils, my-cool-lib */
             while (pp_peek(p, 0)->kind == TK_MINUS &&
@@ -3973,6 +4023,18 @@ static Node *parse_load_stmt(Parser *p) {
     n->load_.rename_vals = rename_vals;
     n->load_.nrenames = nrenames;
     n->load_.sandbox_flags = sandbox_flags;
+    n->load_.preloaded = 0;
+
+    /* Plugins routinely call plugin.lexer.add_keyword / plugin.parser.on_unknown
+       at top level, so anything they register has to be visible by the time we
+       parse the next statement. Hand the path off to the runtime callback
+       (interp.c sets it on startup) and mark the node so the runtime evaluator
+       does not re-execute the file a second time. Falls through harmlessly when
+       no callback is wired (e.g. tooling that lexes/parses without an Interp). */
+    if (g_parser_eager_load && path) {
+        if (g_parser_eager_load(path, p->filename) == 0)
+            n->load_.preloaded = 1;
+    }
     return n;
 }
 
