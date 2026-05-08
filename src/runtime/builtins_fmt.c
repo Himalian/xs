@@ -114,13 +114,28 @@ static Value *native_fmt_ordinal(Interp *ig, Value **a, int n) {
 static Value *native_fmt_pluralize(Interp *ig, Value **a, int n) {
     (void)ig;
     if (n<2) return xs_str("");
-    int64_t cnt=(VAL_TAG(a[0])==XS_INT)?VAL_INT(a[0]):(int64_t)a[0]->f;
-    const char *word=(VAL_TAG(a[1])==XS_STR)?a[1]->s:"";
-    const char *plural=(n>=3&&VAL_TAG(a[2])==XS_STR)?a[2]->s:NULL;
+    /* Accept either order -- (count, word) and (word, count) both
+       feel natural; readers shouldn't have to look up which one
+       this implementation chose. The plural form is the next string
+       arg if present. */
+    Value *count_v = NULL, *word_v = NULL, *plural_v = NULL;
+    for (int i = 0; i < n; i++) {
+        if (VAL_TAG(a[i]) == XS_INT || VAL_TAG(a[i]) == XS_FLOAT) {
+            if (!count_v) count_v = a[i];
+        } else if (VAL_TAG(a[i]) == XS_STR) {
+            if (!word_v) word_v = a[i];
+            else if (!plural_v) plural_v = a[i];
+        }
+    }
+    int64_t cnt = !count_v ? 0
+                : VAL_TAG(count_v) == XS_INT ? VAL_INT(count_v)
+                : (int64_t)count_v->f;
+    const char *word = word_v ? word_v->s : "";
+    const char *plural = plural_v ? plural_v->s : NULL;
     char buf[512];
-    if (cnt==1) snprintf(buf,sizeof(buf),"%lld %s",(long long)cnt,word);
-    else if (plural) snprintf(buf,sizeof(buf),"%lld %s",(long long)cnt,plural);
-    else snprintf(buf,sizeof(buf),"%lld %ss",(long long)cnt,word);
+    if (cnt == 1) snprintf(buf, sizeof(buf), "%lld %s", (long long)cnt, word);
+    else if (plural) snprintf(buf, sizeof(buf), "%lld %s", (long long)cnt, plural);
+    else snprintf(buf, sizeof(buf), "%lld %ss", (long long)cnt, word);
     return xs_str(buf);
 }
 static Value *native_fmt_sprintf(Interp *ig, Value **a, int n) {

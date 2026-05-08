@@ -1764,6 +1764,16 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
             return argc >= 1 ? value_incref(args[0]) : value_incref(XS_NULL_VAL);
         return value_incref(obj);
     }
+    /* to_str / to_string work on every value -- the type-specific
+       blocks below already implement these for str/array/num/bool;
+       the universal fallback lets bool/null/range/regex etc respond
+       too without a per-type stub. */
+    if (strcmp(method, "to_str") == 0 || strcmp(method, "to_string") == 0) {
+        char *s = value_str(obj);
+        Value *r = xs_str(s);
+        free(s);
+        return r;
+    }
 
     // --- string methods
     if (VAL_TAG(obj) == XS_STR) {
@@ -1785,9 +1795,15 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
             Value *v = xs_str(r); free(r); return v;
         }
         if (strcmp(method, "trim") == 0) {
-            int start=0, end=slen-1;
-            while (start<=end && isspace((unsigned char)s[start])) start++;
-            while (end>=start && isspace((unsigned char)s[end]))   end--;
+            const char *cs = (argc > 0 && VAL_TAG(args[0]) == XS_STR) ? args[0]->s : NULL;
+            int start = 0, end = slen - 1;
+            if (cs) {
+                while (start <= end && strchr(cs, s[start])) start++;
+                while (end >= start && strchr(cs, s[end]))   end--;
+            } else {
+                while (start <= end && isspace((unsigned char)s[start])) start++;
+                while (end >= start && isspace((unsigned char)s[end]))   end--;
+            }
             return xs_str_n(s+start, end-start+1);
         }
         if (strcmp(method, "starts_with") == 0 || strcmp(method, "startswith") == 0) {
@@ -1876,7 +1892,12 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
             if (endptr == s) return value_incref(XS_NULL_VAL);
             return xs_int(val);
         }
-        if (strcmp(method, "parse_float") == 0) { return xs_float(atof(s)); }
+        if (strcmp(method, "parse_float") == 0) {
+            char *endp = NULL;
+            double fv = strtod(s, &endp);
+            if (endp == s) return value_incref(XS_NULL_VAL);
+            return xs_float(fv);
+        }
         if (strcmp(method, "is_empty") == 0) {
             return slen==0?value_incref(XS_TRUE_VAL):value_incref(XS_FALSE_VAL);
         }
@@ -1926,16 +1947,27 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
         /* to_str / to_string */
         if (strcmp(method, "to_str") == 0 || strcmp(method, "to_string") == 0)
             return value_incref(obj);
-        /* trim_start / ltrim */
+        /* trim_start / ltrim: optional char-set arg trims those chars
+           instead of whitespace. */
         if (strcmp(method, "trim_start") == 0 || strcmp(method, "ltrim") == 0) {
-            int start=0;
-            while (start<slen && isspace((unsigned char)s[start])) start++;
+            const char *cs = (argc > 0 && VAL_TAG(args[0]) == XS_STR) ? args[0]->s : NULL;
+            int start = 0;
+            if (cs) {
+                while (start < slen && strchr(cs, s[start])) start++;
+            } else {
+                while (start < slen && isspace((unsigned char)s[start])) start++;
+            }
             return xs_str(s+start);
         }
-        /* trim_end / rtrim */
+        /* trim_end / rtrim: same convention */
         if (strcmp(method, "trim_end") == 0 || strcmp(method, "rtrim") == 0) {
-            int end=slen-1;
-            while (end>=0 && isspace((unsigned char)s[end])) end--;
+            const char *cs = (argc > 0 && VAL_TAG(args[0]) == XS_STR) ? args[0]->s : NULL;
+            int end = slen - 1;
+            if (cs) {
+                while (end >= 0 && strchr(cs, s[end])) end--;
+            } else {
+                while (end >= 0 && isspace((unsigned char)s[end])) end--;
+            }
             return xs_str_n(s, end+1);
         }
         /* lines: split by \n */
@@ -2144,21 +2176,50 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
         }
         /* format: "Hello {} and {}".format(a, b): substitute {} placeholders */
         if (strcmp(method, "format") == 0) {
-            /* Build result by replacing {} with successive args */
+            /* {} consumes args in order; {N} pulls a specific
+               positional arg (allowing repeats and reordering). {{
+               and }} are the literal-brace escapes. Useful on raw
+               strings so the regular interpolation pass doesn't eat
+               the placeholders first. */
             int cap = slen + 256;
             char *res = xs_malloc(cap); int ri = 0; int ai = 0;
             for (int j = 0; j < slen; j++) {
-                if (s[j] == '{' && j+1 < slen && s[j+1] == '}') {
-                    char *rep = NULL;
-                    if (ai < argc) { rep = value_str(args[ai++]); }
-                    else { rep = xs_strdup(""); }
+                if (s[j] == '{' && j+1 < slen && s[j+1] == '{') {
+                    if (ri + 2 >= cap) { cap *= 2; res = realloc(res, cap); }
+                    res[ri++] = '{'; j++;
+                } else if (s[j] == '}' && j+1 < slen && s[j+1] == '}') {
+                    if (ri + 2 >= cap) { cap *= 2; res = realloc(res, cap); }
+                    res[ri++] = '}'; j++;
+                } else if (s[j] == '{' && j+1 < slen) {
+                    /* find matching '}' so we can read an optional
+                       index. Stay at depth 1: we don't recurse. */
+                    int k = j + 1;
+                    while (k < slen && s[k] != '}') k++;
+                    if (k >= slen) {
+                        if (ri + 2 >= cap) { cap *= 2; res = realloc(res, cap); }
+                        res[ri++] = s[j];
+                        continue;
+                    }
+                    int idx = -1;
+                    if (k > j + 1) {
+                        char ibuf[32]; int il = k - j - 1;
+                        if (il < (int)sizeof(ibuf)) {
+                            memcpy(ibuf, s + j + 1, il); ibuf[il] = '\0';
+                            char *endp = NULL;
+                            long v = strtol(ibuf, &endp, 10);
+                            if (endp && *endp == '\0') idx = (int)v;
+                        }
+                    }
+                    if (idx < 0) idx = ai++;
+                    char *rep = (idx >= 0 && idx < argc) ?
+                                 value_str(args[idx]) : xs_strdup("");
                     int rlen = (int)strlen(rep);
-                    while (ri + rlen + 1 >= cap) { cap *= 2; char *tmp = realloc(res, cap); if (!tmp) { free(res); free(rep); return xs_str("<oom>"); } res = tmp; }
+                    while (ri + rlen + 1 >= cap) { cap *= 2; res = realloc(res, cap); }
                     memcpy(res + ri, rep, rlen); ri += rlen;
                     free(rep);
-                    j++; /* skip '}' */
+                    j = k;
                 } else {
-                    if (ri + 2 >= cap) { cap *= 2; char *tmp = realloc(res, cap); if (!tmp) { free(res); return xs_str("<oom>"); } res = tmp; }
+                    if (ri + 2 >= cap) { cap *= 2; res = realloc(res, cap); }
                     res[ri++] = s[j];
                 }
             }
@@ -2533,6 +2594,22 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
                 else if(VAL_TAG(arr->items[j])==XS_INT) si+=VAL_INT(arr->items[j]);
             }
             return is_f?xs_float(sf+(double)si):xs_int(si);
+        }
+        if (strcmp(method, "to_map") == 0) {
+            /* Array of (key, value) tuples -> map. zip().to_map() is
+               the natural way to build a map from two parallel arrays. */
+            Value *res = xs_map_new();
+            for (int j = 0; j < arr->len; j++) {
+                Value *p = arr->items[j];
+                if (!p || (VAL_TAG(p) != XS_TUPLE && VAL_TAG(p) != XS_ARRAY) ||
+                    !p->arr || p->arr->len < 2) continue;
+                Value *k = p->arr->items[0];
+                if (!k) continue;
+                char *ks = value_str(k);
+                map_set(res->map, ks, value_incref(p->arr->items[1]));
+                free(ks);
+            }
+            return res;
         }
         if (strcmp(method, "avg") == 0 || strcmp(method, "mean") == 0) {
             if (arr->len == 0) return xs_float(0.0);
@@ -3283,7 +3360,8 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
             }
             free(ks); return arr;
         }
-        if (strcmp(method, "entries") == 0 || strcmp(method, "items") == 0) {
+        if (strcmp(method, "entries") == 0 || strcmp(method, "items") == 0 ||
+            strcmp(method, "to_array") == 0 || strcmp(method, "to_pairs") == 0) {
             int nk=0; char **ks=map_keys(m,&nk);
             Value *arr=xs_array_new();
             for (int j=0;j<nk;j++) {
@@ -3297,7 +3375,8 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
             free(ks); return arr;
         }
         if (strcmp(method, "has") == 0 || strcmp(method, "contains_key") == 0 ||
-            strcmp(method, "has_key") == 0) {
+            strcmp(method, "has_key") == 0 || strcmp(method, "contains") == 0 ||
+            strcmp(method, "includes") == 0) {
             if (argc<1||VAL_TAG(args[0])!=XS_STR) return value_incref(XS_FALSE_VAL);
             return map_has(m,args[0]->s)?value_incref(XS_TRUE_VAL):value_incref(XS_FALSE_VAL);
         }
@@ -4694,8 +4773,22 @@ static Value *eval_binop(Interp *i, Node *n) {
             match = (strcmp(left->st->type_name, tname) == 0);
         else if (VAL_TAG(left) == XS_ENUM_VAL && left->en)
             match = (strcmp(left->en->type_name, tname) == 0);
-        else if (VAL_TAG(left) == XS_INST && left->inst && left->inst->class_)
-            match = (strcmp(left->inst->class_->name, tname) == 0);
+        else if (VAL_TAG(left) == XS_INST && left->inst && left->inst->class_) {
+            /* Walk the inheritance chain so `dog is Animal` is true
+               when Dog : Animal. */
+            XSClass *c = left->inst->class_;
+            XSClass *stack[64]; int sp = 0;
+            stack[sp++] = c;
+            while (sp > 0) {
+                XSClass *cur = stack[--sp];
+                if (cur && cur->name && strcmp(cur->name, tname) == 0) {
+                    match = 1; break;
+                }
+                if (cur)
+                    for (int b = 0; b < cur->nbases && sp < 64; b++)
+                        if (cur->bases[b]) stack[sp++] = cur->bases[b];
+            }
+        }
         result = match ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL);
         goto done;
     }
@@ -5043,7 +5136,11 @@ Value *interp_eval(Interp *i, Node *n) {
                 piece = xs_strdup(part->lit_string.sval ? part->lit_string.sval : "");
             } else {
                 Value *v = EVAL(i, part);
-                piece = value_str(v);
+                /* Use inst_to_str so user-defined __str__ runs inside
+                   interpolated strings: `"got: {v}"` mirrors `str(v)`
+                   semantics on the same object. */
+                extern char *inst_to_str_export(Interp *, Value *, int);
+                piece = inst_to_str_export(i, v, 0);
                 value_decref(v);
             }
             int plen = (int)strlen(piece);

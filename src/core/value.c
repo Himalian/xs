@@ -456,7 +456,23 @@ static char *duration_repr(int64_t ns) {
 }
 
 /* repr */
+/* Recursion guard for value_repr -- a class hierarchy where the
+   instance map's __bases / methods refer back into the type hierarchy
+   used to drive value_repr into unbounded recursion and segfault.
+   Bound the depth and emit "..." past the cap. 64 is far below any
+   realistic nesting and well under typical stack budgets. */
+static __thread int g_repr_depth = 0;
+static char *value_repr_inner(Value *v);
+
 char *value_repr(Value *v) {
+    if (g_repr_depth > 64) return xs_strdup("...");
+    g_repr_depth++;
+    char *r = value_repr_inner(v);
+    g_repr_depth--;
+    return r;
+}
+
+static char *value_repr_inner(Value *v) {
     if (!v) return xs_strdup("null");
     char buf[64];
     switch (VAL_TAG(v)) {
@@ -591,10 +607,30 @@ char *value_repr(Value *v) {
                     return out;
                 }
             }
+            /* Class/struct instances are XS_MAP tagged with __type. Print
+               them as `Foo { x: 1 }` and skip the implementation-detail
+               keys (__type, __bases, super). Without this the repr
+               leaked the inheritance graph and triggered cycles. */
+            int is_inst = 0;
+            const char *inst_name = NULL;
+            if (v->map) {
+                Value *type_v = map_get(v->map, "__type");
+                if (type_v && VAL_TAG(type_v) == XS_STR && type_v->s && type_v->s[0]) {
+                    is_inst = 1;
+                    inst_name = type_v->s;
+                }
+            }
             size_t sz = 64;
             char *out = xs_malloc(sz);
             size_t pos = 0;
-            out[pos++] = '{';
+            if (is_inst) {
+                size_t nl = strlen(inst_name);
+                while (pos + nl + 4 >= sz) { sz *= 2; out = xs_realloc(out, sz); }
+                memcpy(out + pos, inst_name, nl); pos += nl;
+                out[pos++] = ' '; out[pos++] = '{';
+            } else {
+                out[pos++] = '{';
+            }
             if (v->map) {
                 int first = 1;
                 /* Walk in insertion order so str/repr matches what
@@ -602,10 +638,23 @@ char *value_repr(Value *v) {
                 for (int oi = 0; oi < v->map->len; oi++) {
                     int i = v->map->order[oi];
                     if (i < 0 || i >= v->map->cap || !v->map->keys[i]) continue;
+                    if (is_inst) {
+                        const char *k = v->map->keys[i];
+                        if (strcmp(k, "__type") == 0 || strcmp(k, "__bases") == 0 ||
+                            strcmp(k, "__name") == 0 || strcmp(k, "super") == 0) continue;
+                        /* Skip method values: they're stored on the
+                           instance map alongside fields but are
+                           implementation detail in repr. */
+                        Value *mv = v->map->vals[i];
+                        if (mv && (VAL_TAG(mv) == XS_CLOSURE ||
+                                   VAL_TAG(mv) == XS_FUNC ||
+                                   VAL_TAG(mv) == XS_NATIVE)) continue;
+                    }
                     char *val_s = value_repr(v->map->vals[i]);
                     size_t needed = strlen(v->map->keys[i]) + strlen(val_s) + 8;
                     while (pos + needed >= sz) { sz *= 2; out = xs_realloc(out, sz); }
                     if (!first) { out[pos++] = ','; out[pos++] = ' '; }
+                    else if (is_inst) { out[pos++] = ' '; }
                     first = 0;
                     size_t kl = strlen(v->map->keys[i]);
                     memcpy(out+pos, v->map->keys[i], kl); pos += kl;
@@ -613,6 +662,10 @@ char *value_repr(Value *v) {
                     size_t vl = strlen(val_s);
                     memcpy(out+pos, val_s, vl); pos += vl;
                     free(val_s);
+                }
+                if (is_inst && !first) {
+                    while (pos + 2 >= sz) { sz *= 2; out = xs_realloc(out, sz); }
+                    out[pos++] = ' ';
                 }
             }
             while (pos + 2 >= sz) { sz *= 2; out = xs_realloc(out, sz); }

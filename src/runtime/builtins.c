@@ -87,7 +87,30 @@ void xs_set_user_args(int argc, char **argv) {
 #define M_TAU  6.28318530717958647692
 #endif
 
+char *inst_to_str_export(Interp *interp, Value *v, int repr_mode);
+
 static char *inst_to_str(Interp *interp, Value *v, int repr_mode) {
+    /* The vm stores class instances as XS_MAP {__type: "Foo", ...} so
+       __str__ / __repr__ / to_string have to be looked up on the map.
+       Without this, vm-mode println(some_instance) skipped over
+       user-defined __str__ and printed the raw map repr. */
+    if (v && VAL_TAG(v) == XS_MAP && v->map &&
+        map_get(v->map, "__type")) {
+        const char *mname = repr_mode ? "__repr__" : "__str__";
+        Value *fn = map_get(v->map, mname);
+        if (!fn && !repr_mode) fn = map_get(v->map, "to_string");
+        if (fn && (VAL_TAG(fn) == XS_FUNC || VAL_TAG(fn) == XS_CLOSURE ||
+                   VAL_TAG(fn) == XS_NATIVE)) {
+            Value *call_args[1] = { v };
+            Value *result = call_value(interp, fn, call_args, 1, mname);
+            if (result && VAL_TAG(result) == XS_STR) {
+                char *s = xs_strdup(result->s);
+                value_decref(result);
+                return s;
+            }
+            if (result) value_decref(result);
+        }
+    }
     if (VAL_TAG(v) == XS_INST && v->inst) {
         const char *mname = repr_mode ? "__repr__" : "__str__";
         Value *fn = map_get(v->inst->methods, mname);
@@ -126,6 +149,10 @@ static char *inst_to_str(Interp *interp, Value *v, int repr_mode) {
         }
     }
     return repr_mode ? value_repr(v) : value_str(v);
+}
+
+char *inst_to_str_export(Interp *interp, Value *v, int repr_mode) {
+    return inst_to_str(interp, v, repr_mode);
 }
 
 static Value *builtin_print_impl(Interp *i, Value **args, int argc, int with_newline) {
@@ -245,7 +272,16 @@ static Value *builtin_type(Interp *i, Value **args, int argc) {
     case XS_CHAR:   return xs_str("char");
     case XS_ARRAY:  return xs_str("array");
     case XS_TUPLE:  return xs_str("tuple");
-    case XS_MAP:    return xs_str("map");
+    case XS_MAP: {
+        /* The VM stores struct/class instances as XS_MAP tagged with
+           __type so the constructor can be a map literal. Return the
+           tagged type name so `type(Foo())` is "Foo" on every backend
+           rather than "map" under --vm and "Foo" under --interp. */
+        Value *tn = args[0]->map ? map_get(args[0]->map, "__type") : NULL;
+        if (tn && VAL_TAG(tn) == XS_STR && tn->s && tn->s[0])
+            return xs_str(tn->s);
+        return xs_str("map");
+    }
     case XS_FUNC:   return xs_str("fn");
     case XS_NATIVE: return xs_str("fn");
     case XS_CLOSURE: return xs_str("fn");

@@ -75,10 +75,11 @@ static Upvalue *capture_upvalue(VM *vm, Value **slot) {
 
 /* stdlib functions */
 
+extern char *inst_to_str_export(Interp *interp, Value *v, int repr_mode);
+
 static Value *vm_println(Interp *interp, Value **args, int argc) {
-    (void)interp;
     for (int i = 0; i < argc; i++) {
-        char *s = value_str(args[i]);
+        char *s = inst_to_str_export(interp, args[i], 0);
         if (i) printf(" ");
         printf("%s", s);
         free(s);
@@ -88,9 +89,8 @@ static Value *vm_println(Interp *interp, Value **args, int argc) {
 }
 
 static Value *vm_print(Interp *interp, Value **args, int argc) {
-    (void)interp;
     for (int i = 0; i < argc; i++) {
-        char *s = value_str(args[i]);
+        char *s = inst_to_str_export(interp, args[i], 0);
         if (i) printf(" ");
         printf("%s", s);
         free(s);
@@ -113,9 +113,11 @@ static Value *vm_len(Interp *interp, Value **args, int argc) {
 }
 
 static Value *vm_str(Interp *interp, Value **args, int argc) {
-    (void)interp;
     if (argc < 1) return xs_str("");
-    char *s = value_str(args[0]);
+    /* Honour user-defined __str__ on class/struct instances; falls
+       through to value_str for everything else. Used by interpolation
+       (`"v = {v}"`), str(), and println. */
+    char *s = inst_to_str_export(interp, args[0], 0);
     Value *r = xs_str(s);
     free(s);
     return r;
@@ -220,6 +222,14 @@ static Value *vm_type(Interp *interp, Value **args, int argc) {
         "fn", /* closure */
     };
     int tag = (int)VAL_TAG(args[0]);
+    /* Class/struct instances are stored as XS_MAP tagged with __type
+       in the VM. Surface the type name so type(Foo()) is "Foo" rather
+       than "map", matching --interp's XS_INST handling. */
+    if (tag == XS_MAP && args[0]->map) {
+        Value *tn = map_get(args[0]->map, "__type");
+        if (tn && VAL_TAG(tn) == XS_STR && tn->s && tn->s[0])
+            return xs_str(tn->s);
+    }
     return xs_str(tag >= 0 && tag < (int)(sizeof names/sizeof *names) ? names[tag] : "?");
 }
 
@@ -2881,7 +2891,8 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                 Value *yields = map_get(iter->map, "_yields");
                 r = xs_int(yields && VAL_TAG(yields) == XS_ARRAY ? yields->arr->len : 0);
             }
-            else if (VAL_TAG(iter)==XS_MAP && map_get(iter->map, "_chan_id") &&
+            else if ((VAL_TAG(iter)==XS_MAP || VAL_TAG(iter)==XS_MODULE) &&
+                     iter->map && map_get(iter->map, "_chan_id") &&
                      VAL_TAG(map_get(iter->map, "_chan_id")) == XS_INT) {
                 /* Channel: report INT64_MAX so the loop's idx<len check
                    never aborts the iteration prematurely. ITER_GET does
@@ -2921,8 +2932,8 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                     r = value_incref(yields->arr->items[i]);
                 else
                     r = value_incref(XS_NULL_VAL);
-            } else if (VAL_TAG(iter)==XS_MAP && iter->map &&
-                       map_get(iter->map, "_chan_id") &&
+            } else if ((VAL_TAG(iter)==XS_MAP || VAL_TAG(iter)==XS_MODULE) &&
+                       iter->map && map_get(iter->map, "_chan_id") &&
                        VAL_TAG(map_get(iter->map, "_chan_id")) == XS_INT) {
                 /* Channel iteration: blocking recv until the producer
                    closes the channel. Returns null only when the buffer
@@ -2990,6 +3001,22 @@ static int vm_dispatch(VM *vm, int stop_frame) {
             uint8_t mc_cached_is_module = 0;
             uint8_t mc_cached_needs_self = 0;
             int mc_cache_hit = 0;
+
+            /* Universal to_str / to_string: works on every value (incl.
+               instances stored as XS_MAP{__type}). Inserted before the
+               XS_MAP/XS_MODULE method-resolution path so a class without
+               an explicit __str__ still gets a sensible string instead
+               of "no method to_str". */
+            if ((strcmp(mc_name, "to_str") == 0 || strcmp(mc_name, "to_string") == 0) &&
+                VAL_TAG(mc_obj) != XS_INST) {
+                char *s = inst_to_str_export(NULL, mc_obj, 0);
+                Value *r = xs_str(s);
+                free(s);
+                for (int j = 0; j < mc_argc; j++) value_decref(POP());
+                value_decref(POP());
+                PUSH(r);
+                break;
+            }
 
             if (VAL_TAG(mc_obj) == XS_MAP || VAL_TAG(mc_obj) == XS_MODULE) {
                 /* hot path: the cache already has the resolved callable
@@ -3081,7 +3108,8 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                             array_push(arr->arr,value_incref(mc_obj->map->vals[bi]));
                     }
                     mc_result=arr;
-                } else if (strcmp(mc_name,"entries")==0) {
+                } else if (strcmp(mc_name,"entries")==0||strcmp(mc_name,"items")==0||
+                           strcmp(mc_name,"to_array")==0||strcmp(mc_name,"to_pairs")==0) {
                     Value *arr=xs_array_new();
                     for(int oi=0; oi < mc_obj->map->len; oi++) {
                         int bi = mc_obj->map->order[oi];
@@ -3141,7 +3169,9 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                         mc_result = xs_int(buf && VAL_TAG(buf) == XS_ARRAY ? buf->arr->len : 0);
                     } else
                     mc_result=xs_int(mc_obj->map->len);
-                } else if (strcmp(mc_name,"has")==0||strcmp(mc_name,"contains_key")==0) {
+                } else if (strcmp(mc_name,"has")==0||strcmp(mc_name,"contains_key")==0||
+                           strcmp(mc_name,"has_key")==0||strcmp(mc_name,"contains")==0||
+                           strcmp(mc_name,"includes")==0) {
                     mc_result=(mc_argc>=1&&VAL_TAG(mc_args[0])==XS_STR&&map_get(mc_obj->map,mc_args[0]->s))
                         ? value_incref(XS_TRUE_VAL) : value_incref(XS_FALSE_VAL);
                 } else if (strcmp(mc_name,"get")==0&&mc_argc>=1&&VAL_TAG(mc_args[0])==XS_STR) {
@@ -3427,6 +3457,15 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                                 (VAL_TAG(mc_obj) == XS_MAP && !map_get(mc_obj->map, "__type") &&
                                  !map_get(mc_obj->map, "__methods") && !map_get(mc_obj->map, "__fields") &&
                                  !map_get(mc_obj->map, "__self"));
+                            /* async.channel() / async.signal() return an
+                               XS_MODULE whose methods (send/recv/close)
+                               must still see the channel itself as the
+                               first arg. Drop the module flag when the
+                               receiver carries a channel id so the
+                               native gets ch as a[0]. */
+                            if (is_module_call && mc_obj->map &&
+                                map_get(mc_obj->map, "_chan_id"))
+                                is_module_call = 0;
                             /* `super` proxy: has __self pointing at the
                                real instance. The dispatch path below
                                will swap it in for self before calling. */
@@ -3585,6 +3624,11 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                                                : value_incref(XS_NULL_VAL);
                 else mc_result = value_incref(mc_obj);
             }
+            else if (strcmp(mc_name,"to_str")==0||strcmp(mc_name,"to_string")==0) {
+                char *s = value_str(mc_obj);
+                mc_result = xs_str(s);
+                free(s);
+            }
             else if (VAL_TAG(mc_obj) == XS_STR) {
                 const char *s = mc_obj->s;
                 int slen = (int)strlen(s);
@@ -3605,11 +3649,20 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                 } else if (strcmp(mc_name,"trim")==0) {
                     if (slen == 0) { mc_result = xs_str(""); }
                     else {
-                    const char *p2=s; while(*p2==' '||*p2=='\t'||*p2=='\n'||*p2=='\r') p2++;
-                    const char *e2=s+slen-1;
-                    while(e2>p2&&(*e2==' '||*e2=='\t'||*e2=='\n'||*e2=='\r')) e2--;
-                    size_t n2=(size_t)(e2-p2+1); char *r=xs_malloc(n2+1);
-                    memcpy(r,p2,n2); r[n2]='\0'; mc_result=xs_str(r); free(r);
+                    const char *cs = (mc_argc > 0 && VAL_TAG(mc_args[0]) == XS_STR) ? mc_args[0]->s : NULL;
+                    const char *p2 = s;
+                    const char *e2 = s + slen - 1;
+                    if (cs) {
+                        while (*p2 && strchr(cs, *p2)) p2++;
+                        while (e2 > p2 && strchr(cs, *e2)) e2--;
+                    } else {
+                        while (*p2==' '||*p2=='\t'||*p2=='\n'||*p2=='\r') p2++;
+                        while (e2>p2&&(*e2==' '||*e2=='\t'||*e2=='\n'||*e2=='\r')) e2--;
+                    }
+                    size_t n2 = (e2 >= p2) ? (size_t)(e2-p2+1) : 0;
+                    char *r = xs_malloc(n2+1);
+                    memcpy(r, p2, n2); r[n2]='\0';
+                    mc_result = xs_str(r); free(r);
                     }
                 } else if (strcmp(mc_name,"contains")==0||strcmp(mc_name,"includes")==0) {
                     mc_result = (mc_argc>=1&&VAL_TAG(mc_args[0])==XS_STR&&strstr(s,mc_args[0]->s))
@@ -3670,9 +3723,24 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                     while(wpos+rest+1>cap){cap*=2;buf=xs_realloc(buf,cap);}
                     memcpy(buf+wpos,p3,rest); buf[wpos+rest]='\0';
                     mc_result=xs_str(buf); free(buf);
-                } else if (strcmp(mc_name,"parse_int")==0||strcmp(mc_name,"to_int")==0)
+                } else if (strcmp(mc_name,"parse_int")==0) {
+                    /* Match interp's contract: null on bad input,
+                       optional base arg (default 10). The to_int alias
+                       keeps the lossy atoll fallback so the packages
+                       that already lean on `s.to_int() > 0` don't
+                       suddenly start crashing on null. */
+                    int base = (mc_argc > 0 && VAL_TAG(mc_args[0]) == XS_INT)
+                               ? (int)VAL_INT(mc_args[0]) : 10;
+                    char *endp = NULL;
+                    long long iv = strtoll(s, &endp, base);
+                    mc_result = (endp == s) ? value_incref(XS_NULL_VAL) : xs_int(iv);
+                } else if (strcmp(mc_name,"to_int")==0)
                     mc_result=xs_int(atoll(s));
-                else if (strcmp(mc_name,"parse_float")==0||strcmp(mc_name,"to_float")==0)
+                else if (strcmp(mc_name,"parse_float")==0) {
+                    char *endp = NULL;
+                    double fv = strtod(s, &endp);
+                    mc_result = (endp == s) ? value_incref(XS_NULL_VAL) : xs_float(fv);
+                } else if (strcmp(mc_name,"to_float")==0)
                     mc_result=xs_float(atof(s));
                 else if (strcmp(mc_name,"index_of")==0) {
                     mc_result=xs_int(-1);
@@ -3771,12 +3839,18 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                         buf[wpos]='\0'; mc_result=xs_str(buf); free(buf);
                     } else mc_result=value_incref(XS_NULL_VAL);
                 } else if (strcmp(mc_name,"trim_start")==0||strcmp(mc_name,"ltrim")==0) {
-                    const char *p2=s; while(*p2==' '||*p2=='\t'||*p2=='\n'||*p2=='\r') p2++;
-                    mc_result=xs_str(p2);
+                    const char *cs = (mc_argc > 0 && VAL_TAG(mc_args[0]) == XS_STR) ? mc_args[0]->s : NULL;
+                    const char *p2 = s;
+                    if (cs) while (*p2 && strchr(cs, *p2)) p2++;
+                    else    while (*p2==' '||*p2=='\t'||*p2=='\n'||*p2=='\r') p2++;
+                    mc_result = xs_str(p2);
                 } else if (strcmp(mc_name,"trim_end")==0||strcmp(mc_name,"rtrim")==0) {
-                    char *r=xs_strdup(s); int rlen=(int)strlen(r);
-                    while(rlen>0&&(r[rlen-1]==' '||r[rlen-1]=='\t'||r[rlen-1]=='\n'||r[rlen-1]=='\r')) rlen--;
-                    r[rlen]='\0'; mc_result=xs_str(r); free(r);
+                    const char *cs = (mc_argc > 0 && VAL_TAG(mc_args[0]) == XS_STR) ? mc_args[0]->s : NULL;
+                    char *r = xs_strdup(s); int rlen = (int)strlen(r);
+                    if (cs) while (rlen > 0 && strchr(cs, r[rlen-1])) rlen--;
+                    else    while (rlen > 0 && (r[rlen-1]==' '||r[rlen-1]=='\t'||r[rlen-1]=='\n'||r[rlen-1]=='\r')) rlen--;
+                    r[rlen]='\0';
+                    mc_result = xs_str(r); free(r);
                 } else if (strcmp(mc_name,"title")==0) {
                     char *r=xs_strdup(s); int prev_space=1;
                     for(int j=0;r[j];j++){
@@ -3948,40 +4022,53 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                         if(fnd){value_decref(mc_result);mc_result=xs_int((int64_t)(fnd-s));}
                     }
                 } else if (strcmp(mc_name,"format")==0) {
-                    /* simple sprintf-style: replace %s/%d/%f with args in order */
-                    size_t cap=strlen(s)*2+64; char *buf=xs_malloc(cap); size_t wpos=0;
-                    const char *p2=s; int ai=0;
-                    while(*p2){
-                        if(*p2=='%'&&*(p2+1)){
-                            char spec=*(p2+1);
-                            if(spec=='s'||spec=='d'||spec=='f'||spec=='i'){
-                                char tmp[64]; tmp[0]='\0';
-                                if(ai<mc_argc){
-                                    if(spec=='s'){
-                                        char *sv=value_str(mc_args[ai]);
-                                        size_t svl=strlen(sv);
-                                        while(wpos+svl+1>cap){cap*=2;buf=xs_realloc(buf,cap);}
-                                        memcpy(buf+wpos,sv,svl); wpos+=svl; free(sv); ai++;
-                                        p2+=2; continue;
-                                    } else if((spec=='d'||spec=='i')&&VAL_TAG(mc_args[ai])==XS_INT){
-                                        snprintf(tmp,sizeof(tmp),"%lld",(long long)VAL_INT(mc_args[ai])); ai++;
-                                    } else if(spec=='f'&&VAL_TAG(mc_args[ai])==XS_FLOAT){
-                                        snprintf(tmp,sizeof(tmp),"%g",mc_args[ai]->f); ai++;
-                                    } else if((spec=='d'||spec=='i')&&VAL_TAG(mc_args[ai])==XS_FLOAT){
-                                        snprintf(tmp,sizeof(tmp),"%lld",(long long)mc_args[ai]->f); ai++;
-                                    } else if(spec=='f'&&VAL_TAG(mc_args[ai])==XS_INT){
-                                        snprintf(tmp,sizeof(tmp),"%g",(double)VAL_INT(mc_args[ai])); ai++;
-                                    }
-                                }
-                                size_t tl=strlen(tmp);
-                                while(wpos+tl+1>cap){cap*=2;buf=xs_realloc(buf,cap);}
-                                memcpy(buf+wpos,tmp,tl); wpos+=tl; p2+=2; continue;
+                    /* {} consumes the next arg, {N} pulls positional N,
+                       {{ and }} escape literal braces. Mirrors interp. */
+                    size_t cap = strlen(s) * 2 + 64;
+                    char *buf = xs_malloc(cap);
+                    size_t wpos = 0;
+                    int ai = 0;
+                    int slen2 = (int)strlen(s);
+                    for (int j = 0; j < slen2; j++) {
+                        if (s[j] == '{' && j+1 < slen2 && s[j+1] == '{') {
+                            while (wpos + 2 > cap) { cap *= 2; buf = xs_realloc(buf, cap); }
+                            buf[wpos++] = '{'; j++;
+                        } else if (s[j] == '}' && j+1 < slen2 && s[j+1] == '}') {
+                            while (wpos + 2 > cap) { cap *= 2; buf = xs_realloc(buf, cap); }
+                            buf[wpos++] = '}'; j++;
+                        } else if (s[j] == '{' && j+1 < slen2) {
+                            int k = j + 1;
+                            while (k < slen2 && s[k] != '}') k++;
+                            if (k >= slen2) {
+                                while (wpos + 2 > cap) { cap *= 2; buf = xs_realloc(buf, cap); }
+                                buf[wpos++] = s[j];
+                                continue;
                             }
+                            int idx = -1;
+                            if (k > j + 1) {
+                                char ibuf[32]; int il = k - j - 1;
+                                if (il < (int)sizeof(ibuf)) {
+                                    memcpy(ibuf, s + j + 1, il); ibuf[il] = '\0';
+                                    char *endp = NULL;
+                                    long iv = strtol(ibuf, &endp, 10);
+                                    if (endp && *endp == '\0') idx = (int)iv;
+                                }
+                            }
+                            if (idx < 0) idx = ai++;
+                            char *rep = (idx >= 0 && idx < mc_argc) ?
+                                         value_str(mc_args[idx]) : xs_strdup("");
+                            size_t rl = strlen(rep);
+                            while (wpos + rl + 1 > cap) { cap *= 2; buf = xs_realloc(buf, cap); }
+                            memcpy(buf + wpos, rep, rl); wpos += rl;
+                            free(rep);
+                            j = k;
+                        } else {
+                            while (wpos + 2 > cap) { cap *= 2; buf = xs_realloc(buf, cap); }
+                            buf[wpos++] = s[j];
                         }
-                        while(wpos+2>cap){cap*=2;buf=xs_realloc(buf,cap);}
-                        buf[wpos++]=*p2++;
                     }
-                    buf[wpos]='\0'; mc_result=xs_str(buf); free(buf);
+                    buf[wpos] = '\0';
+                    mc_result = xs_str(buf); free(buf);
                 } else if (strcmp(mc_name,"as_int")==0)
                     mc_result=xs_int(atoll(s));
                 else if (strcmp(mc_name,"as_float")==0)
@@ -4226,6 +4313,19 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                         else if(VAL_TAG(mc_obj->arr->items[j])==XS_FLOAT){sf+=mc_obj->arr->items[j]->f;is_float=1;}
                     }
                     mc_result=is_float?xs_float(sf+(double)si):xs_int(si);
+                } else if (strcmp(mc_name,"to_map")==0) {
+                    Value *res = xs_map_new();
+                    for (int j = 0; j < mc_obj->arr->len; j++) {
+                        Value *p = mc_obj->arr->items[j];
+                        if (!p || (VAL_TAG(p) != XS_TUPLE && VAL_TAG(p) != XS_ARRAY) ||
+                            !p->arr || p->arr->len < 2) continue;
+                        Value *k = p->arr->items[0];
+                        if (!k) continue;
+                        char *ks = value_str(k);
+                        map_set(res->map, ks, value_incref(p->arr->items[1]));
+                        free(ks);
+                    }
+                    mc_result = res;
                 } else if (strcmp(mc_name,"avg")==0||strcmp(mc_name,"mean")==0) {
                     if (mc_obj->arr->len == 0) mc_result = xs_float(0.0);
                     else {
@@ -6302,7 +6402,51 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                              VAL_TAG(left) == XS_STRUCT_VAL || VAL_TAG(left) == XS_INST);
                 else if (VAL_TAG(left) == XS_STRUCT_VAL && left->st) match = (strcmp(left->st->type_name, t) == 0);
                 else if (VAL_TAG(left) == XS_ENUM_VAL && left->en) match = (strcmp(left->en->type_name, t) == 0);
-                else if (VAL_TAG(left) == XS_INST && left->inst && left->inst->class_) match = (strcmp(left->inst->class_->name, t) == 0);
+                else if (VAL_TAG(left) == XS_INST && left->inst && left->inst->class_) {
+                    XSClass *c = left->inst->class_;
+                    XSClass *stack[64]; int sp = 0;
+                    stack[sp++] = c;
+                    while (sp > 0) {
+                        XSClass *cur = stack[--sp];
+                        if (cur && cur->name && strcmp(cur->name, t) == 0) {
+                            match = 1; break;
+                        }
+                        if (cur)
+                            for (int b = 0; b < cur->nbases && sp < 64; b++)
+                                if (cur->bases[b]) stack[sp++] = cur->bases[b];
+                    }
+                }
+                /* vm-side classes live as XS_MAP{__type, __bases}: each
+                   entry in __bases is a class-def map with __name and
+                   its own __bases. Walk transitively so `puppy is Animal`
+                   sees Dog -> Animal. Cap at 64 to dodge cycles in the
+                   rare case the runtime mis-builds the chain. */
+                else if (VAL_TAG(left) == XS_MAP && left->map) {
+                    Value *tn = map_get(left->map, "__type");
+                    if (tn && VAL_TAG(tn) == XS_STR && tn->s &&
+                        strcmp(tn->s, t) == 0) {
+                        match = 1;
+                    } else {
+                        Value *queue[64]; int qhead = 0, qtail = 0;
+                        Value *bases = map_get(left->map, "__bases");
+                        if (bases && VAL_TAG(bases) == XS_ARRAY && bases->arr) {
+                            for (int b = 0; b < bases->arr->len && qtail < 64; b++)
+                                if (bases->arr->items[b]) queue[qtail++] = bases->arr->items[b];
+                        }
+                        while (qhead < qtail && !match) {
+                            Value *base = queue[qhead++];
+                            if (!base || VAL_TAG(base) != XS_MAP || !base->map) continue;
+                            Value *bn = map_get(base->map, "__name");
+                            if (bn && VAL_TAG(bn) == XS_STR && bn->s &&
+                                strcmp(bn->s, t) == 0) { match = 1; break; }
+                            Value *bb = map_get(base->map, "__bases");
+                            if (bb && VAL_TAG(bb) == XS_ARRAY && bb->arr) {
+                                for (int b = 0; b < bb->arr->len && qtail < 64; b++)
+                                    if (bb->arr->items[b]) queue[qtail++] = bb->arr->items[b];
+                            }
+                        }
+                    }
+                }
             }
             value_decref(left); value_decref(right);
             PUSH(xs_bool(match));
