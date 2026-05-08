@@ -1851,7 +1851,7 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
             }
             return arr;
         }
-        if (strcmp(method, "replace") == 0) {
+        if (strcmp(method, "replace") == 0 || strcmp(method, "replace_all") == 0) {
             if (argc < 2) return value_incref(obj);
             const char *from = (VAL_TAG(args[0])==XS_STR)?args[0]->s:"";
             const char *to   = (VAL_TAG(args[1])==XS_STR)?args[1]->s:"";
@@ -2114,6 +2114,24 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
             }
             return has_alpha?value_incref(XS_TRUE_VAL):value_incref(XS_FALSE_VAL);
         }
+        /* is_space: every byte is a whitespace character (empty string is false). */
+        if (strcmp(method, "is_space") == 0 || strcmp(method, "is_whitespace") == 0) {
+            if (slen==0) return value_incref(XS_FALSE_VAL);
+            for (int j=0;j<slen;j++) if (!isspace((unsigned char)s[j])) return value_incref(XS_FALSE_VAL);
+            return value_incref(XS_TRUE_VAL);
+        }
+        /* swap_case: flip case for each ASCII alpha; non-alpha unchanged. */
+        if (strcmp(method, "swap_case") == 0) {
+            char *out = xs_malloc(slen+1);
+            for (int j=0;j<slen;j++) {
+                unsigned char c = (unsigned char)s[j];
+                if      (isupper(c)) out[j] = (char)tolower(c);
+                else if (islower(c)) out[j] = (char)toupper(c);
+                else                 out[j] = (char)c;
+            }
+            out[slen] = '\0';
+            Value *r = xs_str(out); free(out); return r;
+        }
         /* to_int / as_int */
         if (strcmp(method, "to_int") == 0 || strcmp(method, "as_int") == 0) {
             return xs_int(atoll(s));
@@ -2295,6 +2313,22 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
         if (strcmp(method, "last") == 0) {
             return arr->len>0?value_incref(arr->items[arr->len-1]):value_incref(XS_NULL_VAL);
         }
+        /* Haskell-flavour pair to head/last: tail = everything after the
+           first element, init = everything except the last. Empty arrays
+           give back an empty array rather than throwing -- the user can
+           combine with .first() / .last() to detect that case. */
+        if (strcmp(method, "tail") == 0) {
+            Value *res = xs_array_new();
+            for (int j = 1; j < arr->len; j++)
+                array_push(res->arr, value_incref(arr->items[j]));
+            return res;
+        }
+        if (strcmp(method, "init") == 0) {
+            Value *res = xs_array_new();
+            for (int j = 0; j + 1 < arr->len; j++)
+                array_push(res->arr, value_incref(arr->items[j]));
+            return res;
+        }
         if (strcmp(method, "get") == 0) {
             if (argc < 1 || VAL_TAG(args[0]) != XS_INT)
                 return argc >= 2 ? value_incref(args[1]) : value_incref(XS_NULL_VAL);
@@ -2309,6 +2343,19 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
         }
         if (strcmp(method, "contains") == 0 || strcmp(method, "includes") == 0) {
             if (argc<1) return value_incref(XS_FALSE_VAL);
+            Value *arg = args[0];
+            int is_pred = arg && (VAL_TAG(arg)==XS_CLOSURE ||
+                                  VAL_TAG(arg)==XS_FUNC ||
+                                  VAL_TAG(arg)==XS_NATIVE);
+            if (is_pred) {
+                for (int j=0;j<arr->len;j++) {
+                    Value *r = call_value(i, arg, &arr->items[j], 1, method);
+                    int t = value_truthy(r);
+                    value_decref(r);
+                    if (t) return value_incref(XS_TRUE_VAL);
+                }
+                return value_incref(XS_FALSE_VAL);
+            }
             for (int j=0;j<arr->len;j++)
                 if (value_equal(arr->items[j],args[0]))
                     return value_incref(XS_TRUE_VAL);
@@ -2535,6 +2582,22 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
         }
         if (strcmp(method, "index_of") == 0 || strcmp(method, "find_index") == 0) {
             if (argc<1) return xs_int(-1);
+            /* index_of(value) probes for equality; find_index(pred)
+               runs the callable and returns the first truthy index.
+               One method does both, picked by the arg's tag. */
+            Value *arg = args[0];
+            int is_pred = arg && (VAL_TAG(arg)==XS_CLOSURE ||
+                                  VAL_TAG(arg)==XS_FUNC ||
+                                  VAL_TAG(arg)==XS_NATIVE);
+            if (is_pred) {
+                for (int j=0;j<arr->len;j++) {
+                    Value *r = call_value(i, arg, &arr->items[j], 1, method);
+                    int t = value_truthy(r);
+                    value_decref(r);
+                    if (t) return xs_int(j);
+                }
+                return xs_int(-1);
+            }
             for (int j=0;j<arr->len;j++)
                 if (value_equal(arr->items[j],args[0])) return xs_int(j);
             return xs_int(-1);
@@ -2549,6 +2612,22 @@ static Value *eval_method(Interp *i, Value *obj, const char *method,
                     array_push(res->arr, value_incref(arr->items[j]));
                 }
             }
+            return res;
+        }
+        if (strcmp(method, "step") == 0 || strcmp(method, "stride") == 0) {
+            int64_t n = (argc>=1&&VAL_TAG(args[0])==XS_INT)?VAL_INT(args[0])
+                      : (argc>=1&&VAL_TAG(args[0])==XS_FLOAT)?(int64_t)args[0]->f : 1;
+            if (n <= 0) {
+                Value *err = xs_error_new("ValueError",
+                    "step() requires a positive integer", NULL);
+                if (i->cf.value) value_decref(i->cf.value);
+                i->cf.signal = CF_THROW;
+                i->cf.value  = err;
+                return value_incref(XS_NULL_VAL);
+            }
+            Value *res = xs_array_new();
+            for (int j = 0; j < arr->len; j += (int)n)
+                array_push(res->arr, value_incref(arr->items[j]));
             return res;
         }
         if (strcmp(method, "chunks") == 0) {
@@ -4820,6 +4899,30 @@ static Value *eval_binop(Interp *i, Node *n) {
                 for (int j=0;j<ra->len;j++) array_push(res->arr, value_incref(ra->items[j]));
             }
             result=res; goto done;
+        }
+        /* ++ on two plain maps merges them. Skip when either has _type
+           so typed wrappers (Set, Counter, class instances, ...) keep
+           their identity instead of silently becoming bare maps. */
+        if (VAL_TAG(left)==XS_MAP && VAL_TAG(right)==XS_MAP &&
+            left->map && right->map &&
+            !map_get(left->map, "_type") && !map_get(right->map, "_type")) {
+            Value *res = xs_map_new();
+            int nk = 0;
+            char **keys = map_keys(left->map, &nk);
+            for (int j = 0; j < nk; j++) {
+                Value *v = map_get(left->map, keys[j]);
+                if (v) map_set(res->map, keys[j], v);
+                free(keys[j]);
+            }
+            free(keys);
+            keys = map_keys(right->map, &nk);
+            for (int j = 0; j < nk; j++) {
+                Value *v = map_get(right->map, keys[j]);
+                if (v) map_set(res->map, keys[j], v);
+                free(keys[j]);
+            }
+            free(keys);
+            result = res; goto done;
         }
     }
 

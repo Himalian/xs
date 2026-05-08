@@ -1790,7 +1790,13 @@ static Value *builtin_wrap_memoize(Interp *i, Value **args, int argc) {
 static Value *builtin_wrap_retry(Interp *i, Value **args, int argc) {
     (void)i;
     if (argc < 1) return value_incref(XS_NULL_VAL);
-    const char *name = (argc >= 3 && VAL_TAG(args[2]) == XS_STR) ? args[2]->s : NULL;
+    /* The hoist always passes the fn name as the trailing string arg.
+       With @retry it lands at args[1]; with @retry(n) it's at args[2].
+       Pick whichever trailing slot holds a string so the wrapper map
+       carries _wrap_name in both forms. */
+    const char *name = NULL;
+    if (argc >= 2 && VAL_TAG(args[argc-1]) == XS_STR)
+        name = args[argc-1]->s;
     Value *m = wrap_make_base("retry", args[0], name);
     int64_t n = 3;
     if (argc >= 2 && VAL_TAG(args[1]) == XS_INT) n = VAL_INT(args[1]);

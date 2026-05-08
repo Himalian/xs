@@ -2121,6 +2121,32 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                 value_decref(a); value_decref(b);
                 PUSH(r); break;
             }
+            /* ++ on two plain maps merges the right side onto the left,
+               matching .merge() semantics. Skip when either side carries
+               a _type tag (Set / Deque / Counter / class instance) so
+               typed wrappers don't silently lose their identity. */
+            if (VAL_TAG(a) == XS_MAP && VAL_TAG(b) == XS_MAP &&
+                a->map && b->map &&
+                !map_get(a->map, "_type") && !map_get(b->map, "_type")) {
+                Value *r = xs_map_new();
+                int nk = 0;
+                char **keys = map_keys(a->map, &nk);
+                for (int j = 0; j < nk; j++) {
+                    Value *v = map_get(a->map, keys[j]);
+                    if (v) map_set(r->map, keys[j], v);
+                    free(keys[j]);
+                }
+                free(keys);
+                keys = map_keys(b->map, &nk);
+                for (int j = 0; j < nk; j++) {
+                    Value *v = map_get(b->map, keys[j]);
+                    if (v) map_set(r->map, keys[j], v);
+                    free(keys[j]);
+                }
+                free(keys);
+                value_decref(a); value_decref(b);
+                PUSH(r); break;
+            }
             char *as=value_str(a), *bs=value_str(b);
             size_t n=strlen(as)+strlen(bs)+1;
             char *buf=xs_malloc(n); strcpy(buf,as); strcat(buf,bs);
@@ -4165,7 +4191,7 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                         j += n;
                     }
                     mc_result=arr;
-                } else if (strcmp(mc_name,"replace")==0&&mc_argc>=2&&VAL_TAG(mc_args[0])==XS_STR&&VAL_TAG(mc_args[1])==XS_STR) {
+                } else if ((strcmp(mc_name,"replace")==0||strcmp(mc_name,"replace_all")==0)&&mc_argc>=2&&VAL_TAG(mc_args[0])==XS_STR&&VAL_TAG(mc_args[1])==XS_STR) {
                     const char *from=mc_args[0]->s,*to=mc_args[1]->s;
                     size_t fl=strlen(from),tl=strlen(to);
                     /* Optional 3rd arg caps the number of replacements,
@@ -4376,6 +4402,18 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                 } else if (strcmp(mc_name,"is_lower")==0) {
                     int ok=(slen>0); for(int j=0;j<slen;j++) if(isalpha((unsigned char)s[j])&&!islower((unsigned char)s[j])){ok=0;break;}
                     mc_result=ok?value_incref(XS_TRUE_VAL):value_incref(XS_FALSE_VAL);
+                } else if (strcmp(mc_name,"is_space")==0||strcmp(mc_name,"is_whitespace")==0) {
+                    int ok=(slen>0); for(int j=0;j<slen;j++) if(!isspace((unsigned char)s[j])){ok=0;break;}
+                    mc_result=ok?value_incref(XS_TRUE_VAL):value_incref(XS_FALSE_VAL);
+                } else if (strcmp(mc_name,"swap_case")==0) {
+                    char *out=xs_malloc(slen+1);
+                    for(int j=0;j<slen;j++){
+                        unsigned char c=(unsigned char)s[j];
+                        if(isupper(c)) out[j]=(char)tolower(c);
+                        else if(islower(c)) out[j]=(char)toupper(c);
+                        else out[j]=(char)c;
+                    }
+                    out[slen]='\0'; mc_result=xs_str(out); free(out);
                 } else if (strcmp(mc_name,"remove_prefix")==0&&mc_argc>=1&&VAL_TAG(mc_args[0])==XS_STR) {
                     size_t pl=strlen(mc_args[0]->s);
                     if(pl>0&&strncmp(s,mc_args[0]->s,pl)==0) mc_result=xs_str(s+pl);
@@ -4566,6 +4604,15 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                     mc_result=mc_obj->arr->len>0?value_incref(mc_obj->arr->items[0]):value_incref(XS_NULL_VAL);
                 else if (strcmp(mc_name,"last")==0)
                     mc_result=mc_obj->arr->len>0?value_incref(mc_obj->arr->items[mc_obj->arr->len-1]):value_incref(XS_NULL_VAL);
+                else if (strcmp(mc_name,"tail")==0) {
+                    Value *r=xs_array_new();
+                    for(int j=1;j<mc_obj->arr->len;j++) array_push(r->arr,value_incref(mc_obj->arr->items[j]));
+                    mc_result=r;
+                } else if (strcmp(mc_name,"init")==0) {
+                    Value *r=xs_array_new();
+                    for(int j=0;j+1<mc_obj->arr->len;j++) array_push(r->arr,value_incref(mc_obj->arr->items[j]));
+                    mc_result=r;
+                }
                 else if (strcmp(mc_name,"get")==0) {
                     if (mc_argc<1||VAL_TAG(mc_args[0])!=XS_INT) {
                         mc_result = mc_argc>=2 ? value_incref(mc_args[1]) : value_incref(XS_NULL_VAL);
@@ -4579,8 +4626,30 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                     }
                 }
                 else if (strcmp(mc_name,"contains")==0||strcmp(mc_name,"includes")==0) {
+                    /* arr.contains(value) for equality, arr.contains(pred)
+                       to ask whether any element satisfies the predicate. */
                     mc_result=value_incref(XS_FALSE_VAL);
-                    if(mc_argc>=1){for(int j=0;j<mc_obj->arr->len;j++){if(value_equal(mc_obj->arr->items[j],mc_args[0])){value_decref(mc_result);mc_result=value_incref(XS_TRUE_VAL);break;}}}
+                    if(mc_argc>=1){
+                        Value *arg = mc_args[0];
+                        int is_pred = arg && (VAL_TAG(arg)==XS_CLOSURE ||
+                                              VAL_TAG(arg)==XS_FUNC ||
+                                              VAL_TAG(arg)==XS_NATIVE);
+                        if (is_pred) {
+                            for(int j=0;j<mc_obj->arr->len;j++){
+                                Value *elem=mc_obj->arr->items[j];
+                                Value *r=vm_invoke(vm,arg,&elem,1);
+                                int t=value_truthy(r);
+                                value_decref(r);
+                                if(t){value_decref(mc_result);mc_result=value_incref(XS_TRUE_VAL);break;}
+                            }
+                            frame=FRAME;
+                        } else {
+                            for(int j=0;j<mc_obj->arr->len;j++){
+                                if(value_equal(mc_obj->arr->items[j],arg)){
+                                    value_decref(mc_result);mc_result=value_incref(XS_TRUE_VAL);break;}
+                            }
+                        }
+                    }
                 } else if (strcmp(mc_name,"join")==0) {
                     const char *sep=(mc_argc>=1&&VAL_TAG(mc_args[0])==XS_STR)?mc_args[0]->s:"";
                     size_t cap=256; char *buf=xs_malloc(cap); size_t wpos=0;
@@ -4749,10 +4818,30 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                     }
                     mc_result=acc;
                 } else if (strcmp(mc_name,"index_of")==0||strcmp(mc_name,"find_index")==0) {
+                    /* index_of(value): first index where item equals
+                       value. find_index(pred): first index where the
+                       predicate returns truthy. The arg's tag tells
+                       us which one we got: a callable means predicate,
+                       anything else means an equality probe. */
                     mc_result=xs_int(-1);
                     if(mc_argc>=1){
-                        for(int j=0;j<mc_obj->arr->len;j++){
-                            if(value_equal(mc_obj->arr->items[j],mc_args[0])){value_decref(mc_result);mc_result=xs_int(j);break;}
+                        Value *arg = mc_args[0];
+                        int is_pred = arg && (VAL_TAG(arg)==XS_CLOSURE ||
+                                              VAL_TAG(arg)==XS_FUNC ||
+                                              VAL_TAG(arg)==XS_NATIVE);
+                        if (is_pred) {
+                            for(int j=0;j<mc_obj->arr->len;j++){
+                                Value *elem=mc_obj->arr->items[j];
+                                Value *r=vm_invoke(vm,arg,&elem,1);
+                                int t = value_truthy(r);
+                                value_decref(r);
+                                if(t){value_decref(mc_result);mc_result=xs_int(j);break;}
+                            }
+                            frame=FRAME;
+                        } else {
+                            for(int j=0;j<mc_obj->arr->len;j++){
+                                if(value_equal(mc_obj->arr->items[j],arg)){value_decref(mc_result);mc_result=xs_int(j);break;}
+                            }
                         }
                     }
                 } else if (strcmp(mc_name,"any")==0&&mc_argc>=1) {
@@ -4895,6 +4984,19 @@ static int vm_dispatch(VM *vm, int stop_frame) {
                         } else array_push(arr->arr,value_incref(mc_obj->arr->items[j]));
                     }
                     mc_result=arr;
+                } else if (strcmp(mc_name,"step")==0||strcmp(mc_name,"stride")==0) {
+                    int64_t n = (mc_argc>=1&&VAL_TAG(mc_args[0])==XS_INT)?VAL_INT(mc_args[0])
+                              : (mc_argc>=1&&VAL_TAG(mc_args[0])==XS_FLOAT)?(int64_t)mc_args[0]->f : 1;
+                    if (n<=0) {
+                        g_xs_pending_throw = xs_error_new("ValueError",
+                            "step() requires a positive integer", NULL);
+                        mc_result=value_incref(XS_NULL_VAL);
+                    } else {
+                        Value *arr=xs_array_new();
+                        for(int j=0;j<mc_obj->arr->len;j+=(int)n)
+                            array_push(arr->arr,value_incref(mc_obj->arr->items[j]));
+                        mc_result=arr;
+                    }
                 } else if (strcmp(mc_name,"chunks")==0) {
                     int64_t sz = (mc_argc>=1&&VAL_TAG(mc_args[0])==XS_INT)?VAL_INT(mc_args[0])
                                : (mc_argc>=1&&VAL_TAG(mc_args[0])==XS_FLOAT)?(int64_t)mc_args[0]->f : 0;

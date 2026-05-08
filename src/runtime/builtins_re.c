@@ -157,8 +157,13 @@ Value *make_re_module(void) {
     XSMap *m = map_new();
     map_take(m, "test",        xs_native(native_re_test));
     map_take(m, "is_match",    xs_native(native_re_test));
+    /* `search` reads naturally for "does the pattern appear anywhere
+       in the string" -- in this engine match isn't anchored either,
+       so the two share the same handler. */
+    map_take(m, "search",      xs_native(native_re_test));
     map_take(m, "match",       xs_native(native_re_match));
     map_take(m, "find_all",    xs_native(native_re_find_all));
+    map_take(m, "findall",     xs_native(native_re_find_all));
     map_take(m, "replace",     xs_native(native_re_replace));
     map_take(m, "replace_all", xs_native(native_re_replace_all));
     map_take(m, "split",       xs_native(native_re_split));

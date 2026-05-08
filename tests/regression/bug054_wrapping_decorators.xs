@@ -27,6 +27,17 @@ fn flaky() {
 assert_eq(flaky(), "ok")
 assert_eq(attempts, 3)
 
+-- @retry without args defaults to 3 attempts on both backends
+var bare_attempts = 0
+@retry
+fn bare_retry() {
+    bare_attempts = bare_attempts + 1
+    if bare_attempts < 2 { throw "no" }
+    return "yes"
+}
+assert_eq(bare_retry(), "yes")
+assert_eq(bare_attempts, 2)
+
 @retry(2)
 fn always_fails() { throw "boom" }
 var caught = ""

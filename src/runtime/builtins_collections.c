@@ -9,12 +9,20 @@
 #include <stdio.h>
 
 /* collections module */
-/* Stack: returns a map with _type="Stack" and _data=[] */
+/* Stack: returns a map with _type="Stack" and _data=[]. An optional
+   array argument seeds the stack in order; the last element of the
+   array becomes the top, so push order is preserved. */
 static Value *collections_stack_new(Interp *i, Value **a, int n) {
-    (void)i;(void)a;(void)n;
+    (void)i;
     Value *stack=xs_map_new();
     Value *type=xs_str("Stack"); map_set(stack->map,"_type",type); value_decref(type);
     Value *data=xs_array_new(); map_set(stack->map,"_data",data); value_decref(data);
+    if (n>0 && VAL_TAG(a[0])==XS_ARRAY) {
+        Value *d=map_get(stack->map,"_data");
+        XSArray *arr=a[0]->arr;
+        for (int j=0;j<arr->len;j++)
+            array_push(d->arr, value_incref(arr->items[j]));
+    }
     return stack;
 }
 /* PriorityQueue: returns a map with _type="PriorityQueue" and _data=[] */
@@ -42,10 +50,18 @@ static Value *collections_counter(Interp *i, Value **a, int n) {
     return result;
 }
 static Value *collections_deque_new(Interp *ig, Value **a, int n) {
-    (void)ig;(void)a;(void)n;
+    (void)ig;
     Value *d=xs_map_new();
     Value *t=xs_str("Deque"); map_set(d->map,"_type",t); value_decref(t);
     Value *data=xs_array_new(); map_set(d->map,"_data",data); value_decref(data);
+    /* Pre-populate from an init array, mirroring the Set/OrderedMap
+       constructors. Deque([1,2,3]) seeds the buffer in order. */
+    if (n>0 && VAL_TAG(a[0])==XS_ARRAY) {
+        Value *d2=map_get(d->map,"_data");
+        XSArray *arr=a[0]->arr;
+        for (int j=0;j<arr->len;j++)
+            array_push(d2->arr, value_incref(arr->items[j]));
+    }
     return d;
 }
 static Value *collections_set_new(Interp *ig, Value **a, int n) {

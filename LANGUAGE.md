@@ -392,7 +392,11 @@ form so it's clear at the call site that the operands are strings.
 "abc123".is_alnum()              -- true
 "ABC".is_upper()                 -- true
 "abc".is_lower()                 -- true
+"   ".is_space()                 -- true (alias: is_whitespace)
 "".is_empty()                    -- true
+
+-- case-flipping
+"Hello".swap_case()              -- "hELLO"
 
 -- parsing
 "42".parse_int()                 -- 42
@@ -459,6 +463,7 @@ arr.sort_by(fn(x) { -x })       -- new array sorted by key function
 arr.flatten()                    -- flatten one level
 arr.zip([10, 20, 30])            -- [(1, 10), (2, 20), (3, 30)]
 arr.enumerate()                  -- [(0, 1), (1, 2), (2, 3), ...]
+arr.step(2)                      -- every n-th element (alias: stride)
 
 -- higher-order methods
 arr.map(fn(x) { x * 2 })

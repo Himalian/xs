@@ -313,6 +313,13 @@ Value *make_json_module(void) {
     map_take(m,"pretty",      xs_native(native_json_pretty));
     map_take(m,"valid",       xs_native(native_json_valid));
     map_take(m,"parse_safe",  xs_native(native_json_parse_safe));
+    /* Familiar names from other ecosystems: encode/decode (JS, Go-ish)
+       and dumps/loads (Python). All share parse/stringify under the
+       hood so behaviour stays identical to the canonical names. */
+    map_take(m,"encode",      xs_native(native_json_stringify));
+    map_take(m,"decode",      xs_native(native_json_parse));
+    map_take(m,"dumps",       xs_native(native_json_stringify));
+    map_take(m,"loads",       xs_native(native_json_parse));
     return xs_module(m);
 }
 
