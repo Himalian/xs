@@ -193,6 +193,8 @@ Value *make_os_module(Interp *ig) {
     { Value *v=xs_str("darwin"); map_set(m,"platform",v); value_decref(v); }
 #elif defined(_WIN32)
     { Value *v=xs_str("windows"); map_set(m,"platform",v); value_decref(v); }
+#elif defined(__wasi__) || defined(__EMSCRIPTEN__)
+    { Value *v=xs_str("wasi"); map_set(m,"platform",v); value_decref(v); }
 #else
     { Value *v=xs_str("linux"); map_set(m,"platform",v); value_decref(v); }
 #endif

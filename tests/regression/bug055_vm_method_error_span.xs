@@ -6,28 +6,39 @@
 --
 -- This test forks ./xs against a tiny target script under each
 -- backend and asserts the rendered location matches the call site.
+-- Skipped on wasm (no fork) and on Windows (cmd.exe doesn't grok
+-- the inline NO_COLOR=1 env-var syntax popen receives).
 
 import process
 import fs
+import os
 
-let target = "/tmp/_bug055_target.xs"
-fs.write(target,
-    "-- target script for bug055\n" ++
-    "let s = \"hello\"\n" ++
-    "println(s.no_such_method())\n")
+if os.platform == "wasi" || os.platform == "windows" {
+    println("bug055: skipped on {os.platform}")
+} else {
+    let target = fs.temp_dir() ++ "/_bug055_target.xs"
+    fs.write(target,
+        "-- target script for bug055\n" ++
+        "let s = \"hello\"\n" ++
+        "println(s.no_such_method())\n")
 
-let backends = ["--interp", "", "--jit"]
-for flag in backends {
     -- NO_COLOR drops the ANSI escapes that would otherwise cut up
-    -- the file:line:col token in the error header.
-    let cmd = "NO_COLOR=1 ./xs " ++ flag ++ " " ++ target ++ " 2>&1"
-    let out = process.run(cmd)
-    let txt = out.stdout
-    assert(txt.contains("_bug055_target.xs:3:"),
-           "{flag}: missing file:line in output -- {txt}")
-    assert(!txt.contains("<unknown>:0:0"),
-           "{flag}: still rendering <unknown>:0:0 -- {txt}")
-    assert(txt.contains("no method") || txt.contains("has no method"),
-           "{flag}: missing method-not-found message -- {txt}")
+    -- the file:line:col token in the error header. Set it on the
+    -- parent so the popen child inherits it; an inline NO_COLOR=1
+    -- prefix on the command string isn't portable to cmd.exe.
+    os.setenv("NO_COLOR", "1")
+
+    let backends = ["--interp", "", "--jit"]
+    for flag in backends {
+        let cmd = "./xs " ++ flag ++ " " ++ target ++ " 2>&1"
+        let out = process.run(cmd)
+        let txt = out.stdout
+        assert(txt.contains("_bug055_target.xs:3:"),
+               "{flag}: missing file:line in output -- {txt}")
+        assert(!txt.contains("<unknown>:0:0"),
+               "{flag}: still rendering <unknown>:0:0 -- {txt}")
+        assert(txt.contains("no method") || txt.contains("has no method"),
+               "{flag}: missing method-not-found message -- {txt}")
+    }
+    println("bug055: ok")
 }
-println("bug055: ok")
