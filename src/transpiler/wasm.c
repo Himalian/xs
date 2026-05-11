@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include "core/xs_compat.h"
 #include "transpiler/wasm.h"
 
@@ -5,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
 
 extern char *strdup(const char *);
 
@@ -6802,22 +6804,31 @@ int transpile_wasm(Node *program, const char *filename, const char *out_path) {
     }
 
     /* ================================================================
-       Write output file
+       Write output file. When stdout is being captured (not a tty),
+       emit the binary there so `xs --emit wasm foo.xs > foo.wasm`
+       works the same way as `--emit js` and `--emit c`. Interactive
+       runs still drop the binary at out_path so a bare invocation
+       doesn't spew bytes at the terminal.
        ================================================================ */
-    FILE *f = fopen(out_path, "wb");
-    if (!f) {
-        fprintf(stderr, "xs wasm: cannot open '%s' for writing\n", out_path);
-        buf_free(&output);
-        funcs_free(&funcs);
-        struct_layouts_free(&struct_layouts);
-        enum_layouts_free(&enum_layouts);
-        return 1;
+    if (!isatty(fileno(stdout))) {
+        fwrite(output.data, 1, (size_t)output.len, stdout);
+        fflush(stdout);
+    } else {
+        FILE *f = fopen(out_path, "wb");
+        if (!f) {
+            fprintf(stderr, "xs wasm: cannot open '%s' for writing\n", out_path);
+            buf_free(&output);
+            funcs_free(&funcs);
+            struct_layouts_free(&struct_layouts);
+            enum_layouts_free(&enum_layouts);
+            return 1;
+        }
+
+        fwrite(output.data, 1, (size_t)output.len, f);
+        fclose(f);
+
+        fprintf(stderr, "xs wasm: wrote %d bytes to %s\n", output.len, out_path);
     }
-
-    fwrite(output.data, 1, (size_t)output.len, f);
-    fclose(f);
-
-    printf("xs wasm: wrote %d bytes to %s\n", output.len, out_path);
 
     buf_free(&output);
     funcs_free(&funcs);

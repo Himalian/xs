@@ -1569,6 +1569,26 @@ test_again: ;
                             memcpy(fl->paths[j], tmp, PATH_MAX);
                         }
 
+                if (fl->count == 0) {
+                    /* Walked the directory but nothing matched the
+                       test_*.xs / *_test.xs / pattern filter. Without
+                       this hint the runner prints "0 passed, 0 failed,
+                       0 total" and exits 0, which reads as success. */
+                    if (is_directory) {
+                        const char *root = sub_arg(0);
+                        size_t rlen = strlen(root);
+                        printf("  No tests found in %.*s\n",
+                               (int)(rlen && root[rlen-1] == '/' ? rlen-1 : rlen),
+                               root);
+                        printf("  (looking for test_*.xs or *_test.xs)\n");
+                    } else {
+                        printf("  No tests found matching '%s'\n", pattern);
+                    }
+                    free(fl);
+                    cache_free(g_sema_cache);
+                    return 0;
+                }
+
                 for (int ti = 0; ti < fl->count; ti++) {
                     const char *tpath = fl->paths[ti];
                     clock_t t_start = clock();
