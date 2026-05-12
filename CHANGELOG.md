@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.2.5
+
+`xs run file.xs foo bar` was swallowing the trailing args -- the
+`run` subcommand's `goto run_file` jumped past the line that
+populates `os.args`. Fixed in both the `.xs` and `.xsc` branches
+so `xs run` matches the bare `xs file.xs ...` form.
+
+Also a documentation cull: removed the book/, RFCS/, packages/,
+API.md, and POLICY.md trees. The book carried out-of-date API
+references (`os.argv` instead of `os.args`, `fs.read_text` instead
+of `fs.read`, `string.split_re` instead of `re.split`, a fictional
+`test.describe` / `test.it` API), RFCS hadn't been touched in
+months, the in-repo packages/ duplicated the registry copies and
+was drifting, API.md repeated content from `src/xs_embed.c`'s doc
+comments with a few wrong entries, and POLICY.md described a
+sandbox that doesn't exist. The remaining surface (README,
+LANGUAGE, COMMANDS, PLUGINS, STATUS, CHANGELOG, CONTRIBUTING) is
+the canonical reference.
+
 ## 1.2.4
 
 Two paper cuts from the post-1.2.3 bug list.
