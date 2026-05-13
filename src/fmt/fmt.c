@@ -22,6 +22,35 @@ static void fmt_indent_n(SB *s, int depth) {
             sb_addc(s, ' ');
 }
 
+/* Mirrors prec_of() in parser.c. Anything not listed here returns
+   a high precedence so the caller doesn't add unnecessary parens
+   around literals / idents / calls / etc. */
+static int fmt_binop_prec(const char *op) {
+    if (!op) return 1000;
+    if (strcmp(op, "|>") == 0) return 2;
+    if (strcmp(op, "??") == 0 || strcmp(op, "..") == 0 ||
+        strcmp(op, "..=") == 0) return 3;
+    if (strcmp(op, "||") == 0 || strcmp(op, "or") == 0) return 4;
+    if (strcmp(op, "&&") == 0 || strcmp(op, "and") == 0) return 5;
+    if (strcmp(op, "==") == 0 || strcmp(op, "!=") == 0) return 6;
+    if (strcmp(op, "<") == 0 || strcmp(op, ">") == 0 ||
+        strcmp(op, "<=") == 0 || strcmp(op, ">=") == 0 ||
+        strcmp(op, "<=>") == 0 ||
+        strcmp(op, "is") == 0 ||
+        strcmp(op, "in") == 0 || strcmp(op, "not in") == 0) return 7;
+    if (strcmp(op, "|") == 0) return 8;
+    if (strcmp(op, "^") == 0) return 9;
+    if (strcmp(op, "&") == 0) return 10;
+    if (strcmp(op, "<<") == 0 || strcmp(op, ">>") == 0) return 11;
+    if (strcmp(op, "+") == 0 || strcmp(op, "-") == 0 ||
+        strcmp(op, "++") == 0) return 12;
+    if (strcmp(op, "*") == 0 || strcmp(op, "/") == 0 ||
+        strcmp(op, "%") == 0 || strcmp(op, "//") == 0) return 13;
+    if (strcmp(op, "**") == 0) return 14;
+    if (strcmp(op, "as") == 0) return 15;
+    return 1000;
+}
+
 static int fmt_emit_leading_comments(SB *s, int node_line, int depth) {
     int count = 0;
     if (!fmt_comments) return 0;
@@ -356,11 +385,29 @@ static void fmt_expr(SB *s, Node *n, int depth) {
     case NODE_IDENT:
         sb_add(s, n->ident.name);
         break;
-    case NODE_BINOP:
+    case NODE_BINOP: {
+        /* Match parser/prec_of so re-formatted output reparses to the
+           same AST. Otherwise (x ?? 1) + 2 would round-trip to
+           x ?? 1 + 2, which the parser groups as x ?? (1 + 2) and
+           returns the wrong value when x is non-null. All XS binops
+           are left-associative; the right operand needs parens if its
+           precedence is lower-or-equal, the left only if lower. */
+        int p_self = fmt_binop_prec(n->binop.op);
+        int lp = (VAL_TAG(n->binop.left) == NODE_BINOP)
+                 ? fmt_binop_prec(n->binop.left->binop.op) : 1000;
+        int rp = (VAL_TAG(n->binop.right) == NODE_BINOP)
+                 ? fmt_binop_prec(n->binop.right->binop.op) : 1000;
+        int lparen = lp < p_self;
+        int rparen = rp <= p_self;
+        if (lparen) sb_addc(s, '(');
         fmt_expr(s, n->binop.left, depth);
+        if (lparen) sb_addc(s, ')');
         sb_printf(s, " %s ", n->binop.op);
+        if (rparen) sb_addc(s, '(');
         fmt_expr(s, n->binop.right, depth);
+        if (rparen) sb_addc(s, ')');
         break;
+    }
     case NODE_UNARY:
         if (n->unary.prefix) {
             sb_add(s, n->unary.op);
