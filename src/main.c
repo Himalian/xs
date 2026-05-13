@@ -206,9 +206,20 @@ static int file_uses_runtime_hooks(const char *path) {
         size_t got = fread(data, 1, (size_t)sz, f);
         data[got] = '\0';
         fclose(f);
+        /* Lexer / parser registrations also need the interp re-parse
+           loop -- the bytecode VM has no equivalent path, so a plugin
+           that calls add_keyword / on_unknown / on_postfix / parser.override
+           gets registered but the main program was already parsed
+           without those rules. Falling back to interp keeps the
+           syntax extension working. */
         int hit = strstr(data, "plugin.runtime.after_eval")  != NULL ||
                   strstr(data, "plugin.runtime.before_eval") != NULL ||
-                  strstr(data, "plugin.runtime.ast_hook")    != NULL;
+                  strstr(data, "plugin.runtime.ast_hook")    != NULL ||
+                  strstr(data, "plugin.lexer.add_keyword")   != NULL ||
+                  strstr(data, "plugin.lexer.transform")     != NULL ||
+                  strstr(data, "plugin.parser.on_unknown")   != NULL ||
+                  strstr(data, "plugin.parser.on_postfix")   != NULL ||
+                  strstr(data, "plugin.parser.override")     != NULL;
         free(data);
         if (hit) return 1;
     }
