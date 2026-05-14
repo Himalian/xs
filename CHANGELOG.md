@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.8
+
+The pipe-to-free-function pattern (`nums |> reduce(0, fn)`) was
+emitting JS that referenced a top-level `reduce` that doesn't
+exist, so Node errored with `ReferenceError: reduce is not
+defined` even though the same XS source ran fine on the VM.
+Added `__xs_reduce` / `map` / `filter` / `each` / `some` /
+`every` / `find` / `count` / `sum` polyfills to the JS prelude
+and routed free calls of those names through them. The helpers
+forward to the corresponding Array prototype method, and the
+reduce / fold helpers sniff which arg is callable so both
+`(init, fn)` and `(fn, init)` orderings work. Method-form
+(`arr.reduce(...)`) was already correct and is unchanged.
+
 ## 1.2.7
 
 `xs fmt` was emitting every NODE_BINOP as `left op right` with no
