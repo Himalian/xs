@@ -17,6 +17,134 @@ static void emit_pattern_cond(SB *s, Node *pat, const char *subject, int depth);
 static int node_has_perform(Node *n);
 static void emit_pattern_bindings(SB *s, Node *pat, const char *subject, int depth);
 
+/* Names that have been `del`'d in the current emit scope. Mirrors the
+ * C transpiler's tracking; reset per transpile_js call and saved /
+ * restored across function bodies so a fn-local `del y` doesn't bleed
+ * into other scopes. */
+#define MAX_JS_DELETED_VARS 64
+static const char *js_deleted_vars[MAX_JS_DELETED_VARS];
+static int js_n_deleted_vars = 0;
+static int js_is_deleted_var(const char *name) {
+    if (!name) return 0;
+    for (int i = 0; i < js_n_deleted_vars; i++)
+        if (strcmp(js_deleted_vars[i], name) == 0) return 1;
+    return 0;
+}
+static void js_mark_deleted_var(const char *name) {
+    if (!name) return;
+    if (js_is_deleted_var(name)) return;
+    if (js_n_deleted_vars < MAX_JS_DELETED_VARS)
+        js_deleted_vars[js_n_deleted_vars++] = name;
+}
+
+/* AST walker that flags constructs the JS target can't faithfully lower.
+ * Refused at emit time so we get a clear error rather than runtime garbage.
+ * Mirrors find_unsupported_for_c (different set of unsupporteds). */
+static const char *find_unsupported_for_js(Node *n) {
+    if (!n) return NULL;
+    switch (VAL_TAG(n)) {
+    case NODE_FN_DECL: {
+        for (int i = 0; i < n->fn_decl.n_decorators; i++) {
+            const char *dn = n->fn_decl.decorators[i].name;
+            if (!dn) continue;
+            if (strcmp(dn, "memoize") == 0 || strcmp(dn, "retry") == 0 ||
+                strcmp(dn, "timed") == 0   || strcmp(dn, "trace") == 0 ||
+                strcmp(dn, "throttle") == 0|| strcmp(dn, "debounce") == 0)
+                return "wrapping decorators (@memoize/@retry/@timed/@trace/@throttle/@debounce)";
+        }
+        return find_unsupported_for_js(n->fn_decl.body);
+    }
+    case NODE_LAMBDA:   return find_unsupported_for_js(n->lambda.body);
+    case NODE_BIND:     return "reactive `bind` declarations";
+    case NODE_PROGRAM:
+        for (int i = 0; i < n->program.stmts.len; i++) {
+            const char *r = find_unsupported_for_js(n->program.stmts.items[i]);
+            if (r) return r;
+        }
+        return NULL;
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmts.len; i++) {
+            const char *r = find_unsupported_for_js(n->block.stmts.items[i]);
+            if (r) return r;
+        }
+        return find_unsupported_for_js(n->block.expr);
+    case NODE_BINOP:
+        { const char *r = find_unsupported_for_js(n->binop.left); if (r) return r; }
+        return find_unsupported_for_js(n->binop.right);
+    case NODE_UNARY:    return find_unsupported_for_js(n->unary.expr);
+    case NODE_CALL:
+        { const char *r = find_unsupported_for_js(n->call.callee); if (r) return r; }
+        for (int i = 0; i < n->call.args.len; i++) {
+            const char *r = find_unsupported_for_js(n->call.args.items[i]);
+            if (r) return r;
+        }
+        return NULL;
+    case NODE_METHOD_CALL:
+        { const char *r = find_unsupported_for_js(n->method_call.obj); if (r) return r; }
+        for (int i = 0; i < n->method_call.args.len; i++) {
+            const char *r = find_unsupported_for_js(n->method_call.args.items[i]);
+            if (r) return r;
+        }
+        return NULL;
+    case NODE_INDEX:
+        { const char *r = find_unsupported_for_js(n->index.obj); if (r) return r; }
+        return find_unsupported_for_js(n->index.index);
+    case NODE_FIELD:    return find_unsupported_for_js(n->field.obj);
+    case NODE_ASSIGN:
+        { const char *r = find_unsupported_for_js(n->assign.target); if (r) return r; }
+        return find_unsupported_for_js(n->assign.value);
+    case NODE_IF:
+        { const char *r = find_unsupported_for_js(n->if_expr.cond); if (r) return r; }
+        { const char *r = find_unsupported_for_js(n->if_expr.then); if (r) return r; }
+        return find_unsupported_for_js(n->if_expr.else_branch);
+    case NODE_FOR:
+        { const char *r = find_unsupported_for_js(n->for_loop.iter); if (r) return r; }
+        return find_unsupported_for_js(n->for_loop.body);
+    case NODE_WHILE:
+        { const char *r = find_unsupported_for_js(n->while_loop.cond); if (r) return r; }
+        return find_unsupported_for_js(n->while_loop.body);
+    case NODE_RETURN:   return find_unsupported_for_js(n->ret.value);
+    case NODE_LET:
+    case NODE_VAR:      return find_unsupported_for_js(n->let.value);
+    case NODE_CONST:    return find_unsupported_for_js(n->const_.value);
+    case NODE_EXPR_STMT: return find_unsupported_for_js(n->expr_stmt.expr);
+    case NODE_TRY:
+        { const char *r = find_unsupported_for_js(n->try_.body); if (r) return r; }
+        return find_unsupported_for_js(n->try_.finally_block);
+    case NODE_THROW:    return find_unsupported_for_js(n->throw_.value);
+    case NODE_MATCH:
+        { const char *r = find_unsupported_for_js(n->match.subject); if (r) return r; }
+        for (int i = 0; i < n->match.arms.len; i++) {
+            { const char *r = find_unsupported_for_js(n->match.arms.items[i].guard); if (r) return r; }
+            { const char *r = find_unsupported_for_js(n->match.arms.items[i].body); if (r) return r; }
+        }
+        return NULL;
+    case NODE_LIT_ARRAY:
+    case NODE_LIT_TUPLE:
+        for (int i = 0; i < n->lit_array.elems.len; i++) {
+            const char *r = find_unsupported_for_js(n->lit_array.elems.items[i]);
+            if (r) return r;
+        }
+        return NULL;
+    case NODE_LIT_MAP:
+        for (int i = 0; i < n->lit_map.vals.len; i++) {
+            const char *r = find_unsupported_for_js(n->lit_map.vals.items[i]);
+            if (r) return r;
+        }
+        return NULL;
+    case NODE_IMPL_DECL:
+        for (int i = 0; i < n->impl_decl.members.len; i++) {
+            const char *r = find_unsupported_for_js(n->impl_decl.members.items[i]);
+            if (r) return r;
+        }
+        return NULL;
+    case NODE_RANGE:
+        { const char *r = find_unsupported_for_js(n->range.start); if (r) return r; }
+        return find_unsupported_for_js(n->range.end);
+    default: return NULL;
+    }
+}
+
 /* state: are we inside a class method body? */
 static int in_class_method = 0;
 
@@ -215,14 +343,18 @@ static void emit_expr(SB *s, Node *n, int depth) {
         }
         break;
     }
-    case NODE_IDENT:
+    case NODE_IDENT: {
+        int wrap_del = js_is_deleted_var(n->ident.name);
+        if (wrap_del) sb_add(s, "__xs_check_deleted(");
         if (in_class_method && n->ident.name && strcmp(n->ident.name, "self") == 0)
             sb_add(s, "this");
         else if (n->ident.name && is_js_reserved(n->ident.name))
             sb_printf(s, "__xs_%s", n->ident.name);
         else
             sb_add(s, n->ident.name);
+        if (wrap_del) sb_printf(s, ", \"%s\")", n->ident.name);
         break;
+    }
     case NODE_BINOP: {
         const char *op = n->binop.op;
         if (strcmp(op, "++") == 0) {
@@ -993,23 +1125,15 @@ static void emit_expr(SB *s, Node *n, int depth) {
         break;
     }
     case NODE_RANGE: {
-        if (n->range.inclusive) {
-            sb_add(s, "Array.from({length: (");
-            emit_expr(s, n->range.end, depth);
-            sb_add(s, ") - (");
-            emit_expr(s, n->range.start, depth);
-            sb_add(s, ") + 1}, (_, i) => i + (");
-            emit_expr(s, n->range.start, depth);
-            sb_add(s, "))");
-        } else {
-            sb_add(s, "Array.from({length: (");
-            emit_expr(s, n->range.end, depth);
-            sb_add(s, ") - (");
-            emit_expr(s, n->range.start, depth);
-            sb_add(s, ")}, (_, i) => i + (");
-            emit_expr(s, n->range.start, depth);
-            sb_add(s, "))");
-        }
+        /* Funnel through __xs_range so we can stash the original (start,
+         * end, inclusive) on the materialised array. .start()/.end() pull
+         * from those instead of items[0]/items[last]; without the marker
+         * exclusive ranges' .end() drifts (1..5 ends at 5, not 4). */
+        sb_add(s, "__xs_range(");
+        emit_expr(s, n->range.start, depth);
+        sb_add(s, ", ");
+        emit_expr(s, n->range.end, depth);
+        sb_printf(s, ", %d)", n->range.inclusive ? 1 : 0);
         break;
     }
     case NODE_LAMBDA: {
@@ -1849,8 +1973,11 @@ static void emit_pattern_cond(SB *s, Node *pat, const char *subject, int depth) 
         emit_pattern_cond(s, pat->pat_capture.pattern, subject, depth);
         break;
     case NODE_PAT_TUPLE: {
-        sb_printf(s, "(Array.isArray(%s) && %s.length === %d",
-                  subject, subject, pat->pat_tuple.elems.len);
+        /* Tuple patterns must reject plain arrays. __xs_tuple sets the
+         * non-enumerable __xs_is_tuple flag; require it here so
+         * `match (1,2) { [a,b] => ... }` doesn't fire on a tuple. */
+        sb_printf(s, "(Array.isArray(%s) && %s.__xs_is_tuple && %s.length === %d",
+                  subject, subject, subject, pat->pat_tuple.elems.len);
         for (int i = 0; i < pat->pat_tuple.elems.len; i++) {
             char sub[256];
             snprintf(sub, sizeof sub, "%s[%d]", subject, i);
@@ -1892,12 +2019,13 @@ static void emit_pattern_cond(SB *s, Node *pat, const char *subject, int depth) 
         break;
     }
     case NODE_PAT_SLICE: {
+        /* Plain array pattern - reject tuples (which set __xs_is_tuple). */
         if (pat->pat_slice.rest) {
-            sb_printf(s, "(Array.isArray(%s) && %s.length >= %d",
-                      subject, subject, pat->pat_slice.elems.len);
+            sb_printf(s, "(Array.isArray(%s) && !%s.__xs_is_tuple && %s.length >= %d",
+                      subject, subject, subject, pat->pat_slice.elems.len);
         } else {
-            sb_printf(s, "(Array.isArray(%s) && %s.length === %d",
-                      subject, subject, pat->pat_slice.elems.len);
+            sb_printf(s, "(Array.isArray(%s) && !%s.__xs_is_tuple && %s.length === %d",
+                      subject, subject, subject, pat->pat_slice.elems.len);
         }
         for (int i = 0; i < pat->pat_slice.elems.len; i++) {
             char sub[256];
@@ -2198,6 +2326,7 @@ static void emit_stmt(SB *s, Node *n, int depth) {
         sb_add(s, ";\n");
         break;
     case NODE_FN_DECL: {
+        int __saved_n_deleted = js_n_deleted_vars;
         sb_indent(s, depth);
         if (n->fn_decl.is_pub) sb_add(s, "export ");
         if (n->fn_decl.is_async) sb_add(s, "async ");
@@ -2275,6 +2404,7 @@ static void emit_stmt(SB *s, Node *n, int depth) {
         }
         sb_indent(s, depth);
         sb_add(s, named ? "}\n\n" : "});\n");
+        js_n_deleted_vars = __saved_n_deleted; /* unwind del scope on fn exit */
         break;
     }
     case NODE_RETURN:
@@ -2939,6 +3069,15 @@ static void emit_stmt(SB *s, Node *n, int depth) {
         emit_expr(s, n->bind_decl.expr, depth);
         sb_add(s, ";\n");
         break;
+    case NODE_DEL:
+        sb_indent(s, depth);
+        if (n->del_.name) {
+            sb_printf(s, "%s = __XS_DELETED;\n", n->del_.name);
+            js_mark_deleted_var(n->del_.name);
+        } else {
+            sb_add(s, "; /* del without name */\n");
+        }
+        break;
     case NODE_TAG_DECL:
         /* Emit as a regular function with __block as last param */
         sb_indent(s, depth);
@@ -2972,6 +3111,14 @@ static void emit_node(SB *s, Node *n, int depth) {
 
 /* public entry point */
 char *transpile_js(Node *program, const char *filename) {
+    const char *unsupported = find_unsupported_for_js(program);
+    if (unsupported) {
+        fprintf(stderr, "xs --emit js: %s not supported on this target. "
+                "Use --vm or --interp.\n", unsupported);
+        return NULL;
+    }
+
+    js_n_deleted_vars = 0;
     SB s;
     sb_init(&s);
 
@@ -3024,6 +3171,10 @@ char *transpile_js(Node *program, const char *filename) {
     sb_add(&s, "    if (typeof process !== 'undefined') process.stdout.write(s);\n");
     sb_add(&s, "    else console.log(s);\n");
     sb_add(&s, "};\n");
+    /* Builtins also need bare-reference bindings (`let g = println`). The
+     * direct-call path lowers to __xs_print; this aliases the bare name. */
+    sb_add(&s, "const println = __xs_print;\n");
+    sb_add(&s, "const print   = __xs_write;\n");
     sb_add(&s, "const __xs_add = (a, b) => {\n");
     sb_add(&s, "    if (Array.isArray(a) && Array.isArray(b)) return a.concat(b);\n");
     sb_add(&s, "    if (typeof a === \"string\" || typeof b === \"string\") return __xs_repr(a) + __xs_repr(b);\n");
@@ -3361,6 +3512,12 @@ char *transpile_js(Node *program, const char *filename) {
     sb_add(&s, "        switch (m) {\n");
     sb_add(&s, "            case 'len': case 'size': return o.length;\n");
     sb_add(&s, "            case 'is_empty': return o.length === 0;\n");
+    /* Range methods - .start / .end pull from the metadata stashed by
+     * __xs_range; for non-range arrays they collapse to first / last,
+     * which keeps `[1,2,3].start()` reasonable too. */
+    sb_add(&s, "            case 'start': return o.__xs_range_start !== undefined ? o.__xs_range_start : (o[0] !== undefined ? o[0] : null);\n");
+    sb_add(&s, "            case 'end':   return o.__xs_range_end !== undefined ? o.__xs_range_end : (o.length ? o[o.length-1] : null);\n");
+    sb_add(&s, "            case 'to_array': case 'toArray': case 'collect': return [...o];\n");
     sb_add(&s, "            case 'first': case 'head': return o[0] !== undefined ? o[0] : null;\n");
     sb_add(&s, "            case 'last': return o.length ? o[o.length-1] : null;\n");
     sb_add(&s, "            case 'tail': return o.slice(1);\n");
@@ -3745,6 +3902,27 @@ char *transpile_js(Node *program, const char *filename) {
        parens like the VM does. Defining as a property on the array is
        cheap; subclassing Array breaks too many JS interop paths. */
     sb_add(&s, "const __xs_tuple = (arr) => { Object.defineProperty(arr, '__xs_is_tuple', {value: true, enumerable: false}); return arr; };\n");
+    /* del-tombstone sentinel. xs_check_deleted throws a catchable error\n     * on read of a deleted local, mirroring the C / VM behaviour. */
+    sb_add(&s, "const __XS_DELETED = Symbol('__xs_deleted');\n");
+    sb_add(&s, "const __xs_check_deleted = (v, name) => {\n");
+    sb_add(&s, "    if (v === __XS_DELETED) throw new Error(\"name '\" + name + \"' is not defined (deleted)\");\n");
+    sb_add(&s, "    return v;\n");
+    sb_add(&s, "};\n");
+    /* Materialise a range as an array but stash the original (start, end)
+     * so r.end() returns the bound the user wrote rather than the last
+     * materialised element. Mirrors what xs_arr.is_range does on the C
+     * target. */
+    sb_add(&s, "const __xs_range = (start, end, inclusive) => {\n");
+    sb_add(&s, "    const s = Number(start), e = inclusive ? Number(end) + 1 : Number(end);\n");
+    sb_add(&s, "    const step = s <= e ? 1 : -1;\n");
+    sb_add(&s, "    const len = Math.max(0, (e - s) * step);\n");
+    sb_add(&s, "    const a = new Array(len);\n");
+    sb_add(&s, "    for (let i = 0; i < len; i++) a[i] = s + i * step;\n");
+    sb_add(&s, "    Object.defineProperty(a, '__xs_range_start', {value: s, enumerable: false});\n");
+    sb_add(&s, "    Object.defineProperty(a, '__xs_range_end',   {value: Number(end), enumerable: false});\n");
+    sb_add(&s, "    Object.defineProperty(a, '__xs_range_inclusive', {value: !!inclusive, enumerable: false});\n");
+    sb_add(&s, "    return a;\n");
+    sb_add(&s, "};\n");
     sb_add(&s, "const chr = (n) => String.fromCharCode(Number(n));\n");
     sb_add(&s, "const ord = (s) => typeof s === 'string' && s.length > 0 ? s.codePointAt(0) : 0;\n");
     sb_add(&s, "const random = {\n");
