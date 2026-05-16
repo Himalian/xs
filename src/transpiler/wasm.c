@@ -564,6 +564,59 @@ static int enum_variant_tag(EnumLayoutMap *m, const char *path) {
 }
 
 /* ========================================================================
+   Method dispatch table -- one entry per (struct_name, method_name) so
+   `obj.foo()` can dispatch to the right impl based on the receiver's
+   struct tag. Trait default methods get registered with struct_name=NULL
+   so they fire when no impl overrides them.
+   ======================================================================== */
+
+#define MAX_METHODS 1024
+
+typedef struct {
+    char *struct_name;   /* may be NULL for trait defaults */
+    char *trait_name;    /* may be NULL */
+    char *method_name;
+    int   fn_idx;        /* index into FuncMap (use USER_FUNC_BASE+fn_idx) */
+    int   n_params;      /* without env */
+} MethodEntry;
+
+typedef struct {
+    MethodEntry items[MAX_METHODS];
+    int         count;
+} MethodTable;
+
+static void method_table_init(MethodTable *m) { m->count = 0; }
+
+static void method_table_free(MethodTable *m) {
+    for (int i = 0; i < m->count; i++) {
+        free(m->items[i].struct_name);
+        free(m->items[i].trait_name);
+        free(m->items[i].method_name);
+    }
+    m->count = 0;
+}
+
+static void method_table_add(MethodTable *m, const char *struct_name,
+                             const char *trait_name, const char *method,
+                             int fn_idx, int n_params) {
+    if (m->count >= MAX_METHODS) return;
+    MethodEntry *e = &m->items[m->count++];
+    e->struct_name = struct_name ? strdup(struct_name) : NULL;
+    e->trait_name  = trait_name  ? strdup(trait_name)  : NULL;
+    e->method_name = strdup(method);
+    e->fn_idx      = fn_idx;
+    e->n_params    = n_params;
+}
+
+/* Find all entries that match `method` (not filtered by struct). */
+static int method_table_count_for(MethodTable *m, const char *method) {
+    int n = 0;
+    for (int i = 0; i < m->count; i++)
+        if (strcmp(m->items[i].method_name, method) == 0) n++;
+    return n;
+}
+
+/* ========================================================================
    Top-level binding tracker -- top-level `var`/`let`/`const` become
    WASM globals so any function (top-level or nested) can read/write
    them. Without this, top-level fns couldn't see module-scope state at
@@ -616,6 +669,7 @@ typedef struct {
     void            *fn_infos;      /* FuncInfo array for closure capture info */
     int              cur_fn_idx;    /* index of function being compiled (-1 for main) */
     TopBindings     *top_bindings;  /* top-level var/let/const -> global idx */
+    MethodTable     *methods;       /* per-(struct, method) impl table */
 } CompilerCtx;
 
 /* ========================================================================
@@ -1674,7 +1728,124 @@ static void compile_expr(Node *node, WasmBuf *code, LocalMap *locals, CompilerCt
         const char *method = node->method_call.method;
         int nargs = node->method_call.args.len;
 
-        /* Check user-defined methods FIRST (impl methods, class methods) */
+        /* Check user-defined methods. Multiple impls of the same method
+           name need runtime dispatch by the receiver's struct tag (or
+           class instance type, stored alongside the value). A single
+           registered impl can call directly. */
+        if (ctx->methods) {
+            int n_matches = method_table_count_for(ctx->methods, method);
+            if (n_matches == 1) {
+                /* Find the one entry. */
+                MethodEntry *only = NULL;
+                for (int k = 0; k < ctx->methods->count; k++) {
+                    if (strcmp(ctx->methods->items[k].method_name, method) == 0) {
+                        only = &ctx->methods->items[k]; break;
+                    }
+                }
+                compile_expr(node->method_call.obj, code, locals, ctx);
+                for (int i = 0; i < nargs; i++)
+                    compile_expr(node->method_call.args.items[i], code, locals, ctx);
+                emit_call(code, USER_FUNC_BASE + only->fn_idx);
+                break;
+            }
+            if (n_matches > 1) {
+                /* Runtime dispatch: load the receiver, read its embedded
+                   type-name string (data_ptr + 4 for struct values, or
+                   "name" map field for class instances), then chain
+                   string-equality checks against each impl's struct
+                   name. The default-method branch (struct_name=NULL)
+                   fires only when nothing else matches. */
+                int recv_local = locals_add(locals, "__mrecv");
+                compile_expr(node->method_call.obj, code, locals, ctx);
+                emit_local_set(code, recv_local);
+                /* Stash args in locals so each branch reuses them */
+                int arg_locals[16];
+                for (int i = 0; i < nargs && i < 16; i++) {
+                    arg_locals[i] = locals_add(locals, "__marg");
+                    compile_expr(node->method_call.args.items[i], code, locals, ctx);
+                    emit_local_set(code, arg_locals[i]);
+                }
+                /* Compute the receiver's stored type name (Value*).
+                   For TAG_STRUCT: data_ptr + 4 -> str val.
+                   For TAG_MAP (class instance): map_get(recv, "__class").
+                   For others: null. The first match wins. */
+                int rname_local = locals_add(locals, "__mrnm");
+                int tag_local = locals_add(locals, "__mtag");
+                emit_local_get(code, recv_local);
+                emit_call(code, RT_VAL_TAG);
+                emit_local_set(code, tag_local);
+                emit_local_get(code, tag_local);
+                emit_i32(code, TAG_STRUCT);
+                buf_byte(code, OP_I32_EQ);
+                buf_byte(code, OP_IF); buf_byte(code, WASM_TYPE_I32);
+                emit_local_get(code, recv_local);
+                emit_call(code, RT_VAL_I32);
+                emit_i32(code, 4);
+                buf_byte(code, OP_I32_ADD);
+                buf_byte(code, OP_I32_LOAD);
+                buf_leb128_u(code, 2); buf_leb128_u(code, 0);
+                buf_byte(code, OP_ELSE);
+                emit_local_get(code, tag_local);
+                emit_i32(code, TAG_MAP);
+                buf_byte(code, OP_I32_EQ);
+                buf_byte(code, OP_IF); buf_byte(code, WASM_TYPE_I32);
+                emit_local_get(code, recv_local);
+                {
+                    int kl = 0;
+                    int koff = strtab_add_with_len(ctx->strtab, "__class", &kl);
+                    emit_str_val(code, koff, kl);
+                }
+                emit_call(code, RT_MAP_GET);
+                buf_byte(code, OP_ELSE);
+                emit_null(code);
+                buf_byte(code, OP_END);
+                buf_byte(code, OP_END);
+                emit_local_set(code, rname_local);
+
+                /* Build a chain of `if rname == "X" then call X__method else ...` */
+                MethodEntry *defaults[16] = {0};
+                int n_defaults = 0;
+                int n_concrete = 0;
+                MethodEntry *concretes[16];
+                for (int k = 0; k < ctx->methods->count; k++) {
+                    MethodEntry *e = &ctx->methods->items[k];
+                    if (strcmp(e->method_name, method) != 0) continue;
+                    if (e->struct_name) {
+                        if (n_concrete < 16) concretes[n_concrete++] = e;
+                    } else {
+                        if (n_defaults < 16) defaults[n_defaults++] = e;
+                    }
+                }
+                /* Open if/else chain for each concrete impl */
+                int open = 0;
+                for (int k = 0; k < n_concrete; k++) {
+                    MethodEntry *e = concretes[k];
+                    int kl = 0;
+                    int koff = strtab_add_with_len(ctx->strtab, e->struct_name, &kl);
+                    emit_local_get(code, rname_local);
+                    emit_str_val(code, koff, kl);
+                    emit_call(code, RT_VAL_EQ);
+                    emit_call(code, RT_VAL_TRUTHY);
+                    buf_byte(code, OP_IF); buf_byte(code, WASM_TYPE_I32);
+                    emit_local_get(code, recv_local);
+                    for (int i = 0; i < nargs; i++) emit_local_get(code, arg_locals[i]);
+                    emit_call(code, USER_FUNC_BASE + e->fn_idx);
+                    buf_byte(code, OP_ELSE);
+                    open++;
+                }
+                /* Default branch (trait default if any, else null) */
+                if (n_defaults > 0) {
+                    emit_local_get(code, recv_local);
+                    for (int i = 0; i < nargs; i++) emit_local_get(code, arg_locals[i]);
+                    emit_call(code, USER_FUNC_BASE + defaults[0]->fn_idx);
+                } else {
+                    emit_null(code);
+                }
+                for (int k = 0; k < open; k++) buf_byte(code, OP_END);
+                break;
+            }
+        }
+        /* Fallback: lookup by bare name (legacy code paths). */
         {
             int fidx = funcs_find(ctx->funcs, method);
             if (fidx >= 0) {
@@ -2883,6 +3054,45 @@ static void compile_pattern_cond(Node *pat, int subject_local, WasmBuf *code,
         break;
     }
 
+    case NODE_PAT_MAP: {
+        /* Subject must be a map; each pattern key must be present in
+           the subject and its sub-pattern must match the value. */
+        emit_local_get(code, subject_local);
+        emit_call(code, RT_VAL_TAG);
+        emit_i32(code, TAG_MAP);
+        buf_byte(code, OP_I32_EQ);
+        for (int i = 0; i < pat->pat_map.nfields; i++) {
+            const char *k = pat->pat_map.keys[i];
+            if (!k) continue;
+            int kl = 0;
+            int koff = strtab_add_with_len(ctx->strtab, k, &kl);
+            int v_local = locals_add(locals, "__pmv");
+            emit_local_get(code, subject_local);
+            emit_str_val(code, koff, kl);
+            emit_call(code, RT_MAP_GET);
+            emit_local_set(code, v_local);
+            /* key present? map_get returns null (0 ptr or TAG_NULL) when
+               not found. Treat both as miss. */
+            emit_local_get(code, v_local);
+            buf_byte(code, OP_I32_EQZ);
+            buf_byte(code, OP_IF); buf_byte(code, WASM_TYPE_I32);
+            emit_i32(code, 0);
+            buf_byte(code, OP_ELSE);
+            emit_local_get(code, v_local);
+            emit_call(code, RT_VAL_TAG);
+            emit_i32(code, TAG_NULL);
+            buf_byte(code, OP_I32_NE);
+            buf_byte(code, OP_END);
+            buf_byte(code, OP_I32_AND);
+            /* And the sub-pattern (if any) matches. */
+            if (pat->pat_map.sub && pat->pat_map.sub[i]) {
+                compile_pattern_cond(pat->pat_map.sub[i], v_local, code, locals, ctx);
+                buf_byte(code, OP_I32_AND);
+            }
+        }
+        break;
+    }
+
     default:
         emit_i32(code, 1);
         break;
@@ -3053,6 +3263,28 @@ static void compile_pattern_bindings(Node *pat, int subject_local, WasmBuf *code
 
     case NODE_PAT_GUARD:
         compile_pattern_bindings(pat->pat_guard.pattern, subject_local, code, locals, ctx);
+        break;
+
+    case NODE_PAT_MAP:
+        for (int i = 0; i < pat->pat_map.nfields; i++) {
+            const char *k = pat->pat_map.keys[i];
+            if (!k) continue;
+            int kl = 0;
+            int koff = strtab_add_with_len(ctx->strtab, k, &kl);
+            int v_local = locals_add(locals, "__bmv");
+            emit_local_get(code, subject_local);
+            emit_str_val(code, koff, kl);
+            emit_call(code, RT_MAP_GET);
+            emit_local_set(code, v_local);
+            if (pat->pat_map.sub && pat->pat_map.sub[i]) {
+                compile_pattern_bindings(pat->pat_map.sub[i], v_local, code, locals, ctx);
+            } else {
+                /* shorthand: bind under key name */
+                int bidx = locals_ensure(locals, k);
+                emit_local_get(code, v_local);
+                emit_local_set(code, bidx);
+            }
+        }
         break;
 
     default:
@@ -6712,7 +6944,8 @@ static int collect_nested(Node *node, FuncInfo *out, int max, FuncMap *funcs, in
     return count;
 }
 
-static int collect_functions(Node *program, FuncInfo *out, int max, FuncMap *funcs) {
+static int collect_functions(Node *program, FuncInfo *out, int max,
+                             FuncMap *funcs, MethodTable *methods) {
     if (!program || VAL_TAG(program) != NODE_PROGRAM) return 0;
     int count = 0;
     NodeList *stmts = &program->program.stmts;
@@ -6724,26 +6957,69 @@ static int collect_functions(Node *program, FuncInfo *out, int max, FuncMap *fun
             out[count].n_params = s->fn_decl.params.len;
             count++;
         }
-        /* Also collect methods from impl blocks */
+        /* Methods from impl blocks. Mangle the name with the impl's
+           type so multiple impls of the same method coexist; record the
+           (struct, method) pair in the method table so call sites can
+           dispatch to the right impl. */
         if (s && VAL_TAG(s) == NODE_IMPL_DECL) {
+            const char *sname = s->impl_decl.type_name;
+            const char *tname = s->impl_decl.trait_name;
             for (int j = 0; j < s->impl_decl.members.len && count < max; j++) {
                 Node *m = s->impl_decl.members.items[j];
                 if (m && VAL_TAG(m) == NODE_FN_DECL && m->fn_decl.name) {
-                    funcs_add(funcs, m->fn_decl.name);
+                    char mangled[512];
+                    if (sname)
+                        snprintf(mangled, sizeof(mangled), "%s__%s", sname, m->fn_decl.name);
+                    else
+                        snprintf(mangled, sizeof(mangled), "%s", m->fn_decl.name);
+                    funcs_add(funcs, mangled);
                     out[count].node = m;
                     out[count].n_params = m->fn_decl.params.len;
+                    if (methods)
+                        method_table_add(methods, sname, tname, m->fn_decl.name,
+                                         count, m->fn_decl.params.len);
                     count++;
                 }
             }
         }
-        /* Methods from class declarations */
+        /* Methods from class declarations - same treatment. */
         if (s && VAL_TAG(s) == NODE_CLASS_DECL) {
+            const char *cname = s->class_decl.name;
             for (int j = 0; j < s->class_decl.members.len && count < max; j++) {
                 Node *m = s->class_decl.members.items[j];
                 if (m && VAL_TAG(m) == NODE_FN_DECL && m->fn_decl.name) {
-                    funcs_add(funcs, m->fn_decl.name);
+                    char mangled[512];
+                    if (cname)
+                        snprintf(mangled, sizeof(mangled), "%s__%s", cname, m->fn_decl.name);
+                    else
+                        snprintf(mangled, sizeof(mangled), "%s", m->fn_decl.name);
+                    funcs_add(funcs, mangled);
                     out[count].node = m;
                     out[count].n_params = m->fn_decl.params.len;
+                    if (methods)
+                        method_table_add(methods, cname, NULL, m->fn_decl.name,
+                                         count, m->fn_decl.params.len);
+                    count++;
+                }
+            }
+        }
+        /* Trait default methods: registered with struct_name=NULL so the
+           dispatch falls back to them when no impl overrides. */
+        if (s && VAL_TAG(s) == NODE_TRAIT_DECL) {
+            const char *tname = s->trait_decl.name;
+            for (int j = 0; j < s->trait_decl.methods.len && count < max; j++) {
+                Node *m = s->trait_decl.methods.items[j];
+                if (m && VAL_TAG(m) == NODE_FN_DECL && m->fn_decl.name &&
+                    m->fn_decl.body) {
+                    char mangled[512];
+                    snprintf(mangled, sizeof(mangled), "__trait_%s__%s",
+                             tname ? tname : "T", m->fn_decl.name);
+                    funcs_add(funcs, mangled);
+                    out[count].node = m;
+                    out[count].n_params = m->fn_decl.params.len;
+                    if (methods)
+                        method_table_add(methods, NULL, tname, m->fn_decl.name,
+                                         count, m->fn_decl.params.len);
                     count++;
                 }
             }
@@ -6905,7 +7181,7 @@ static const char *find_unsupported_for_wasm(Node *n) {
         }
         return find_unsupported_for_wasm(n->block.expr);
     case NODE_DEFER:        return NULL;
-    case NODE_PAT_MAP:      return "map patterns (`#{\"k\": k}`)";
+    case NODE_PAT_MAP:      return NULL;
     case NODE_LIT_BIGINT:   return "bigint literals (overflow into arbitrary-precision int)";
     case NODE_LIT_INT:
         /* WASM ints are i32 here; anything beyond that silently wraps.
@@ -6927,14 +7203,7 @@ static const char *find_unsupported_for_wasm(Node *n) {
         if (!n->use_.is_plugin && n->use_.path) return "cross-file `use \"...\"`";
         return NULL;
     case NODE_IMPORT:       return "stdlib imports (math/json/fs/...)";
-    case NODE_TRAIT_DECL: {
-        for (int i = 0; i < n->trait_decl.methods.len; i++) {
-            Node *m = n->trait_decl.methods.items[i];
-            if (m && VAL_TAG(m) == NODE_FN_DECL && m->fn_decl.body)
-                return "traits with default-method bodies";
-        }
-        return NULL;
-    }
+    case NODE_TRAIT_DECL:   return NULL;
     case NODE_IF: {
         const char *r;
         if ((r = find_unsupported_for_wasm(n->if_expr.cond))) return r;
@@ -7007,8 +7276,6 @@ static const char *find_unsupported_for_wasm(Node *n) {
         if (r) return r;
         for (int i = 0; i < n->match.arms.len; i++) {
             MatchArm *a = &n->match.arms.items[i];
-            if (a->pattern && VAL_TAG(a->pattern) == NODE_PAT_MAP)
-                return "map patterns (`#{\"k\": k}`)";
             if ((r = find_unsupported_for_wasm(a->body))) return r;
             if (a->guard && (r = find_unsupported_for_wasm(a->guard))) return r;
         }
@@ -7088,9 +7355,12 @@ int transpile_wasm(Node *program, const char *filename, const char *out_path) {
         }
     }
 
+    MethodTable methods;
+    method_table_init(&methods);
+
     /* Collect user function declarations */
     FuncInfo fn_infos[MAX_FUNCS] = {0};
-    int n_funcs = collect_functions(program, fn_infos, MAX_FUNCS, &funcs);
+    int n_funcs = collect_functions(program, fn_infos, MAX_FUNCS, &funcs, &methods);
 
     int has_main = (funcs_find(&funcs, "main") >= 0);
     int main_func_idx = -1;
@@ -7129,6 +7399,7 @@ int transpile_wasm(Node *program, const char *filename, const char *out_path) {
         ctx.fn_infos = fn_infos;
         ctx.cur_fn_idx = i;
         ctx.top_bindings = &top_bindings;
+        ctx.methods = &methods;
 
         /* Add parameters - for closures, add __env as first param */
         if (fn_infos[i].n_captures > 0) {
@@ -7202,6 +7473,7 @@ int transpile_wasm(Node *program, const char *filename, const char *out_path) {
         ctx.fn_infos = fn_infos;
         ctx.cur_fn_idx = -1;
         ctx.top_bindings = &top_bindings;
+        ctx.methods = &methods;
 
         if (VAL_TAG(program) == NODE_PROGRAM) {
             NodeList *stmts = &program->program.stmts;
@@ -7852,5 +8124,6 @@ int transpile_wasm(Node *program, const char *filename, const char *out_path) {
     struct_layouts_free(&struct_layouts);
     enum_layouts_free(&enum_layouts);
     top_bindings_free(&top_bindings);
+    method_table_free(&methods);
     return 0;
 }
