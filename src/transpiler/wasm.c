@@ -1399,6 +1399,34 @@ static void compile_expr(Node *node, WasmBuf *code, LocalMap *locals, CompilerCt
         Node *callee = node->call.callee;
         int nargs = node->call.args.len;
 
+        /* Enum variant constructor: Maybe::Some(42) etc. Build the same
+           [vtag, args...] array shape that NODE_SCOPE uses for zero-arg
+           variants. Without this the call dropped through to the indirect
+           path and trapped on a string-tagged "callee". */
+        if (callee && VAL_TAG(callee) == NODE_SCOPE && callee->scope.nparts > 0) {
+            char vpath[512] = {0};
+            for (int i = 0; i < callee->scope.nparts; i++) {
+                if (i) strcat(vpath, "::");
+                strcat(vpath, callee->scope.parts[i]);
+            }
+            int vtag = enum_variant_tag(ctx->enums, vpath);
+            if (vtag >= 0) {
+                emit_call(code, RT_ARR_NEW);
+                int arr_tmp = locals_add(locals, "__ector");
+                emit_local_set(code, arr_tmp);
+                emit_local_get(code, arr_tmp);
+                emit_int_val(code, vtag);
+                emit_call(code, RT_ARR_PUSH);
+                for (int i = 0; i < nargs; i++) {
+                    emit_local_get(code, arr_tmp);
+                    compile_expr(node->call.args.items[i], code, locals, ctx);
+                    emit_call(code, RT_ARR_PUSH);
+                }
+                emit_local_get(code, arr_tmp);
+                break;
+            }
+        }
+
         /* Built-in functions */
         if (callee && VAL_TAG(callee) == NODE_IDENT) {
             const char *name = callee->ident.name;
@@ -2622,10 +2650,17 @@ static void compile_expr(Node *node, WasmBuf *code, LocalMap *locals, CompilerCt
             }
             int vtag = enum_variant_tag(ctx->enums, full);
             if (vtag >= 0) {
-                /* Store as string so it prints as "Color::Red" etc. */
-                int slen = 0;
-                int soff = strtab_add_with_len(ctx->strtab, full, &slen);
-                emit_str_val(code, soff, slen);
+                /* Encode every variant uniformly as an array whose first
+                   slot is the variant tag (boxed as int). Variants with
+                   ctor args are built by the NODE_CALL path below; the
+                   pattern cond / bindings agree on this layout. */
+                emit_call(code, RT_ARR_NEW);
+                int arr_tmp = locals_add(locals, "__evar");
+                emit_local_set(code, arr_tmp);
+                emit_local_get(code, arr_tmp);
+                emit_int_val(code, vtag);
+                emit_call(code, RT_ARR_PUSH);
+                emit_local_get(code, arr_tmp);
             } else {
                 /* Try as a regular identifier (last part) */
                 int idx = locals_find(locals, node->scope.parts[node->scope.nparts - 1]);
@@ -3543,16 +3578,24 @@ static void compile_pattern_cond(Node *pat, int subject_local, WasmBuf *code,
     }
 
     case NODE_PAT_ENUM: {
-        /* Check variant tag */
+        /* Subject is an array of the form [vtag, args...]. Match needs
+           the array tag plus arr[0] == vtag. */
         int vtag = -1;
         if (pat->pat_enum.path) {
             vtag = enum_variant_tag(ctx->enums, pat->pat_enum.path);
         }
         if (vtag >= 0) {
             emit_local_get(code, subject_local);
+            emit_call(code, RT_VAL_TAG);
+            emit_i32(code, TAG_ARRAY);
+            buf_byte(code, OP_I32_EQ);
+            emit_local_get(code, subject_local);
+            emit_int_val(code, 0);
+            emit_call(code, RT_ARR_GET);
             emit_call(code, RT_VAL_I32);
             emit_i32(code, vtag);
             buf_byte(code, OP_I32_EQ);
+            buf_byte(code, OP_I32_AND);
         } else {
             emit_i32(code, 1);
         }
@@ -3712,10 +3755,11 @@ static void compile_pattern_bindings(Node *pat, int subject_local, WasmBuf *code
         break;
 
     case NODE_PAT_ENUM:
+        /* Subject layout is [vtag, args...]; ctor args start at index 1. */
         for (int i = 0; i < pat->pat_enum.args.len; i++) {
             int al = locals_add(locals, "__be_a");
             emit_local_get(code, subject_local);
-            emit_int_val(code, i);
+            emit_int_val(code, i + 1);
             emit_call(code, RT_ARR_GET);
             emit_local_set(code, al);
             compile_pattern_bindings(pat->pat_enum.args.items[i], al, code, locals, ctx);
