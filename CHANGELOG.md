@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.2.13
+
+The WASM AOT path (`xs --emit wasm`) used to silently produce wrong
+output for most non-trivial programs. The whole audit landed: closure
+write-through, byte-wise string equality, UTF-8 codepoint `.len`,
+struct match by type name, indirect closure calls, in-place map
+updates, top-level globals, mutual nested fns, `defer` with closure
+capture, receiver-aware method dispatch with trait default methods,
+map patterns, higher-order array methods (`.map` / `.filter` /
+`.reduce` / `.fold` / `.each` / `.some` / `.every` / `.find` /
+`.sort_with` / `.flat_map` / `.group_by` / `.partition` / `.sum` /
+`.product` / `.min_by` / `.max_by` / `.count`), codepoint-aware
+`.chars` / `.lines` / `.lower` / `.trim` / `.split` / `.replace`
+/ `.sort`, deep array equality, `.starts_with` correctness, bigint
+with arbitrary precision, tolerant `assert_eq` for chained float
+arithmetic, stdlib `import math / json / fs / time`, cross-file
+`use "./mod.xs"` with `as` rename and selective destructure,
+generators via eager array fill, `async` / `await` / `spawn` /
+`nursery` resolved synchronously in a single-threaded module,
+algebraic effects (`perform` / `handle` / `resume`) lowered through
+try-throw and global handler slots, reactive `bind` lowered to a
+one-shot let.
+
+The full 17-test conformance suite now runs end-to-end through
+`wasmtime` and matches the interpreter byte-for-byte. The
+`make wasm` runtime build remains the production browser path;
+`--emit wasm` is finally a viable AOT path for real programs.
+
 ## 1.2.12
 
 JS transpiler stopped crashing on six conformance cases. Trait default

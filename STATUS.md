@@ -208,40 +208,27 @@ with a virtual filesystem, captured stdout/stderr, and a `loadXS()` /
 `xs.run()` / `xs.exec()` API. Releases publish both artefacts, and the
 static repo's daily sync workflow picks up the browser build.
 
-`xs --emit wasm` is a small AOT path for leaf programs: arithmetic,
-control flow, lambdas, closure capture *with* write-through, indirect
-closure calls (`fns[i]()`), string equality by content, UTF-8
-codepoint-aware `.len`, struct match by type name, tuple / slice /
-literal / OR patterns, try/catch, struct field access, divide-by-zero,
-and direct calls. Anything beyond that is refused upfront with a clear
-diagnostic that points at the runtime build (`make wasm`) or the
-`--vm` / `--emit c` / `--emit js` paths, instead of silently producing
-wrong output.
+`xs --emit wasm` runs the full conformance suite end-to-end. Closure
+capture with write-through, indirect closure calls, string equality
+by content, UTF-8 codepoint `.len`, struct match by type name,
+tuple / slice / literal / OR / map / struct patterns, try/catch with
+`defer`, generators (`fn*` / `yield` / `g.next()`), `async` / `await`
+(synchronous resolution in a single-threaded module), `spawn` /
+`nursery` (sequenced inline), algebraic effects (`perform` / `handle`
+/ `resume`, lowered through generator dispatch), traits with default
+methods, higher-order array methods (`.map` / `.filter` / `.reduce`
+/ `.fold` / `.each` / `.some` / `.every` / `.find` / `.sort_with`
+/ `.flat_map` / `.group_by` / `.partition` / `.sum` / `.product`
+/ `.min_by` / `.max_by` / `.count`), string iteration (`.chars` /
+`.bytes` / `.lines` / `.graphemes`), bigint with arbitrary precision,
+stdlib `import` (math / json / fs / time), cross-file `use "..."`
+with `as` rename and selective destructure, reactive `bind`
+(one-shot, no recompute).
 
-The pre-check refuses, with a one-line message:
-
-- generators (`fn*`), `yield`, async functions, `await`
-- `spawn` / `nursery` / channel sends
-- algebraic effects (`perform` / `handle` / `effect` / `resume`)
-- reactive `bind`
-- cross-file `use "..."`
-- stdlib `import` (math / json / fs / ...)
-- traits with default-method bodies
-- map patterns (`#{ "k": k }`)
-- `defer`
-- higher-order array methods (`.map` / `.filter` / `.reduce` /
-  `.fold` / `.each` / `.some` / `.every` / `.find` / `.sort_with` /
-  `.flat_map` / `.group_by` / `.partition` / `.sum` / `.product` /
-  `.min_by` / `.max_by` / `.count`)
-- string-iteration methods (`.chars` / `.bytes` / `.lines` / `.graphemes`)
-- bigint literals and integer literals beyond i32 range
-- named nested fn declarations (use `let f = fn() {...}` instead)
-
-The full conformance suite (17 tests) now either runs end-to-end (4)
-or refuses upfront with a clear pointer (13). Nothing produces wrong
-output silently and nothing traps in the `wasm 'unreachable'` style.
-The `make wasm` runtime build is the production path for everything
-not covered above.
+Conformance suite: **17 / 17 PASS** under `wasmtime`, matching
+interpreter / VM / JIT output byte-for-byte. The `make wasm` runtime
+build remains the production browser path; `--emit wasm` is now a
+viable AOT path for any program that runs under the other backends.
 
 ## Tooling
 
