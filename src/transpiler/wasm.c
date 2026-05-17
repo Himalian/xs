@@ -2509,11 +2509,19 @@ static void compile_expr(Node *node, WasmBuf *code, LocalMap *locals, CompilerCt
             emit_call(code, RT_STR_LEN);
             break;
         }
-        if (strcmp(method, "next") == 0) {
-            /* Generator .next() bridge -- the wasm AOT lowers generators
-               into plain arrays; .next() just returns the i'th element
-               wrapped in {value, done}. We expose a synthetic adapter
-               by treating the receiver as already an array iterator. */
+        if (strcmp(method, "next") == 0 && nargs == 0) {
+            /* Generator .next() -- delegate to __gen_next helper if it
+               was emitted (the generator-lowering pass injects it). The
+               helper consumes one item from the generator's __items
+               array and returns {value, done}. Fall back to a stub
+               that treats the receiver as the produced value, which
+               keeps the older codegen path semantically equivalent. */
+            int gn_idx = funcs_find(ctx->funcs, "__gen_next");
+            if (gn_idx >= 0) {
+                compile_expr(node->method_call.obj, code, locals, ctx);
+                emit_call(code, USER_FUNC_BASE + gn_idx);
+                break;
+            }
             compile_expr(node->method_call.obj, code, locals, ctx);
             int rv = locals_add(locals, "__gnext_r");
             emit_local_set(code, rv);
@@ -10981,6 +10989,459 @@ static void wasm_rewrite_ns_method_calls(Node *n) {
     }
 }
 
+/* ---- Generator lowering --------------------------------------------------
+
+   `fn* foo(...) { body-with-yields }` is rewritten to a regular fn that
+   eagerly drains the body into a `__items` array, then returns the
+   generator value `#{__items: arr, __pos: 0}`. `yield expr` becomes
+   `__gen_buf.push(expr)`. `g.next()` and for-in are bridged via two
+   user-level helpers (__gen_next, __gen_iter) injected into the
+   program when any generator is present. */
+
+/* Find every NODE_YIELD inside subtree and replace it with
+   __gen_buf.push(yield_value). The yield node is consumed in place. */
+static void wasm_lower_yields(Node *n) {
+    if (!n) return;
+    switch (VAL_TAG(n)) {
+    case NODE_YIELD: {
+        /* Convert to __gen_buf.push(value) (a NODE_METHOD_CALL). */
+        Node *val = n->yield_.value;
+        n->yield_.value = NULL;
+        n->tag = NODE_METHOD_CALL;
+        n->method_call.obj = mk_ident("__gen_buf");
+        n->method_call.method = xs_strdup("push");
+        n->method_call.args = nodelist_new();
+        nodelist_push(&n->method_call.args, val ? val : mk_null_lit());
+        n->method_call.kwargs = nodepairlist_new();
+        n->method_call.optional = 0;
+        return;
+    }
+    case NODE_PROGRAM:
+        for (int i = 0; i < n->program.stmts.len; i++)
+            wasm_lower_yields(n->program.stmts.items[i]);
+        return;
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmts.len; i++)
+            wasm_lower_yields(n->block.stmts.items[i]);
+        wasm_lower_yields(n->block.expr);
+        return;
+    case NODE_FN_DECL:
+        /* Don't recurse into nested generator fn (it has its own buf). */
+        if (n->fn_decl.is_generator) return;
+        wasm_lower_yields(n->fn_decl.body);
+        return;
+    case NODE_LAMBDA:
+        if (n->lambda.is_generator & 1) return;
+        wasm_lower_yields(n->lambda.body);
+        return;
+    case NODE_IF:
+        wasm_lower_yields(n->if_expr.cond);
+        wasm_lower_yields(n->if_expr.then);
+        for (int i = 0; i < n->if_expr.elif_conds.len; i++)
+            wasm_lower_yields(n->if_expr.elif_conds.items[i]);
+        for (int i = 0; i < n->if_expr.elif_thens.len; i++)
+            wasm_lower_yields(n->if_expr.elif_thens.items[i]);
+        wasm_lower_yields(n->if_expr.else_branch);
+        return;
+    case NODE_WHILE:
+        wasm_lower_yields(n->while_loop.cond);
+        wasm_lower_yields(n->while_loop.body);
+        return;
+    case NODE_FOR:
+        wasm_lower_yields(n->for_loop.iter);
+        wasm_lower_yields(n->for_loop.body);
+        return;
+    case NODE_LOOP:
+        wasm_lower_yields(n->loop.body);
+        return;
+    case NODE_LET: case NODE_VAR:
+        wasm_lower_yields(n->let.value);
+        return;
+    case NODE_CONST:
+        wasm_lower_yields(n->const_.value);
+        return;
+    case NODE_EXPR_STMT:
+        wasm_lower_yields(n->expr_stmt.expr);
+        return;
+    case NODE_RETURN:
+        wasm_lower_yields(n->ret.value);
+        return;
+    case NODE_ASSIGN:
+        wasm_lower_yields(n->assign.target);
+        wasm_lower_yields(n->assign.value);
+        return;
+    case NODE_BINOP:
+        wasm_lower_yields(n->binop.left);
+        wasm_lower_yields(n->binop.right);
+        return;
+    case NODE_UNARY:
+        wasm_lower_yields(n->unary.expr);
+        return;
+    case NODE_CALL:
+        wasm_lower_yields(n->call.callee);
+        for (int i = 0; i < n->call.args.len; i++)
+            wasm_lower_yields(n->call.args.items[i]);
+        return;
+    case NODE_METHOD_CALL:
+        wasm_lower_yields(n->method_call.obj);
+        for (int i = 0; i < n->method_call.args.len; i++)
+            wasm_lower_yields(n->method_call.args.items[i]);
+        return;
+    case NODE_INDEX:
+        wasm_lower_yields(n->index.obj);
+        wasm_lower_yields(n->index.index);
+        return;
+    case NODE_FIELD:
+        wasm_lower_yields(n->field.obj);
+        return;
+    case NODE_TRY:
+        wasm_lower_yields(n->try_.body);
+        wasm_lower_yields(n->try_.finally_block);
+        for (int i = 0; i < n->try_.catch_arms.len; i++)
+            wasm_lower_yields(n->try_.catch_arms.items[i].body);
+        return;
+    case NODE_THROW:
+        wasm_lower_yields(n->throw_.value);
+        return;
+    case NODE_MATCH:
+        wasm_lower_yields(n->match.subject);
+        for (int i = 0; i < n->match.arms.len; i++)
+            wasm_lower_yields(n->match.arms.items[i].body);
+        return;
+    case NODE_LIT_ARRAY: case NODE_LIT_TUPLE:
+        for (int i = 0; i < n->lit_array.elems.len; i++)
+            wasm_lower_yields(n->lit_array.elems.items[i]);
+        return;
+    case NODE_LIT_MAP:
+        for (int i = 0; i < n->lit_map.keys.len; i++)
+            wasm_lower_yields(n->lit_map.keys.items[i]);
+        for (int i = 0; i < n->lit_map.vals.len; i++)
+            wasm_lower_yields(n->lit_map.vals.items[i]);
+        return;
+    case NODE_RANGE:
+        wasm_lower_yields(n->range.start);
+        wasm_lower_yields(n->range.end);
+        return;
+    case NODE_DEFER:
+        wasm_lower_yields(n->defer_.body);
+        return;
+    case NODE_INTERP_STRING:
+        for (int i = 0; i < n->lit_string.parts.len; i++)
+            wasm_lower_yields(n->lit_string.parts.items[i]);
+        return;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.fields.len; i++)
+            wasm_lower_yields(n->struct_init.fields.items[i].val);
+        wasm_lower_yields(n->struct_init.rest);
+        return;
+    default:
+        return;
+    }
+}
+
+/* Convert a single generator fn body into:
+     {
+       let __gen_buf = []
+       <original body with yields rewritten to __gen_buf.push(...)>
+       return #{ __items: __gen_buf, __pos: 0 }
+     }
+   The fn's is_generator flag is cleared so subsequent passes treat it
+   as a regular fn. */
+static void wasm_lower_generator_body(Node *fn) {
+    if (!fn) return;
+    Node *body = NULL;
+    if (VAL_TAG(fn) == NODE_FN_DECL) body = fn->fn_decl.body;
+    else if (VAL_TAG(fn) == NODE_LAMBDA) body = fn->lambda.body;
+    if (!body) return;
+
+    /* Make sure body is a block; wrap if not. */
+    if (VAL_TAG(body) != NODE_BLOCK) {
+        NodeList ss = nodelist_new();
+        Node *new_body = mk_block(ss, body);
+        if (VAL_TAG(fn) == NODE_FN_DECL) fn->fn_decl.body = new_body;
+        else                              fn->lambda.body = new_body;
+        body = new_body;
+    }
+
+    /* Rewrite yields inside the body. */
+    wasm_lower_yields(body);
+
+    /* Prepend `let __gen_buf = []`. */
+    Node *empty_arr = node_new(NODE_LIT_ARRAY, span_zero());
+    empty_arr->lit_array.elems = nodelist_new();
+    empty_arr->lit_array.repeat_val = NULL;
+    empty_arr->lit_array.repeat_cnt = 0;
+    Node *init_let = mk_let("__gen_buf", empty_arr, 0);
+
+    /* If the body had a trailing expr, demote it to an expr_stmt. */
+    if (body->block.expr) {
+        Node *es = mk_expr_stmt(body->block.expr);
+        nodelist_push(&body->block.stmts, es);
+        body->block.expr = NULL;
+    }
+
+    /* Insert init at beginning. Easier to build a fresh stmts list. */
+    NodeList new_stmts = nodelist_new();
+    nodelist_push(&new_stmts, init_let);
+    for (int i = 0; i < body->block.stmts.len; i++)
+        nodelist_push(&new_stmts, body->block.stmts.items[i]);
+    free(body->block.stmts.items);
+    body->block.stmts = new_stmts;
+
+    /* Build the trailing return value: #{ __items: __gen_buf, __pos: 0 } */
+    MapEntry ents[] = {
+        {"__items", mk_ident("__gen_buf")},
+        {"__pos",   mk_int_lit(0)},
+    };
+    Node *gen_val = mk_map_lit_entries(ents, 2);
+    body->block.expr = gen_val;
+
+    /* Clear the generator marker so codegen treats as regular fn. */
+    if (VAL_TAG(fn) == NODE_FN_DECL) fn->fn_decl.is_generator = 0;
+    else                              fn->lambda.is_generator &= ~1;
+}
+
+/* Recursively walk and lower every generator fn / lambda. */
+static void wasm_lower_all_generators(Node *n) {
+    if (!n) return;
+    if (VAL_TAG(n) == NODE_FN_DECL && n->fn_decl.is_generator) {
+        wasm_lower_generator_body(n);
+        /* Recurse into the (now-rewritten) body in case it nests another. */
+        wasm_lower_all_generators(n->fn_decl.body);
+        return;
+    }
+    if (VAL_TAG(n) == NODE_LAMBDA && (n->lambda.is_generator & 1)) {
+        wasm_lower_generator_body(n);
+        wasm_lower_all_generators(n->lambda.body);
+        return;
+    }
+    switch (VAL_TAG(n)) {
+    case NODE_PROGRAM:
+        for (int i = 0; i < n->program.stmts.len; i++)
+            wasm_lower_all_generators(n->program.stmts.items[i]);
+        return;
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmts.len; i++)
+            wasm_lower_all_generators(n->block.stmts.items[i]);
+        wasm_lower_all_generators(n->block.expr);
+        return;
+    case NODE_FN_DECL:
+        wasm_lower_all_generators(n->fn_decl.body);
+        return;
+    case NODE_LAMBDA:
+        wasm_lower_all_generators(n->lambda.body);
+        return;
+    case NODE_IF:
+        wasm_lower_all_generators(n->if_expr.cond);
+        wasm_lower_all_generators(n->if_expr.then);
+        for (int i = 0; i < n->if_expr.elif_conds.len; i++)
+            wasm_lower_all_generators(n->if_expr.elif_conds.items[i]);
+        for (int i = 0; i < n->if_expr.elif_thens.len; i++)
+            wasm_lower_all_generators(n->if_expr.elif_thens.items[i]);
+        wasm_lower_all_generators(n->if_expr.else_branch);
+        return;
+    case NODE_WHILE:
+        wasm_lower_all_generators(n->while_loop.cond);
+        wasm_lower_all_generators(n->while_loop.body);
+        return;
+    case NODE_FOR:
+        wasm_lower_all_generators(n->for_loop.iter);
+        wasm_lower_all_generators(n->for_loop.body);
+        return;
+    case NODE_LOOP:
+        wasm_lower_all_generators(n->loop.body);
+        return;
+    case NODE_LET: case NODE_VAR:
+        wasm_lower_all_generators(n->let.value);
+        return;
+    case NODE_CONST:
+        wasm_lower_all_generators(n->const_.value);
+        return;
+    case NODE_EXPR_STMT:
+        wasm_lower_all_generators(n->expr_stmt.expr);
+        return;
+    case NODE_RETURN:
+        wasm_lower_all_generators(n->ret.value);
+        return;
+    case NODE_ASSIGN:
+        wasm_lower_all_generators(n->assign.target);
+        wasm_lower_all_generators(n->assign.value);
+        return;
+    case NODE_BINOP:
+        wasm_lower_all_generators(n->binop.left);
+        wasm_lower_all_generators(n->binop.right);
+        return;
+    case NODE_UNARY:
+        wasm_lower_all_generators(n->unary.expr);
+        return;
+    case NODE_CALL:
+        wasm_lower_all_generators(n->call.callee);
+        for (int i = 0; i < n->call.args.len; i++)
+            wasm_lower_all_generators(n->call.args.items[i]);
+        return;
+    case NODE_METHOD_CALL:
+        wasm_lower_all_generators(n->method_call.obj);
+        for (int i = 0; i < n->method_call.args.len; i++)
+            wasm_lower_all_generators(n->method_call.args.items[i]);
+        return;
+    case NODE_TRY:
+        wasm_lower_all_generators(n->try_.body);
+        wasm_lower_all_generators(n->try_.finally_block);
+        for (int i = 0; i < n->try_.catch_arms.len; i++)
+            wasm_lower_all_generators(n->try_.catch_arms.items[i].body);
+        return;
+    case NODE_MATCH:
+        wasm_lower_all_generators(n->match.subject);
+        for (int i = 0; i < n->match.arms.len; i++)
+            wasm_lower_all_generators(n->match.arms.items[i].body);
+        return;
+    case NODE_LIT_ARRAY: case NODE_LIT_TUPLE:
+        for (int i = 0; i < n->lit_array.elems.len; i++)
+            wasm_lower_all_generators(n->lit_array.elems.items[i]);
+        return;
+    case NODE_LIT_MAP:
+        for (int i = 0; i < n->lit_map.keys.len; i++)
+            wasm_lower_all_generators(n->lit_map.keys.items[i]);
+        for (int i = 0; i < n->lit_map.vals.len; i++)
+            wasm_lower_all_generators(n->lit_map.vals.items[i]);
+        return;
+    case NODE_INDEX:
+        wasm_lower_all_generators(n->index.obj);
+        wasm_lower_all_generators(n->index.index);
+        return;
+    case NODE_FIELD:
+        wasm_lower_all_generators(n->field.obj);
+        return;
+    default:
+        return;
+    }
+}
+
+/* Returns 1 iff any descendant is a generator fn or lambda. */
+static int wasm_program_has_generators(Node *n) {
+    if (!n) return 0;
+    if (VAL_TAG(n) == NODE_FN_DECL && n->fn_decl.is_generator) return 1;
+    if (VAL_TAG(n) == NODE_LAMBDA && (n->lambda.is_generator & 1)) return 1;
+    switch (VAL_TAG(n)) {
+    case NODE_PROGRAM:
+        for (int i = 0; i < n->program.stmts.len; i++)
+            if (wasm_program_has_generators(n->program.stmts.items[i])) return 1;
+        return 0;
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmts.len; i++)
+            if (wasm_program_has_generators(n->block.stmts.items[i])) return 1;
+        return wasm_program_has_generators(n->block.expr);
+    case NODE_FN_DECL: return wasm_program_has_generators(n->fn_decl.body);
+    case NODE_LAMBDA:  return wasm_program_has_generators(n->lambda.body);
+    case NODE_IF:
+        if (wasm_program_has_generators(n->if_expr.then)) return 1;
+        for (int i = 0; i < n->if_expr.elif_thens.len; i++)
+            if (wasm_program_has_generators(n->if_expr.elif_thens.items[i])) return 1;
+        return wasm_program_has_generators(n->if_expr.else_branch);
+    case NODE_WHILE: return wasm_program_has_generators(n->while_loop.body);
+    case NODE_FOR:   return wasm_program_has_generators(n->for_loop.body);
+    case NODE_LOOP:  return wasm_program_has_generators(n->loop.body);
+    case NODE_LET: case NODE_VAR: return wasm_program_has_generators(n->let.value);
+    case NODE_CONST: return wasm_program_has_generators(n->const_.value);
+    case NODE_EXPR_STMT: return wasm_program_has_generators(n->expr_stmt.expr);
+    case NODE_RETURN: return wasm_program_has_generators(n->ret.value);
+    default: return 0;
+    }
+}
+
+/* Helpers spliced into the program when it contains generators.
+   __gen_iter unwraps a generator value to its underlying __items
+   array; pass-through for plain arrays so for-in works on both.
+   __gen_next pops one item and returns the iterator-protocol shape. */
+static Node *wasm_build_generator_helpers(void) {
+    static const char *gen_src =
+        "fn __gen_iter(g) {\n"
+        "    if type(g) == \"6\" { return g[\"__items\"] }\n"
+        "    return g\n"
+        "}\n"
+        "fn __gen_next(g) {\n"
+        "    let p = g[\"__pos\"]\n"
+        "    let it = g[\"__items\"]\n"
+        "    let m = #{}\n"
+        "    if p >= it.len() {\n"
+        "        m[\"value\"] = null\n"
+        "        m[\"done\"] = true\n"
+        "        return m\n"
+        "    }\n"
+        "    g[\"__pos\"] = p + 1\n"
+        "    m[\"value\"] = it[p]\n"
+        "    m[\"done\"] = false\n"
+        "    return m\n"
+        "}\n";
+    Lexer lex; lexer_init(&lex, gen_src, "<wasm-gen-helpers>");
+    TokenArray ta = lexer_tokenize(&lex);
+    Parser p; parser_init(&p, &ta, "<wasm-gen-helpers>");
+    Node *prog = parser_parse(&p);
+    token_array_free(&ta);
+    comment_list_free(&lex.comments);
+    if (!prog || p.had_error) {
+        if (prog) node_free(prog);
+        return NULL;
+    }
+    return prog;
+}
+
+/* Wrap every for-in's iter expression with __gen_iter(...). The helper
+   returns the original value untouched if it isn't a generator map, so
+   the rewrite is safe to apply unconditionally. */
+static void wasm_wrap_for_iters(Node *n) {
+    if (!n) return;
+    switch (VAL_TAG(n)) {
+    case NODE_FOR:
+        if (n->for_loop.iter) {
+            Node *call = node_new(NODE_CALL, span_zero());
+            call->call.callee = mk_ident("__gen_iter");
+            call->call.args = nodelist_new();
+            call->call.kwargs = nodepairlist_new();
+            nodelist_push(&call->call.args, n->for_loop.iter);
+            n->for_loop.iter = call;
+        }
+        wasm_wrap_for_iters(n->for_loop.body);
+        return;
+    case NODE_PROGRAM:
+        for (int i = 0; i < n->program.stmts.len; i++)
+            wasm_wrap_for_iters(n->program.stmts.items[i]);
+        return;
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmts.len; i++)
+            wasm_wrap_for_iters(n->block.stmts.items[i]);
+        wasm_wrap_for_iters(n->block.expr);
+        return;
+    case NODE_FN_DECL: wasm_wrap_for_iters(n->fn_decl.body); return;
+    case NODE_LAMBDA:  wasm_wrap_for_iters(n->lambda.body); return;
+    case NODE_IF:
+        wasm_wrap_for_iters(n->if_expr.then);
+        for (int i = 0; i < n->if_expr.elif_thens.len; i++)
+            wasm_wrap_for_iters(n->if_expr.elif_thens.items[i]);
+        wasm_wrap_for_iters(n->if_expr.else_branch);
+        return;
+    case NODE_WHILE:   wasm_wrap_for_iters(n->while_loop.body); return;
+    case NODE_LOOP:    wasm_wrap_for_iters(n->loop.body); return;
+    case NODE_LET: case NODE_VAR: wasm_wrap_for_iters(n->let.value); return;
+    case NODE_CONST:   wasm_wrap_for_iters(n->const_.value); return;
+    case NODE_EXPR_STMT: wasm_wrap_for_iters(n->expr_stmt.expr); return;
+    case NODE_RETURN:  wasm_wrap_for_iters(n->ret.value); return;
+    case NODE_TRY:
+        wasm_wrap_for_iters(n->try_.body);
+        wasm_wrap_for_iters(n->try_.finally_block);
+        for (int i = 0; i < n->try_.catch_arms.len; i++)
+            wasm_wrap_for_iters(n->try_.catch_arms.items[i].body);
+        return;
+    case NODE_MATCH:
+        wasm_wrap_for_iters(n->match.subject);
+        for (int i = 0; i < n->match.arms.len; i++)
+            wasm_wrap_for_iters(n->match.arms.items[i].body);
+        return;
+    default:
+        return;
+    }
+}
+
 /* Top-level rewrite. Runs lower_node recursively, then expands
    NODE_USE / NODE_IMPORT / NODE_EFFECT_DECL into the equivalent
    regular-statement sequences. The output is still a NODE_PROGRAM. */
@@ -11126,6 +11587,29 @@ static void wasm_lower_program(Node *program, const char *src_filename) {
        rewritten consistently. */
     if (g_n_wasm_ns_names > 0) wasm_rewrite_ns_method_calls(program);
 
+    /* Generator lowering: convert every `fn*` into a regular fn that
+       eagerly fills an items array and returns a generator value, inject
+       the helpers, wrap every for-in iter in __gen_iter so we drive
+       generators transparently as if they were arrays. */
+    if (wasm_program_has_generators(program)) {
+        wasm_lower_all_generators(program);
+        wasm_wrap_for_iters(program);
+        Node *helpers = wasm_build_generator_helpers();
+        if (helpers && VAL_TAG(helpers) == NODE_PROGRAM) {
+            NodeList combined = nodelist_new();
+            for (int i = 0; i < helpers->program.stmts.len; i++)
+                nodelist_push(&combined, helpers->program.stmts.items[i]);
+            for (int i = 0; i < program->program.stmts.len; i++)
+                nodelist_push(&combined, program->program.stmts.items[i]);
+            free(helpers->program.stmts.items);
+            helpers->program.stmts.items = NULL;
+            helpers->program.stmts.len = 0;
+            helpers->program.stmts.cap = 0;
+            node_free(helpers);
+            free(program->program.stmts.items);
+            program->program.stmts = combined;
+        }
+    }
 }
 
 /* Pre-check that bails out with a clear error for features the WASM
@@ -11139,11 +11623,9 @@ static const char *find_unsupported_for_wasm(Node *n) {
     if (!n) return NULL;
     switch (VAL_TAG(n)) {
     case NODE_FN_DECL:
-        if (n->fn_decl.is_generator) return "generator functions (fn*)";
-        /* async marker is cleared by lower_node */
+        /* generator + async markers are cleared by lowering passes */
         return find_unsupported_for_wasm(n->fn_decl.body);
     case NODE_LAMBDA:
-        if (n->lambda.is_generator & 1) return "generator lambdas (fn*)";
         return find_unsupported_for_wasm(n->lambda.body);
     case NODE_PROGRAM:
         for (int i = 0; i < n->program.stmts.len; i++) {
@@ -11170,7 +11652,7 @@ static const char *find_unsupported_for_wasm(Node *n) {
     case NODE_EFFECT_DECL:  return "algebraic effects (perform/handle)";
     case NODE_RESUME:       return "algebraic effects (perform/handle)";
     case NODE_BIND:         return "reactive `bind` declarations";
-    case NODE_YIELD:        return "yield (generators)";
+    case NODE_YIELD:        return NULL; /* lowered to __gen_buf.push */
     case NODE_USE:          return NULL; /* lowered before this check */
     case NODE_IMPORT:       return NULL; /* lowered before this check */
     case NODE_TRAIT_DECL:   return NULL;
