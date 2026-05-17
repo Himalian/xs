@@ -3282,8 +3282,20 @@ static void compile_expr(Node *node, WasmBuf *code, LocalMap *locals, CompilerCt
     case NODE_EFFECT_DECL:
     case NODE_ACTOR_DECL:
     case NODE_TAG_DECL:
-    case NODE_BIND:
         emit_null(code);
+        break;
+
+    case NODE_BIND:
+        /* Bind in expression position: evaluate once, return the value. */
+        if (node->bind_decl.expr) {
+            compile_expr(node->bind_decl.expr, code, locals, ctx);
+            if (node->bind_decl.name) {
+                int idx = locals_ensure(locals, node->bind_decl.name);
+                emit_local_tee(code, idx);
+            }
+        } else {
+            emit_null(code);
+        }
         break;
 
     case NODE_LET:
@@ -4359,8 +4371,20 @@ static void compile_stmt(Node *node, WasmBuf *code, LocalMap *locals, CompilerCt
     /* ---- Tag/Bind ---- */
 
     case NODE_TAG_DECL:
-    case NODE_BIND:
         break;
+
+    case NODE_BIND: {
+        /* Reactive bind would re-evaluate when dependencies change.
+           The AOT path does not have a reactive runtime, so we lower
+           the binding to a one-shot let -- the value is computed once
+           at the bind point and never recomputed. */
+        if (node->bind_decl.name && node->bind_decl.expr) {
+            int idx = locals_ensure(locals, node->bind_decl.name);
+            compile_expr(node->bind_decl.expr, code, locals, ctx);
+            emit_local_set(code, idx);
+        }
+        break;
+    }
 
     /* ---- Nursery ---- */
 
@@ -12305,7 +12329,6 @@ static const char *find_unsupported_for_wasm(Node *n) {
     case NODE_HANDLE:       return NULL; /* lowered in place */
     case NODE_EFFECT_DECL:  return NULL; /* dropped */
     case NODE_RESUME:       return NULL; /* lowered to assignments */
-    case NODE_BIND:         return "reactive `bind` declarations";
     case NODE_YIELD:        return NULL; /* lowered to __gen_buf.push */
     case NODE_USE:          return NULL; /* lowered before this check */
     case NODE_IMPORT:       return NULL; /* lowered before this check */
