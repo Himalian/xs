@@ -31,6 +31,11 @@ static void emit_pattern_bindings(SB *s, Node *pat, const char *subject, int dep
 static const char *js_deleted_vars[MAX_JS_DELETED_VARS];
 static int js_n_deleted_vars = 0;
 
+/* forward decls for the multi-arity overload tracker (defined near transpile_js) */
+static int js_ol_is_overloaded(const char *name);
+static int js_ol_lookup(const char *name);
+static void js_ol_record(const char *name, int arity);
+
 /* Source-file directory for the program currently being transpiled.
    Used to resolve `use "./relative.xs"` paths in NODE_USE emit. */
 static char g_js_src_dir[1024] = "";
@@ -2572,6 +2577,15 @@ static void emit_stmt(SB *s, Node *n, int depth) {
            the surrounding block's control flow do the right thing. */
         const char *fn_name = n->fn_decl.name;
         int named = fn_name && fn_name[0] && fn_name[0] != '<';
+        /* Multi-arity overload: mangle to `name_a<arity>` so each decl
+         * gets its own JS function. The dispatcher at the bottom of
+         * the file routes by args.length. */
+        char fn_mangle_buf[256];
+        if (named && js_ol_is_overloaded(fn_name)) {
+            snprintf(fn_mangle_buf, sizeof(fn_mangle_buf), "%s_a%d",
+                     fn_name, n->fn_decl.params.len);
+            fn_name = fn_mangle_buf;
+        }
         if (!named) sb_add(s, "return (");
         if (fn_is_gen) {
             if (named) sb_printf(s, "function* %s", fn_name);
@@ -3579,6 +3593,39 @@ static int program_imports_module(Node *program, const char *name) {
     return 0;
 }
 
+/* Overload tracking: when the source declares `fn calc(x)` and then
+ * `fn calc(x, y)`, the interp/vm/jit merge into an OVERLOAD value that
+ * dispatches by arity. The JS path used to let the second decl shadow
+ * the first; now we mangle each conflicting decl to `name_a<arity>`
+ * and emit a dispatcher at the end of the prelude. */
+#define JS_OL_MAX 128
+static const char *js_ol_names[JS_OL_MAX];
+static int         js_ol_arities[JS_OL_MAX][8];
+static int         js_ol_arity_count[JS_OL_MAX];
+static int         js_ol_count = 0;
+
+static int js_ol_lookup(const char *name) {
+    for (int i = 0; i < js_ol_count; i++)
+        if (strcmp(js_ol_names[i], name) == 0) return i;
+    return -1;
+}
+static void js_ol_record(const char *name, int arity) {
+    if (!name) return;
+    int idx = js_ol_lookup(name);
+    if (idx < 0) {
+        if (js_ol_count >= JS_OL_MAX) return;
+        idx = js_ol_count++;
+        js_ol_names[idx] = name;
+        js_ol_arity_count[idx] = 0;
+    }
+    if (js_ol_arity_count[idx] >= 8) return;
+    js_ol_arities[idx][js_ol_arity_count[idx]++] = arity;
+}
+static int js_ol_is_overloaded(const char *name) {
+    int idx = js_ol_lookup(name);
+    return idx >= 0 && js_ol_arity_count[idx] > 1;
+}
+
 /* Trigger registry collection. Walk the program top-level and emit one
  * entry per trigger-decorated fn. @once is a modifier, not a trigger;
  * it doesn't get its own entry. memoize/retry/timed/trace are wrapping
@@ -3602,6 +3649,16 @@ char *transpile_js(Node *program, const char *filename) {
 
     purity_analyze(program);
     js_n_deleted_vars = 0;
+
+    /* Pre-scan for multi-arity overloads at the program top level. */
+    js_ol_count = 0;
+    if (VAL_TAG(program) == NODE_PROGRAM) {
+        for (int i = 0; i < program->program.stmts.len; i++) {
+            Node *st = program->program.stmts.items[i];
+            if (st && VAL_TAG(st) == NODE_FN_DECL && st->fn_decl.name)
+                js_ol_record(st->fn_decl.name, st->fn_decl.params.len);
+        }
+    }
     SB s;
     sb_init(&s);
 
@@ -4677,10 +4734,24 @@ char *transpile_js(Node *program, const char *filename) {
     if (has_top_await) sb_add(&s, "(async () => {\n");
 
     if (VAL_TAG(program) == NODE_PROGRAM) {
+        /* Overload dispatchers come BEFORE user statements. Each
+         * routes name(...args) by args.length to the matching mangled
+         * fn (name_a<arity>). The mangled fns are emitted as JS
+         * function declarations, which hoist, so referring to them
+         * from a dispatcher defined earlier in the file is safe. */
+        for (int oi = 0; oi < js_ol_count; oi++) {
+            if (js_ol_arity_count[oi] < 2) continue;
+            const char *nm = js_ol_names[oi];
+            sb_printf(&s, "const %s = (function(){ const t = {", nm);
+            for (int ai = 0; ai < js_ol_arity_count[oi]; ai++) {
+                if (ai) sb_add(&s, ", ");
+                sb_printf(&s, "%d: %s_a%d", js_ol_arities[oi][ai], nm, js_ol_arities[oi][ai]);
+            }
+            sb_printf(&s, "}; const ks = Object.keys(t).map(Number).sort((x,y)=>x-y); return (...a) => (t[a.length] || t[ks.find(k => k >= a.length) ?? ks[ks.length-1]])(...a); })();\n");
+        }
         for (int i = 0; i < program->program.stmts.len; i++) {
             Node *st = program->program.stmts.items[i];
             emit_node(&s, st, has_top_await ? 1 : 0);
-            /* check if this is a main() function declaration */
             if (st && VAL_TAG(st) == NODE_FN_DECL && st->fn_decl.name &&
                 strcmp(st->fn_decl.name, "main") == 0) {
                 has_main = 1;
