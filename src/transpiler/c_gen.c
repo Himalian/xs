@@ -10,6 +10,7 @@
 #include "core/xs.h"
 #include "core/lexer.h"
 #include "core/parser.h"
+#include "semantic/purity.h"
 
 /* forward declarations */
 static void emit_expr(SB *s, Node *n, int depth);
@@ -483,12 +484,13 @@ static int register_lambda(Node *n) {
  * `fn calc(x, y)`; C does not. We mangle to `calc_1` / `calc_2` and
  * route the call site by arity. */
 #define MAX_FN_SIGS 128
-static struct { const char *name; int n_params; } fn_sigs[MAX_FN_SIGS];
+static struct { const char *name; int n_params; int is_pure; } fn_sigs[MAX_FN_SIGS];
 static int n_fn_sigs = 0;
-static void register_fn_sig(const char *name, int n_params) {
+static void register_fn_sig_pure(const char *name, int n_params, int is_pure) {
     if (n_fn_sigs < MAX_FN_SIGS) {
         fn_sigs[n_fn_sigs].name = name;
         fn_sigs[n_fn_sigs].n_params = n_params;
+        fn_sigs[n_fn_sigs].is_pure = is_pure;
         n_fn_sigs++;
     }
 }
@@ -498,6 +500,11 @@ static int lookup_fn_param_count(const char *name) {
     for (int i = 0; i < n_fn_sigs; i++)
         if (strcmp(fn_sigs[i].name, name) == 0) return fn_sigs[i].n_params;
     return -1;
+}
+static int lookup_fn_is_pure(const char *name) {
+    for (int i = 0; i < n_fn_sigs; i++)
+        if (strcmp(fn_sigs[i].name, name) == 0) return fn_sigs[i].is_pure;
+    return 0;
 }
 static int count_fn_overloads(const char *name) {
     int n = 0;
@@ -920,7 +927,8 @@ static void prescan_stmts(Node *program) {
         }
         /* register function signatures for default param padding */
         if (VAL_TAG(st) == NODE_FN_DECL && st->fn_decl.name)
-            register_fn_sig(st->fn_decl.name, st->fn_decl.params.len);
+            register_fn_sig_pure(st->fn_decl.name, st->fn_decl.params.len,
+                                 st->fn_decl.inferred_pure);
     }
 }
 
@@ -1151,7 +1159,9 @@ static void emit_expr(SB *s, Node *n, int depth) {
             /* bare reference to a top-level function: wrap as a callable
              * xs_val so it can be passed to .map / .filter / etc. The
              * wrapper is generated alongside the function itself. */
-            sb_printf(s, "xs_fn_new(__xs_wrap_%s, NULL)", n->ident.name);
+            sb_printf(s, "%s(__xs_wrap_%s, NULL)",
+                      lookup_fn_is_pure(n->ident.name) ? "xs_fn_new_pure" : "xs_fn_new",
+                      n->ident.name);
         } else
             emit_safe_name(s, n->ident.name);
         if (wrap_del) sb_printf(s, ", \"%s\")", n->ident.name);
@@ -1418,6 +1428,11 @@ static void emit_expr(SB *s, Node *n, int depth) {
             sb_addc(s, ')');
         } else if (is_callee_name(n->call.callee, "type")) {
             sb_add(s, "xs_type(");
+            if (n->call.args.len > 0) emit_expr(s, n->call.args.items[0], depth);
+            else sb_add(s, "XS_NULL");
+            sb_addc(s, ')');
+        } else if (is_callee_name(n->call.callee, "__pure?")) {
+            sb_add(s, "xs_is_pure(");
             if (n->call.args.len > 0) emit_expr(s, n->call.args.items[0], depth);
             else sb_add(s, "XS_NULL");
             sb_addc(s, ')');
@@ -2611,9 +2626,13 @@ static void emit_expr(SB *s, Node *n, int depth) {
                     sb_printf(s, "__cenv_%d[%d] = __box_%s;\n", lid, ci, cap);
             }
             sb_indent(s, depth);
-            sb_printf(s, "xs_fn_new(__xs_lambda_%d, __cenv_%d); })", lid, lid);
+            sb_printf(s, "%s(__xs_lambda_%d, __cenv_%d); })",
+                      n->lambda.inferred_pure ? "xs_fn_new_pure" : "xs_fn_new",
+                      lid, lid);
         } else {
-            sb_printf(s, "xs_fn_new(__xs_lambda_%d, NULL)", lid);
+            sb_printf(s, "%s(__xs_lambda_%d, NULL)",
+                      n->lambda.inferred_pure ? "xs_fn_new_pure" : "xs_fn_new",
+                      lid);
         }
         break;
     }
@@ -5218,6 +5237,7 @@ static Node *c_fn_to_lambda(Node *fn) {
     lam->lambda.params = fn->fn_decl.params;
     lam->lambda.body = fn->fn_decl.body;
     lam->lambda.is_generator = fn->fn_decl.is_generator;
+    lam->lambda.inferred_pure = fn->fn_decl.inferred_pure;
     /* Detach so node_free on fn doesn't double-free. */
     fn->fn_decl.params.items = NULL;
     fn->fn_decl.params.len = 0;
@@ -6239,6 +6259,7 @@ char *transpile_c(Node *program, const char *filename) {
      * already handles: no async markers, no NODE_AWAIT/SPAWN/NURSERY
      * wrappers, no generator fns, no `use` imports. */
     c_lower_program(program, filename);
+    purity_analyze(program);
 
     const char *unsupported = find_unsupported_for_c(program);
     if (unsupported) {
@@ -7201,11 +7222,20 @@ char *transpile_c(Node *program, const char *filename) {
         "    return XS_STR(\"unknown\");\n"
         "}\n\n"
         "/* closure runtime */\n"
-        "typedef struct { xs_val (*fn)(void*, xs_val*, int); void *env; } xs_fn_t;\n\n"
+        "typedef struct { xs_val (*fn)(void*, xs_val*, int); void *env; int is_pure; } xs_fn_t;\n\n"
         "static xs_val xs_fn_new(xs_val (*fn)(void*, xs_val*, int), void *env) {\n"
         "    xs_fn_t *f = (xs_fn_t*)malloc(sizeof(xs_fn_t));\n"
-        "    f->fn = fn; f->env = env;\n"
+        "    f->fn = fn; f->env = env; f->is_pure = 0;\n"
         "    return (xs_val){.tag=8, .p=f};\n"
+        "}\n\n"
+        "static xs_val xs_fn_new_pure(xs_val (*fn)(void*, xs_val*, int), void *env) {\n"
+        "    xs_fn_t *f = (xs_fn_t*)malloc(sizeof(xs_fn_t));\n"
+        "    f->fn = fn; f->env = env; f->is_pure = 1;\n"
+        "    return (xs_val){.tag=8, .p=f};\n"
+        "}\n\n"
+        "static xs_val xs_is_pure(xs_val v) {\n"
+        "    if (v.tag != 8 || !v.p) return XS_BOOL(0);\n"
+        "    return XS_BOOL(((xs_fn_t*)v.p)->is_pure ? 1 : 0);\n"
         "}\n\n"
         "static xs_val xs_call(xs_val fn, xs_val *args, int argc) {\n"
         "    if (fn.tag == 8 && fn.p) {\n"

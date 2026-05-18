@@ -10,6 +10,7 @@
 #include "core/lexer.h"
 #include "core/parser.h"
 #include "core/ast.h"
+#include "semantic/purity.h"
 #include "core/value.h"
 
 /* forward declarations */
@@ -686,6 +687,8 @@ static void emit_expr(SB *s, Node *n, int depth) {
             /* XS type names differ from JS typeof: int / float / str /
                array / map / null / bool. Route through __xs_type. */
             sb_add(s, "__xs_type(");
+        } else if (is_callee_name(n->call.callee, "__pure?")) {
+            sb_add(s, "__xs_is_pure(");
         } else if (is_callee_name(n->call.callee, "len")) {
             sb_add(s, "__xs_len(");
             if (n->call.args.len > 0) emit_expr(s, n->call.args.items[0], depth);
@@ -1304,6 +1307,7 @@ static void emit_expr(SB *s, Node *n, int depth) {
     case NODE_LAMBDA: {
         int lam_is_gen = n->lambda.is_generator ||
                           node_has_perform(n->lambda.body);
+        if (n->lambda.inferred_pure) sb_add(s, "__xs_mark_pure");
         sb_addc(s, '(');
         if (lam_is_gen) {
             sb_add(s, "function*");
@@ -1973,6 +1977,7 @@ static void emit_expr(SB *s, Node *n, int depth) {
         /* Anonymous: emit a function expression. */
         int fn_is_gen = n->fn_decl.is_generator ||
                         node_has_perform(n->fn_decl.body);
+        if (n->fn_decl.inferred_pure) sb_add(s, "__xs_mark_pure");
         sb_add(s, fn_is_gen ? "(function*" : "(function");
         emit_params(s, &n->fn_decl.params);
         sb_add(s, " {\n");
@@ -2629,6 +2634,10 @@ static void emit_stmt(SB *s, Node *n, int depth) {
         }
         sb_indent(s, depth);
         sb_add(s, named ? "}\n\n" : "});\n");
+        if (named && n->fn_decl.inferred_pure) {
+            sb_indent(s, depth);
+            sb_printf(s, "__xs_mark_pure(%s);\n\n", fn_name);
+        }
         js_n_deleted_vars = __saved_n_deleted; /* unwind del scope on fn exit */
         break;
     }
@@ -3487,6 +3496,7 @@ char *transpile_js(Node *program, const char *filename) {
         return NULL;
     }
 
+    purity_analyze(program);
     js_n_deleted_vars = 0;
     SB s;
     sb_init(&s);
@@ -3694,6 +3704,10 @@ char *transpile_js(Node *program, const char *filename) {
     sb_add(&s, "    if (typeof v === 'function') return 'fn';\n");
     sb_add(&s, "    return 'unknown';\n");
     sb_add(&s, "};\n");
+    /* purity introspection. Pure fns are tagged with __xs_pure = true
+       at construction time so __pure?(f) is a property check. */
+    sb_add(&s, "const __xs_mark_pure = (f) => { if (typeof f === 'function') f.__xs_pure = true; return f; };\n");
+    sb_add(&s, "const __xs_is_pure = (f) => typeof f === 'function' && f.__xs_pure === true;\n");
     /* ++ concat: arrays -> concat array, strings -> string, plain
        maps -> merged map. Anything else -> stringified concat. */
     sb_add(&s, "const __xs_concat = (a, b) => {\n");

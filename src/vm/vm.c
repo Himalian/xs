@@ -1289,6 +1289,11 @@ static Value *vm_is_fn(Interp *interp, Value **args, int argc) {
     ValueTag t = VAL_TAG(args[0]);
     return xs_bool(t == XS_FUNC || t == XS_NATIVE || t == XS_CLOSURE);
 }
+static Value *vm_is_pure_q(Interp *interp, Value **args, int argc) {
+    (void)interp;
+    if (argc < 1) return xs_bool(0);
+    return xs_bool(rt_is_pure(args[0]));
+}
 static Value *vm_char_fn(Interp *interp, Value **args, int argc) {
     (void)interp;
     if (argc < 1) return xs_str("");
@@ -1451,6 +1456,7 @@ static void vm_register_stdlib(VM *vm) {
     REG("is_bool",     vm_is_bool);
     REG("is_array",    vm_is_array);
     REG("is_fn",       vm_is_fn);
+    REG("__pure?",     vm_is_pure_q);
     REG("i64",         vm_int_fn);
     REG("f64",         vm_float_fn);
     REG("char",        vm_char_fn);

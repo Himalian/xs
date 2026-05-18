@@ -252,6 +252,9 @@ static void proto_write(FILE *f, XSProto *p) {
     write_u16(f, (uint16_t)p->n_upvalues);
     /* source file (per-proto; inner protos write their own copy) */
     write_str(f, p->source_file);
+    /* per-proto purity bit (v3+). Reader honours it when the file
+       header advertised v3 and defaults to 0 for older files. */
+    write_u8(f, (uint8_t)(p->is_pure ? 1 : 0));
     /* code */
     write_u32(f, (uint32_t)p->chunk.len);
     for (int i = 0; i < p->chunk.len; i++)
@@ -288,12 +291,17 @@ int proto_write_file(XSProto *p, const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
     fwrite("XSC", 1, 4, f); /* includes null terminator */
-    write_u16(f, 2); /* format version: v2 adds per-proto source_file +
-                        per-instruction lines/cols */
+    write_u16(f, 3); /* format version: v3 adds the per-proto purity
+                        bit needed by __pure?(f) and the wrapping
+                        decorator gate. v2 readers see is_pure=0. */
     proto_write(f, p);
     fclose(f);
     return 0;
 }
+
+/* Format version threaded through proto_read so v2 .xsc files keep
+   loading after the v3 purity-bit addition. */
+static int g_xsc_format_ver = 3;
 
 static XSProto *proto_read(Reader *r) {
     char *name = read_str(r);
@@ -304,6 +312,9 @@ static XSProto *proto_read(Reader *r) {
     p->n_upvalues = read_u16(r);
     /* source file (per-proto) */
     p->source_file = read_str(r);
+    /* purity bit (v3+); v2 files have no slot here. */
+    if (g_xsc_format_ver >= 3) p->is_pure = (int)read_u8(r);
+    else                       p->is_pure = 0;
     /* code */
     int ncode = (int)read_u32(r);
     for (int i = 0; i < ncode; i++)
@@ -356,7 +367,9 @@ static int read_header(Reader *r) {
     char magic[4] = {0};
     if (rd_read(r, magic, 4) != 4 || memcmp(magic, "XSC", 4) != 0) return -1;
     uint16_t ver = read_u16(r);
-    return ver == 2 ? 0 : -1;
+    if (ver != 2 && ver != 3) return -1;
+    g_xsc_format_ver = (int)ver;
+    return 0;
 }
 
 XSProto *proto_read_file(const char *path) {

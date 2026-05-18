@@ -4,6 +4,7 @@
 #include "core/lexer.h"
 #include "core/parser.h"
 #include "core/ast.h"
+#include "semantic/purity.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1525,6 +1526,20 @@ static void compile_expr(Node *node, WasmBuf *code, LocalMap *locals, CompilerCt
             if (strcmp(name, "input") == 0) {
                 /* No stdin in WASI minimal - return empty string */
                 emit_str_val(code, strtab_add(ctx->strtab, ""), 0);
+                break;
+            }
+            if (strcmp(name, "__pure?") == 0) {
+                /* Purity introspection on WASM is not yet wired up:
+                   the closure cell carries (tag, func_idx, env_ptr)
+                   with no slot for a per-fn purity bit, and the
+                   parallel-table lookup needs runtime support that
+                   doesn't exist here. Evaluate the argument for side
+                   effects, drop it, return false. */
+                if (nargs >= 1) {
+                    compile_expr(node->call.args.items[0], code, locals, ctx);
+                    buf_byte(code, OP_DROP);
+                }
+                emit_bool_val(code, 0);
                 break;
             }
 
@@ -12560,6 +12575,7 @@ int transpile_wasm(Node *program, const char *filename, const char *out_path) {
        constructs the back end natively understands. After this returns
        the program is free of those node types. */
     wasm_lower_program(program, filename);
+    purity_analyze(program);
 
     const char *unsupported = find_unsupported_for_wasm(program);
     if (unsupported) {

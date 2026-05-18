@@ -187,6 +187,7 @@ struct XSProto {
                                   * at runtime when the method also
                                   * captures outer upvalues. */
     int         is_variadic;
+    int         is_pure;       /* set from the AST's inferred_pure bit */
     /* Source filename owned by the proto (or NULL). Used to render
        runtime errors at the right file when the call originated from
        this proto's bytecode. Inner protos inherit by reading this off

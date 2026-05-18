@@ -2,6 +2,7 @@
 #include "core/value.h"
 #include "core/xs_bigint.h"
 #include "core/parser.h"
+#include "semantic/purity.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -1288,6 +1289,7 @@ static void compile_node_inner(Compiler *c, Node *n, int want_value) {
                              n->fn_decl.body);
         if (n->fn_decl.is_generator)
             c->current->proto->inner[idx]->is_generator = 1;
+        c->current->proto->inner[idx]->is_pure = n->fn_decl.inferred_pure;
         emit_make_closure(c, idx);
         if (want_value) emit(c, MAKE_A(OP_DUP, 0, 0));
         if (local_slot >= 0) emit_a(c, OP_STORE_LOCAL, local_slot);
@@ -1349,6 +1351,7 @@ static void compile_node_inner(Compiler *c, Node *n, int want_value) {
                              n->lambda.body);
         if (n->lambda.is_generator)
             c->current->proto->inner[idx]->is_generator = 1;
+        c->current->proto->inner[idx]->is_pure = n->lambda.inferred_pure;
         emit_make_closure(c, idx);
         if (!want_value) emit(c, MAKE_A(OP_POP, 0, 0));
         return;
@@ -3217,6 +3220,10 @@ static void compile_node_inner(Compiler *c, Node *n, int want_value) {
 }
 
 XSProto *compile_program(Node *program) {
+    /* Purity stamping is idempotent; running it here ensures the bit
+       lands on every fn / lambda even when the VM is invoked without
+       a prior sema pass (e.g. xs build with --no-check). */
+    purity_analyze(program);
     Compiler c = {0};
     CompilerScope top;
     XSProto *p = proto_new("<main>", 0);
