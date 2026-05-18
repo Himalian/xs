@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.2.18
+
+Three transpiler correctness fixes surfaced by extending the strict
+cross-backend matrix from the conformance suite onto the full
+regression corpus. C emit: overloaded fn wrappers no longer collide
+on the same name (`__xs_wrap_calc_1` vs `__xs_wrap_calc_2`); a
+dynamic method-call on a map field now goes through xs_call
+instead of colliding with the runtime's `handle` keyword. JS emit:
+multi-arg `.concat` / `.extend` now spreads the full args list
+instead of forwarding only the first.
+
+The matrix is now part of `tests/run.sh` (section 6), so every
+push runs all 60 regression files through every backend and
+byte-diffs the output against interp. 46 files carry skip-emit
+markers with TODO notes that name the gap a transpiler would need
+to close to lift them.
+
 ## 1.2.17
 
 `xs upgrade` now works on Windows. The previous build refused
