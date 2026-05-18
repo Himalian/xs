@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.24
+
+`--emit js` lowers wrapping decorators: `@memoize`, `@retry(n)`,
+`@timed`, `@trace` now actually work; previously they were
+refused. Each becomes a small prelude helper that wraps the
+function and rebinds the name after the fn-decl emit. memoize
+uses JSON.stringify of the arg list as cache key. retry catches
+up to n attempts. timed writes `[timed] name: ms ms` to stderr
+(same shape as the interp). bug054 lifts the js marker; c side
+still rejects (typed C fns can't be re-bound to a closure value
+without a deeper rework, kept as the legitimate gap).
+
+bug045 (@api / @modifier / @discovery decorator parsing) lifts
+its skip-emit entirely; those decorators parse cleanly and emit
+as no-ops on every backend, which is what the test expects.
+
 ## 1.2.23
 
 `--emit js` lowers scheduling decorators: `@every` emits
