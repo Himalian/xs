@@ -15,6 +15,11 @@ Value *stdlib_load_module(struct Interp *i, const char *name);
 Value *call_value(struct Interp *i, Value *callee, Value **args, int argc,
                   const char *call_site);
 
+/* True when v is a callable whose body has been proven pure by the
+   static analyzer. False for non-functions, native builtins (purity
+   not tracked at the C level), and impure user functions. */
+int    rt_is_pure(Value *v);
+
 // module factories (tree-walker + VM)
 Value *make_math_module(void);
 Value *make_time_module(void);

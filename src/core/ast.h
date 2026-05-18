@@ -337,6 +337,7 @@ struct Node {
             ParamList params;
             Node     *body;
             int       is_generator; /* 1 if fn* lambda */
+            int       inferred_pure; /* set by the purity analyzer; 1 = pure */
         } lambda;
 
         struct {
@@ -395,7 +396,8 @@ struct Node {
             int        is_async;
             int        is_pub;
             int        is_generator;
-            int        is_pure;
+            int        is_pure;        /* user-declared @pure marker */
+            int        inferred_pure;  /* computed by the purity analyzer */
             int        is_test;
             int        is_static;
             int        is_macro;     /* @[macro] -- compile-time procedural macro */

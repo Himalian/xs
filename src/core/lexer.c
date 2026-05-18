@@ -803,6 +803,13 @@ static Token lex_ident(Lexer *l, int sl, int sc, int sp) {
     StrBuf sb; sb_init(&sb);
     while (isalnum(lpeek(l,0)) || lpeek(l,0)=='_')
         sb_push(&sb, ladvance(l));
+    /* Allow a single trailing `?` when the call form follows immediately:
+       `is_pure?(f)` lexes as one identifier so introspection helpers can
+       use the predicate-suffix convention without colliding with the
+       postfix try operator. `x?` (no paren) keeps its old meaning. */
+    if (lpeek(l,0) == '?' && lpeek(l,1) == '(') {
+        sb_push(&sb, ladvance(l));
+    }
     char *name = sb_finish(&sb);
     Span span = make_span(l,sl,sc,sp);
 

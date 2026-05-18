@@ -96,6 +96,7 @@ struct XSFunc {
     int     *variadic_flags;
     int      is_generator;
     int      is_async;
+    int      is_pure;        /* set from the AST's inferred_pure bit */
     char    *deprecated_msg;
     char   **param_type_names;
     char    *ret_type_name;

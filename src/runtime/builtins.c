@@ -5,6 +5,9 @@
 #include "runtime/builtins.h"
 #include "runtime/error.h"
 #include "core/xs_bigint.h"
+#ifdef XSC_ENABLE_VM
+#include "vm/bytecode.h"
+#endif
 #include "core/utf8.h"
 #include "tls/xs_tls.h"
 #include "core/gc.h"
@@ -353,6 +356,52 @@ static Value *builtin_is_str(Interp *i, Value **a, int n)   { (void)i; return ta
 static Value *builtin_is_bool(Interp *i, Value **a, int n)  { (void)i; return tag_check(a, n, XS_BOOL); }
 static Value *builtin_is_array(Interp *i, Value **a, int n) { (void)i; return tag_check2(a, n, XS_ARRAY, XS_TUPLE); }
 static Value *builtin_is_fn(Interp *i, Value **a, int n)    { (void)i; return tag_check2(a, n, XS_FUNC, XS_NATIVE); }
+
+int rt_is_pure(Value *v) {
+    if (!v) return 0;
+    if (xs_is_smi(v)) return 0;
+    switch (VAL_TAG(v)) {
+    case XS_FUNC:
+        return v->fn ? v->fn->is_pure : 0;
+#ifdef XSC_ENABLE_VM
+    case XS_CLOSURE:
+        return v->cl && v->cl->proto ? v->cl->proto->is_pure : 0;
+#endif
+    case XS_OVERLOAD:
+        if (v->overload) {
+            for (int i = 0; i < v->overload->len; i++)
+                if (!rt_is_pure(v->overload->items[i])) return 0;
+            return v->overload->len > 0;
+        }
+        return 0;
+    case XS_MAP:
+        /* Decorator wrappers stash the underlying callable in
+           _wrap_fn. Unwrap so a stack of pure wrappers reads as
+           pure (the wrappers themselves don't introduce side
+           effects beyond what they delegate to). */
+        if (v->map) {
+            Value *kv = map_get(v->map, "_wrap_kind");
+            Value *fn = map_get(v->map, "_wrap_fn");
+            if (kv && VAL_TAG(kv) == XS_STR && fn) {
+                /* @trace and @timed log to stderr; treat them as
+                   side-effect carriers regardless of inner. */
+                const char *k = kv->s;
+                if (k && (strcmp(k, "trace") == 0 || strcmp(k, "timed") == 0))
+                    return 0;
+                return rt_is_pure(fn);
+            }
+        }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+static Value *builtin_is_pure_q(Interp *i, Value **a, int n) {
+    (void)i;
+    if (n < 1) return xs_bool(0);
+    return xs_bool(rt_is_pure(a[0]));
+}
 
 /* conversions */
 static Value *builtin_int(Interp *i, Value **args, int argc) {
@@ -1548,6 +1597,11 @@ void stdlib_register(Interp *i) {
     interp_define_native(i, "is_bool",   builtin_is_bool);
     interp_define_native(i, "is_array",  builtin_is_array);
     interp_define_native(i, "is_fn",     builtin_is_fn);
+    /* purity introspection: returns true when the static analyzer
+       proved the callable has no observable side effects. Used by
+       @memoize / @retry to refuse impure decoratees and by user
+       code that wants to gate caching or property tests. */
+    interp_define_native(i, "__pure?",   builtin_is_pure_q);
     interp_define_native(i, "int",       builtin_int);
     interp_define_native(i, "i64",       builtin_int);
     interp_define_native(i, "float",     builtin_float);
@@ -1780,10 +1834,27 @@ static Value *wrap_make_base(const char *kind, Value *fn, const char *name) {
     return m;
 }
 
+/* Decoration-time purity gate. @memoize and @retry both require their
+   target to be statically pure: a memoized impure fn would silently
+   skip side effects on cache hits, and a retried impure fn would
+   replay them on each attempt. Refuse at decoration time so the
+   problem surfaces at startup, not after the first cache miss. */
+static int wrap_require_pure(const char *kind, Value *fn, const char *name) {
+    if (rt_is_pure(fn)) return 1;
+    char buf[256];
+    snprintf(buf, sizeof buf,
+        "@%s requires a pure function; got impure '%s'",
+        kind, name ? name : "<anonymous>");
+    xs_runtime_error(span_zero(), "PurityError", NULL, "%s", buf);
+    return 0;
+}
+
 static Value *builtin_wrap_memoize(Interp *i, Value **args, int argc) {
     (void)i;
     if (argc < 1) return value_incref(XS_NULL_VAL);
-    const char *name = (argc >= 2 && VAL_TAG(args[1]) == XS_STR) ? args[1]->s : NULL;
+    const char *name = (argc >= 2 && VAL_TAG(args[argc-1]) == XS_STR) ? args[argc-1]->s : NULL;
+    if (!wrap_require_pure("memoize", args[0], name))
+        return value_incref(XS_NULL_VAL);
     Value *m = wrap_make_base("memoize", args[0], name);
     Value *cache = xs_map_new();
     map_set(m->map, "_wrap_cache", cache); value_decref(cache);
@@ -1800,6 +1871,8 @@ static Value *builtin_wrap_retry(Interp *i, Value **args, int argc) {
     const char *name = NULL;
     if (argc >= 2 && VAL_TAG(args[argc-1]) == XS_STR)
         name = args[argc-1]->s;
+    if (!wrap_require_pure("retry", args[0], name))
+        return value_incref(XS_NULL_VAL);
     Value *m = wrap_make_base("retry", args[0], name);
     int64_t n = 3;
     if (argc >= 2 && VAL_TAG(args[1]) == XS_INT) n = VAL_INT(args[1]);

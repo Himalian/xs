@@ -11,6 +11,7 @@
 #include "core/gc.h"
 #include "core/limits.h"
 #include "plugins/pipeline.h"
+#include "semantic/purity.h"
 #ifdef XSC_ENABLE_TRACER
 #include "tracer/tracer.h"
 #endif
@@ -6729,6 +6730,7 @@ do_call: ;
         XSFunc *fn = func_new_ex("<lambda>", params, nparams,
                                n->lambda.body, i->env, defaults, varflags);
         fn->is_generator = n->lambda.is_generator;
+        fn->is_pure      = n->lambda.inferred_pure;
         if (nparams > 0) {
             int has_types = 0;
             for (int j = 0; j < nparams; j++) {
@@ -9496,6 +9498,7 @@ void interp_exec(Interp *i, Node *stmt) {
                                stmt->fn_decl.body, i->env, defaults, varflags);
         fn->is_generator = stmt->fn_decl.is_generator;
         fn->is_async     = stmt->fn_decl.is_async;
+        fn->is_pure      = stmt->fn_decl.inferred_pure;
         if (stmt->fn_decl.deprecated_msg)
             fn->deprecated_msg = xs_strdup(stmt->fn_decl.deprecated_msg);
         if (nparams > 0) {
@@ -10769,6 +10772,7 @@ static void hoist_functions(Interp *i, NodeList *stmts) {
                                  stmt->fn_decl.body, i->env, defaults, varflags);
         fn->is_generator = stmt->fn_decl.is_generator;
         fn->is_async     = stmt->fn_decl.is_async;
+        fn->is_pure      = stmt->fn_decl.inferred_pure;
         if (stmt->fn_decl.deprecated_msg)
             fn->deprecated_msg = xs_strdup(stmt->fn_decl.deprecated_msg);
         if (nparams > 0) {
@@ -10826,6 +10830,11 @@ static void hoist_functions(Interp *i, NodeList *stmts) {
 
 void interp_run(Interp *i, Node *program) {
     if (!program || VAL_TAG(program) != NODE_PROGRAM) return;
+    /* Stamp every fn / lambda with its inferred purity so the bit is
+       available on XSFunc the moment a closure is materialised. The
+       analyzer is idempotent and cheap; running it here covers the
+       embedder paths that bypass sema. */
+    purity_analyze(program);
     /* Reset per-invocation counters but keep any caps set by the
        embedder / CLI. */
     xs_limits_reset();

@@ -5,6 +5,7 @@
 #include "core/xs.h"
 #include "semantic/sema.h"
 #include "semantic/exhaust.h"
+#include "semantic/purity.h"
 #include "semantic/resolve.h"
 #include "semantic/scoped_check.h"
 #include "semantic/symtable.h"
@@ -662,5 +663,6 @@ int sema_analyze(SemaCtx *ctx, Node *program, const char *filename) {
     check_impls(ctx, program);
     walk(ctx, program);
     scoped_check_program(ctx, program);
+    purity_analyze(program);
     return ctx->diag ? diag_context_error_count(ctx->diag) : 0;
 }
