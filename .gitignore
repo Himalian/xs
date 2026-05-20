@@ -10,3 +10,5 @@
 /fuzz_parser
 /tests/unit/*_test
 !/tests/unit/*_test.c
+/build/debug
+/compile_commands.json
