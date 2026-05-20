@@ -22,20 +22,45 @@ local function detect_filetype()
 end
 
 local function register_treesitter()
+  local grammar_dir = vim.fn.stdpath("data") .. "/lazy/xs/editors/tree-sitter-xs"
+
+  -- Legacy nvim-treesitter plugin (nvim < 0.12)
   local ok, parsers = pcall(require, "nvim-treesitter.parsers")
-  if not ok then return end
-  local cfg = parsers.get_parser_configs()
-  cfg.xs = {
-    install_info = {
-      url = "https://github.com/xs-lang0/xs",
-      files = { "src/parser.c" },
-      location = "editors/tree-sitter-xs",
-      branch = "main",
-      generate_requires_npm = false,
-      requires_generate_from_grammar = false,
-    },
-    filetype = "xs",
-  }
+  if ok and parsers.get_parser_configs then
+    local cfg = parsers.get_parser_configs()
+    cfg.xs = {
+      install_info = {
+        url = "https://github.com/xs-lang0/xs",
+        files = { "src/parser.c" },
+        location = "editors/tree-sitter-xs",
+        branch = "main",
+        generate_requires_npm = false,
+        requires_generate_from_grammar = false,
+      },
+      filetype = "xs",
+    }
+    return
+  end
+
+  -- Built-in vim.treesitter (nvim 0.12+)
+  if vim.treesitter and vim.treesitter.language then
+    local parser_file = grammar_dir .. "/src/parser.c"
+    if vim.fn.filereadable(parser_file) ~= 1 then return end
+
+    local install_dir = vim.fn.stdpath("data") .. "/treesitter"
+    vim.fn.mkdir(install_dir, "p")
+    local so_path = install_dir .. "/xs.so"
+    if vim.fn.filereadable(so_path) == 0 then
+      vim.fn.system({
+        "tree-sitter", "build",
+        "--grammar-path", grammar_dir,
+        "-o", so_path,
+      })
+    end
+    if vim.fn.filereadable(so_path) == 1 then
+      vim.treesitter.language.add("xs", { path = so_path })
+    end
+  end
 end
 
 local function register_lsp(opts)
